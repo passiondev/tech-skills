@@ -70,11 +70,21 @@ way to end up half-installed.
 
 ## Step 2 — Install the bundle
 
+Two commands, in this order.
+
 ```bash
+claude plugin marketplace add passiondev/tech-skills
 claude plugin install <department>@passion-tech
 ```
 
-Then check what landed:
+The first one fetches the marketplace. Step 1 only *declared* it, and until it
+has been fetched the second command fails with `Plugin "<department>" not found
+in marketplace "passion-tech"` — so running them out of order looks like a
+missing plugin when nothing is missing. Because `passion-tech` is already in
+`settings.json`, the add reports `(declared in user settings)` and changes
+nothing there.
+
+The second one installs. Then check what landed:
 
 ```bash
 claude plugin list
@@ -200,6 +210,7 @@ points:
 | Symptom | Cause |
 | --- | --- |
 | `claude plugin list` shows nothing new | Claude Code was not restarted, or `settings.json` did not parse |
+| `Plugin "<department>" not found in marketplace` | The marketplace has not been fetched. Run step 2's first command, then the second |
 | Bundle reads `✘ failed to load`, naming a dependency | Step 2 was skipped or half-finished. Run the `claude plugin install` command in the error, then list again. Restarting does **not** fix this |
 | Fewer plugins listed than step 2's table | Same cause — the settings-driven install stopped early. Re-run step 2 |
 | Plugin listed, skills not available | Restart came before the fetch — restart again |
