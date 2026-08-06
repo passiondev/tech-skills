@@ -69,12 +69,15 @@ Screenshots and page verification need Playwright — a ~150 MB Chromium
 download, not installed by default. To add it:
 
 ```bash
-ROCK_WITH_BROWSER=1 "$R" catalog status   # triggers the install once
+ROCK_WITH_BROWSER=1 "$R" catalog status   # installs Playwright and Chromium, once
 "$R" browser login                        # confirm it can sign in
 "$R" browser screenshot /volunteers
 "$R" browser verify-page 412              # does the page load without errors
 "$R" browser check-element /volunteers ".signup-form"
 ```
+
+The flag is needed once. The choice is remembered, so every later command keeps
+the browser and a plain command never removes it.
 
 Add `--headed` to watch it. Screenshots stay out of every repository, because a
 screenshot of a Rock page is full of real people's names.
@@ -89,6 +92,7 @@ Everything the runtime writes is under `~/.claude/passion-rock`:
 | `catalog.json` | the cached catalog |
 | `rock.log` | every API call and command — 2 MB rotating, 3 backups |
 | `screenshots/` | anything the browser tooling captured |
+| `.browser` | present once you opted into the browser tooling. Delete it and the next command re-syncs without Playwright |
 
 This directory is deliberately outside the plugin, because plugin directories
 are replaced wholesale on every update. `rock.log` is the first place to look
