@@ -12,8 +12,10 @@ Paste this into Claude Code, with your department in place of the example:
 > https://github.com/passiondev/tech-skills/blob/main/ONBOARDING.md
 
 Claude reads the document, merges two keys into your `~/.claude/settings.json`,
-helps you get a Jira API token, and writes your credentials to
-`~/.claude/passion.env`. It shows you every change before making it.
+installs your department bundle, helps you get a Jira API token, and writes your
+credentials to `~/.claude/passion.env`. It shows you every change before making
+it, and checks the plugin count afterwards so a half-finished install is caught
+while someone is still there to fix it.
 
 Departments: `global-engineering`, `local-engineering`, `ops`, `analytics`,
 `service-and-support`.

@@ -18,6 +18,10 @@ The whole install reduces to two keys in one file:
 
 `autoUpdate` is documented as updating "this marketplace and its installed plugins on startup", so one flag delivers what [0001](0001-public-marketplace-repo.md) required. `enabledPlugins` takes `plugin@marketplace` keys, and [0002](0002-capability-plugins-and-department-bundles.md)'s dependency mechanism does the rest — naming the department bundle pulls in every capability plugin it needs.
 
+*The last clause is false, and it was the first thing to break when the install was finally run. Tested against a clean `HOME` on Claude Code 2.1.222 with nothing but the settings block above: enabling `ops@passion-tech` installed `general`, its dependency `jira`, and eventually the `ops` bundle — and never installed `plan`. `ops` sat at `✘ failed to load` with `Dependency "plan@passion-tech" is not installed`, ten skills on disk against the fifteen the README promises. Four further startups converged on the same broken state; it does not self-heal. The pattern was identical for `local-engineering`: the first dependency's closure, then nothing. `claude plugin install <bundle>@passion-tech` resolves the full closure in one pass and repairs the broken state, so `ONBOARDING.md` now has an explicit install step with the expected plugin and skill counts per department.*
+
+*Two lessons, and the second is the uncomfortable one. Enabling a plugin and installing it are different operations, and the settings block only reliably does the first — `autoUpdate` maintains what is installed, it does not complete an install. And the "Considered options" below rejected an install script partly for being the only deterministic choice we were giving up; the actual remedy turned out to be neither a script nor a paste, but one command run inside the interview, which keeps this ADR's shape while buying back the determinism.*
+
 Everyone installing this has Claude Code, by definition. That makes the agent the one tool the entire audience is guaranteed to have, on any operating system, with no script to write or keep working. And the actual difficulty here is merging two keys into a file that may or may not exist and may already contain anything — which is precisely what a copy-paste instruction handles badly and an agent handles well. Claude shows the diff before writing, so the person still sees what changed.
 
 It also covers the parts a JSON block cannot. Getting a Jira API token means visiting Atlassian and creating one; `uv` may not be installed; `passion.env` needs six values a person has to gather. Those are an interview, not a paste.
@@ -32,5 +36,7 @@ It also covers the parts a JSON block cannot. Getting a Jira API token means vis
 `ONBOARDING.md` is now executable documentation. It is read by an agent that will act on it, so vagueness there becomes wrong actions on someone's machine. It needs to state exactly which keys to merge and exactly what to leave alone.
 
 Nothing about this is deterministic. Two people can run the same sentence and get different conversations, and there is no way to test the path the way a script could be tested. The mitigation is that the resulting state is checkable — `claude plugin list` shows what landed.
+
+*That mitigation is what caught the dependency failure above, and it only worked because the document now states the number to expect. "They should see their department bundle plus its capability plugins" is not checkable — a person looking at four plugins when they should have seven has no way to know. A count is checkable, so step 2 carries one per department.*
 
 The instruction includes a public URL, so it depends on the person's Claude Code being able to fetch it. Where it cannot, the document has to be pasted instead.
