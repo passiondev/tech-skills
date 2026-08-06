@@ -63,15 +63,32 @@ plugins they need. You install one thing.
 
 ## Updating
 
-You don't. `autoUpdate` is set on the marketplace, so every Claude Code start
-pulls the marketplace and its installed plugins. There are no version numbers —
-`main` is what everyone is running, which is why nothing merges without review.
+You don't. `autoUpdate` is set on the marketplace, so opening Claude Code
+fetches the marketplace and its installed plugins. There are no version numbers.
+`main` is what everyone runs, which is why nothing merges without review.
 
-The corollary: a skill can change under you, and one can disappear. If
-something behaved differently today, the git history is the changelog — read it
-on GitHub. Your local copy is a shallow clone with only the current commit in
-it, and `claude plugin list` reports the version you installed at rather than
-the one on disk, so neither can tell you what moved.
+Two gaps in that, both closed by the same command. Headless runs (`claude -p`)
+do not auto-update, so a machine that only ever drives these skills from a
+script or a scheduled job stays frozen at whatever it installed. And a session
+already open when `main` moves does not pick the change up.
+
+```
+claude plugin marketplace update passion-tech
+```
+
+To see which commit you are on:
+
+```
+git -C ~/.claude/plugins/marketplaces/passion-tech log --oneline -1
+```
+
+Do not use `claude plugin list` for this. It reports the version you installed
+at, not the one on disk.
+
+The corollary of no version numbers: a skill can change under you, and one can
+disappear. If something behaved differently today, read the git history on
+GitHub. Your local copy is a shallow clone with only the current commit in it,
+so it cannot tell you what moved.
 
 ## This repository is public
 
