@@ -211,6 +211,7 @@ points:
 | --- | --- |
 | `claude plugin list` shows nothing new | Claude Code was not restarted, or `settings.json` did not parse |
 | `Plugin "<department>" not found in marketplace` | The marketplace has not been fetched. Run step 2's first command, then the second |
+| `ENOENT: no such file or directory, mkdir '.../.claude/plugins/marketplaces'` | `~/.claude/plugins` is missing or is a symlink whose target does not exist — common if their dotfiles symlink `~/.claude`. `ls -ld ~/.claude/plugins` shows which. Create the target directory, then re-run step 2 |
 | Bundle reads `✘ failed to load`, naming a dependency | Step 2 was skipped or half-finished. Run the `claude plugin install` command in the error, then list again. Restarting does **not** fix this |
 | Fewer plugins listed than step 2's table | Same cause — the settings-driven install stopped early. Re-run step 2 |
 | Plugin listed, skills not available | Restart came before the fetch — restart again |

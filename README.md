@@ -55,7 +55,10 @@ pulls the marketplace and its installed plugins. There are no version numbers â€
 `main` is what everyone is running, which is why nothing merges without review.
 
 The corollary: a skill can change under you, and one can disappear. If
-something behaved differently today, the git history is the changelog.
+something behaved differently today, the git history is the changelog â€” read it
+on GitHub. Your local copy is a shallow clone with only the current commit in
+it, and `claude plugin list` reports the version you installed at rather than
+the one on disk, so neither can tell you what moved.
 
 ## This repository is public
 
