@@ -1,0 +1,16 @@
+[project]
+name = "passion-rock"
+version = "0.1.0"
+description = "Rock RMS client for the Passion tech-skills marketplace"
+requires-python = ">=3.12"
+dependencies = [
+    "pyyaml>=6.0.3",
+    "requests>=2.32.5",
+]
+
+[dependency-groups]
+# Only rock_browser.py needs a browser. 43 of the 47 operations do not, so
+# Playwright is opt-in: `uv sync --group browser`. See ADR 0003.
+browser = [
+    "playwright>=1.52.0",
+]

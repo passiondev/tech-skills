@@ -1,0 +1,4 @@
+{
+  "name": "jira",
+  "description": "Pull a Jira ticket with its comments and attachments, and work from it."
+}

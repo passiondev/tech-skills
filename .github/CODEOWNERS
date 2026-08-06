@@ -1,0 +1,5 @@
+# One curator reviews and merges everything. There are no versions and no
+# staging here, so review is the only thing between a commit and thirty
+# people's tooling. See docs/adr/0010-curator-merges-ci-guards.md.
+
+* @justinpbarnett

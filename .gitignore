@@ -1,0 +1,9 @@
+# Nothing generated, nothing local, nothing with a credential in it.
+# This repo is public forever — see docs/adr/0001-public-marketplace-repo.md.
+
+__pycache__/
+*.py[cod]
+.venv/
+.env
+passion.env
+.DS_Store

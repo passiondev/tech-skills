@@ -1,0 +1,58 @@
+name: check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Everyone runs `main` — there are no versions and no staging (ADR 0009), so
+# a bad merge is live for thirty people immediately. This is the automated half
+# of the safety net; the curator is the other half (ADR 0010).
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # check.py is stdlib-only on purpose: nothing to install, and a
+      # contributor can run the identical command locally before pushing.
+      - name: Manifests, skills, secrets, runtime invariants
+        run: python3 .github/scripts/check.py
+
+      - name: The onboarding settings block must be valid JSON
+        run: |
+          python3 - <<'PY'
+          import json, re, sys, pathlib
+          text = pathlib.Path("ONBOARDING.md").read_text()
+          blocks = re.findall(r"```json\n(.*?)```", text, re.S)
+          if not blocks:
+              sys.exit("ONBOARDING.md has no JSON block — step 1 is the install")
+          for i, b in enumerate(blocks, 1):
+              try:
+                  d = json.loads(b)
+              except json.JSONDecodeError as e:
+                  sys.exit(f"ONBOARDING.md block {i} is not valid JSON: {e}")
+          # Claude is told to merge these two keys and nothing else.
+          d = json.loads(blocks[0])
+          missing = {"extraKnownMarketplaces", "enabledPlugins"} - set(d)
+          if missing:
+              sys.exit(f"ONBOARDING.md settings block is missing {missing}")
+          mk = d["extraKnownMarketplaces"]["passion-tech"]
+          assert mk["autoUpdate"] is True, "autoUpdate must stay on — ADR 0001"
+          assert mk["source"]["repo"] == "passiondev/tech-skills", "wrong repo"
+          print("ONBOARDING.md settings block is valid")
+          PY
+
+      - name: Every department in the README is a real bundle
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, re, sys
+          mk = json.loads(pathlib.Path(".claude-plugin/marketplace.json").read_text())
+          bundles = {p["name"] for p in mk["plugins"] if p.get("category") == "department"}
+          readme = pathlib.Path("README.md").read_text()
+          named = set(re.findall(r"`([a-z-]+-engineering|ops|analytics|service-and-support)`", readme))
+          missing = bundles - named
+          if missing:
+              sys.exit(f"README does not mention these departments: {sorted(missing)}")
+          print(f"README covers all {len(bundles)} departments")
+          PY

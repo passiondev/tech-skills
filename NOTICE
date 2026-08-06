@@ -1,0 +1,27 @@
+This product includes software developed by Matt Pocock.
+
+    Skills for Real Engineers
+    https://github.com/mattpocock/skills
+    Copyright (c) 2026 Matt Pocock
+    Licensed under the MIT License
+
+Eighteen of the thirty-one skills distributed by this marketplace are
+copied from that repository, some with modifications. The modifications are
+ours; the originals are his. `docs/vendored.json` records, for every skill,
+where it came from, the commit it was taken from, and whether we have changed
+it since.
+
+The copied skills are:
+
+    plugins/general/skills/   grill-me, grill-with-docs, grilling, research,
+                              teach
+    plugins/dev/skills/       code-review, codebase-design, diagnosing-bugs,
+                              implement, improve-codebase-architecture,
+                              prototype, resolving-merge-conflicts, tdd
+    plugins/plan/skills/      domain-modeling, to-spec, to-tickets, triage,
+                              wayfinder
+
+Everything else in this repository — the `jira` and `rock` plugins and their
+runtimes, the `onboard`, `humanize` and `to-ste` skills, the marketplace itself, and all
+documentation — is Copyright (c) 2026 Passion City Church, under the same MIT
+licence.

@@ -1,0 +1,5 @@
+{
+  "name": "service-and-support",
+  "description": "Everything the Service and Support department needs. Install this one.",
+  "dependencies": ["general", "rock"]
+}

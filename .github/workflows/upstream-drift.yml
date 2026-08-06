@@ -1,0 +1,119 @@
+name: upstream-drift
+
+on:
+  schedule:
+    - cron: "0 13 * * 1"   # Mondays, 13:00 UTC
+  workflow_dispatch:
+
+# ADR 0011 predicted that a manual "remember to check upstream" ritual would be
+# neglected, and asked for a job that surfaces the drift instead.
+#
+# It asked for a pull request. This opens an issue. A PR would have to apply
+# upstream's changes on top of ours, and ADR 0006 makes some of our changes
+# deliberate — the merge would silently revert Passion-flavouring. An issue
+# carrying the diff gives the curator the same "review this" prompt without
+# proposing a change that is sometimes wrong.
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch upstream
+        run: git clone --depth 1 https://github.com/mattpocock/skills.git /tmp/upstream
+
+      - name: Diff every vendored skill
+        id: diff
+        run: |
+          python3 - <<'PY' | tee /tmp/drift.md
+          import json, pathlib, subprocess
+
+          vend = json.loads(pathlib.Path("docs/vendored.json").read_text())
+          upstream = pathlib.Path("/tmp/upstream/skills")
+
+          # Upstream groups skills into category directories, and regroups them
+          # from time to time. Index by directory name so a skill moving from
+          # engineering/ to productivity/ does not read as a deletion.
+          index = {d.name: d for d in upstream.glob("*/*") if (d / "SKILL.md").is_file()}
+          index.update({d.name: d for d in upstream.glob("*") if (d / "SKILL.md").is_file()})
+
+          unchanged, drifted, gone, ours = [], [], [], []
+
+          for name, meta in sorted(vend["skills"].items()):
+              if meta["upstream"] != "mattpocock/skills":
+                  ours.append(name)
+                  continue
+              src = index.get(meta.get("upstream_name") or name)
+              dst = pathlib.Path("plugins") / meta["plugin"] / "skills" / name
+              if src is None:
+                  gone.append(name)
+                  continue
+              out = subprocess.run(
+                  ["diff", "-ru", "--exclude=agents", str(src), str(dst)],
+                  capture_output=True, text=True).stdout
+              (drifted if out else unchanged).append((name, meta, out))
+
+          print(f"Upstream: `mattpocock/skills@main`. "
+                f"{len(unchanged)} unchanged, {len(drifted)} differ, {len(gone)} removed upstream.\n")
+
+          # A `diverged` marker on a file that matches upstream byte for byte is
+          # stale bookkeeping — usually the leftover of a refresh. It matters
+          # because the marker is what tells a reader "this differs on purpose",
+          # and the section below sorts by it.
+          stale = [name for name, meta, _ in unchanged if meta.get("diverged")]
+          if stale:
+              print("## Stale `diverged` markers\n")
+              for n in stale:
+                  print(f"- `{n}` is identical to upstream but `docs/vendored.json` "
+                        "marks it diverged — move the text to `note` or drop it.")
+              print()
+
+          if gone:
+              print("## Removed upstream\n")
+              for n in gone:
+                  print(f"- `{n}` — still shipped here. Intentional, or should it go?")
+              print()
+
+          if drifted:
+              print("## Differ from upstream\n")
+              print("Some of these are ours on purpose — check `diverged` and `notes` "
+                    "in `docs/vendored.json` before changing anything.\n")
+              # A GitHub issue body caps at 65536 characters. The interesting case
+              # for this job is upstream having changed a lot, which is exactly when
+              # the report is longest — so budget the diffs rather than posting
+              # something the API rejects. Unmarked drift is the news; skills already
+              # marked `diverged` are expected to differ, so they yield first.
+              budget = 48000
+              for name, meta, out in sorted(drifted, key=lambda d: bool(d[1].get("diverged"))):
+                  flag = " **(marked diverged)**" if meta.get("diverged") else ""
+                  lines = len(out.splitlines())
+                  if budget <= 0:
+                      print(f"- <code>{name}</code>{flag} — {lines} diff lines, "
+                            f"not shown (report too long); run `diff -ru` locally\n")
+                      continue
+                  shown, rest = out[:budget], len(out) - budget
+                  budget -= len(shown)
+                  print(f"<details><summary><code>{name}</code>{flag} — "
+                        f"{lines} diff lines</summary>\n")
+                  print("```diff")
+                  print(shown)
+                  if rest > 0:
+                      print(f"... truncated, {rest} more characters")
+                  print("```\n</details>\n")
+
+          print(f"\n<sub>{len(ours)} skills are ours and are not compared.</sub>")
+          PY
+
+      - name: Open or update the drift issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TITLE="Upstream drift: mattpocock/skills"
+          EXISTING=$(gh issue list --state open --search "$TITLE in:title" --json number --jq '.[0].number')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body-file /tmp/drift.md
+          else
+            gh issue create --title "$TITLE" --body-file /tmp/drift.md --label upstream
+          fi

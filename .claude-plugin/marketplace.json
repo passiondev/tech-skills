@@ -1,0 +1,88 @@
+{
+  "name": "passion-tech",
+  "owner": {
+    "name": "Passion City Church Technology Team"
+  },
+  "metadata": {
+    "description": "Approved Claude Code skills for the Passion City Church technology team."
+  },
+  "plugins": [
+    {
+      "name": "general",
+      "source": "./plugins/general",
+      "description": "Thinking, writing, learning, and research skills everyone uses, whatever their department.",
+      "category": "general",
+      "tags": ["thinking", "writing", "research", "teaching"]
+    },
+    {
+      "name": "jira",
+      "source": "./plugins/jira",
+      "description": "Pull a Jira ticket with its comments and attachments, and work from it.",
+      "category": "general",
+      "tags": ["jira", "tickets", "atlassian"]
+    },
+    {
+      "name": "dev",
+      "source": "./plugins/dev",
+      "description": "Writing and changing code: TDD, review, debugging, architecture, prototyping.",
+      "category": "engineering",
+      "tags": ["code", "testing", "review", "architecture"]
+    },
+    {
+      "name": "plan",
+      "source": "./plugins/plan",
+      "description": "Turning work into specs, tickets, and domain documentation before it is built.",
+      "category": "engineering",
+      "tags": ["planning", "specs", "tickets", "adr"]
+    },
+    {
+      "name": "rock",
+      "source": "./plugins/rock",
+      "description": "Read Rock RMS: find and inspect workflows, pages, blocks, people, groups, and data.",
+      "category": "rock",
+      "tags": ["rock", "rms", "lava", "read-only"]
+    },
+    {
+      "name": "rock-build",
+      "source": "./plugins/rock-build",
+      "description": "Change Rock RMS: diagnose broken workflows, repair them, and create new entities.",
+      "category": "rock",
+      "tags": ["rock", "rms", "workflows", "write"]
+    },
+    {
+      "name": "global-engineering",
+      "source": "./plugins/global-engineering",
+      "description": "Everything the Global Engineering department needs. Install this one.",
+      "category": "department",
+      "tags": ["department", "engineering"]
+    },
+    {
+      "name": "local-engineering",
+      "source": "./plugins/local-engineering",
+      "description": "Everything the Local Engineering department needs. Install this one.",
+      "category": "department",
+      "tags": ["department", "engineering", "rock"]
+    },
+    {
+      "name": "ops",
+      "source": "./plugins/ops",
+      "description": "Everything the Ops department needs. Install this one.",
+      "category": "department",
+      "tags": ["department", "ops"]
+    },
+    {
+      "name": "analytics",
+      "source": "./plugins/analytics",
+      "description": "Everything the Analytics department needs. Install this one.",
+      "category": "department",
+      "tags": ["department", "analytics", "rock"]
+    },
+    {
+      "name": "service-and-support",
+      "source": "./plugins/service-and-support",
+      "description": "Everything the Service and Support department needs. Install this one.",
+      "category": "department",
+      "tags": ["department", "support", "rock"]
+    }
+  ]
+}

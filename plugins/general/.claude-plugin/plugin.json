@@ -1,0 +1,5 @@
+{
+  "name": "general",
+  "description": "Thinking, writing, learning, and research skills everyone uses, whatever their department.",
+  "dependencies": ["jira"]
+}

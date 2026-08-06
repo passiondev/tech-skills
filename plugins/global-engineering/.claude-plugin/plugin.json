@@ -1,0 +1,5 @@
+{
+  "name": "global-engineering",
+  "description": "Everything the Global Engineering department needs. Install this one.",
+  "dependencies": ["general", "dev", "plan"]
+}

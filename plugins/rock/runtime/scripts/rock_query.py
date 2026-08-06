@@ -1,0 +1,1765 @@
+"""Query Rock RMS entities -- workflows, pages, blocks.
+
+Usage:
+  uv run scripts/rock_query.py workflows                    # list workflows
+  uv run scripts/rock_query.py workflow "Volunteer Signup"   # get one workflow
+  uv run scripts/rock_query.py workflow 234                  # get by ID
+  uv run scripts/rock_query.py pages                         # list pages
+  uv run scripts/rock_query.py page "/volunteers"            # get by route
+  uv run scripts/rock_query.py page 456                      # get by ID
+  uv run scripts/rock_query.py search "volunteer"            # search across entities
+"""
+
+import argparse
+import json
+import os
+import sys
+import traceback
+
+from rock_client import RockClient, odata_str
+from rock_log import get_logger
+
+log = get_logger("rock.query")
+
+CONNECTION_STATES = {0: "Active", 1: "Inactive", 2: "Future", 3: "Connected"}
+CONNECTION_STATE_FILTER = {v.lower(): k for k, v in CONNECTION_STATES.items()}
+GENDERS = {1: "Male", 2: "Female"}
+GROUP_MEMBER_STATUSES = {0: "Inactive", 1: "Active", 2: "Pending"}
+EXPRESSION_TYPES = {0: "Filter", 1: "GroupAll", 2: "GroupAny", 3: "GroupAllFalse", 4: "GroupAnyFalse"}
+FAMILY_GROUP_TYPE_ID = 10
+KNOWN_RELATIONSHIPS_GROUP_TYPE_ID = 11
+
+
+def _resolve_name(client, endpoint, entity_id, field="Name"):
+    """Look up a single entity's name field by ID. Returns '?' on failure."""
+    if not entity_id:
+        return "?"
+    try:
+        result = client.get(f"{endpoint}/{entity_id}", params={"$select": field})
+        return result.get(field, "?") if result else "?"
+    except Exception as _e:
+        log.debug("lookup failed: %s", _e)
+        return "?"
+
+
+def _resolve_person_name(client, alias_id, cache=None):
+    """Resolve PersonAliasId to 'FirstName LastName'. Uses optional cache dict."""
+    if not alias_id:
+        return "?"
+    if cache is not None and alias_id in cache:
+        return cache[alias_id]
+    try:
+        alias = client.get(f"PersonAlias/{alias_id}", params={"$select": "PersonId"})
+        if alias:
+            p = client.get(f"People/{alias['PersonId']}", params={"$select": "FirstName,LastName"})
+            if p:
+                name = f"{p['FirstName']} {p['LastName']}"
+                if cache is not None:
+                    cache[alias_id] = name
+                return name
+    except Exception as _e:
+        log.debug("lookup failed: %s", _e)
+    if cache is not None:
+        cache[alias_id] = "?"
+    return "?"
+
+
+def _find_entity(client, endpoint, identifier, name_field="Name", label=None):
+    """Find an entity by ID, exact name, or substring match."""
+    label = label or endpoint.rstrip("s").lower()
+    try:
+        eid = int(identifier)
+        result = client.get(f"{endpoint}/{eid}")
+        if result:
+            return result
+    except ValueError:
+        pass
+    results = client.get(endpoint, params={
+        "$filter": f"{name_field} eq '{odata_str(identifier)}'", "$top": 1,
+    })
+    if results:
+        return results[0]
+    results = client.get(endpoint, params={
+        "$filter": f"substringof('{odata_str(identifier)}', {name_field}) eq true", "$top": 5,
+    })
+    if results and len(results) == 1:
+        return results[0]
+    if results:
+        print(f"Multiple {label}s match '{identifier}':")
+        for r in results:
+            print(f"  {r['Id']:5d}  {r.get(name_field, '?')}")
+        return None
+    print(f"No {label} found matching '{identifier}'")
+    return None
+
+
+def _enrich_actions_entity_types(actions, client):
+    """Batch-resolve EntityType FriendlyNames for a list of actions."""
+    eids = {a.get("EntityTypeId") for a in actions if a.get("EntityTypeId")}
+    et_map = {}
+    for eid in eids:
+        try:
+            et = client.get(f"EntityTypes/{eid}", params={"$select": "FriendlyName"})
+            et_map[eid] = et or {}
+        except Exception as _e:
+            log.debug("entity type lookup failed: %s", _e)
+            et_map[eid] = {}
+    for action in actions:
+        action["EntityType"] = et_map.get(action.get("EntityTypeId"), {})
+
+
+def format_workflow_tree(wf):
+    """Format a workflow type as a structural tree."""
+    lines = [f"{wf['Name']} (ID: {wf['Id']})"]
+    desc = wf.get("Description", "")
+    if desc:
+        lines.append(f"  {desc[:120]}")
+    lines.append(f"  Category: {wf.get('CategoryName', 'none')}")
+    lines.append(f"  Active: {wf.get('IsActive', False)}")
+
+    activities = wf.get("ActivityTypes", [])
+    for i, act in enumerate(_by_order(activities)):
+        is_last_act = i == len(activities) - 1
+        prefix = "└─" if is_last_act else "├─"
+        activated = " (activated with workflow)" if act.get("IsActivatedWithWorkflow") else ""
+        lines.append(f"  {prefix} Activity: {act['Name']}{activated}")
+
+        actions = act.get("ActionTypes", [])
+        for j, action in enumerate(_by_order(actions)):
+            is_last = j == len(actions) - 1
+            branch = "   " if is_last_act else "│  "
+            ap = "└─" if is_last else "├─"
+            entity_name = action.get("EntityType", {}).get("FriendlyName", "unknown")
+            lines.append(f"  {branch} {ap} Action: {action['Name']} [{entity_name}]")
+
+    return "\n".join(lines)
+
+
+def _by_order(items):
+    return sorted(items, key=lambda a: a.get("Order", 0))
+
+
+def _find_workflow(identifier, client):
+    """Find a workflow by ID, exact name, or fuzzy search."""
+    return _find_entity(client, "WorkflowTypes", identifier, label="workflow")
+
+
+def _load_workflow_tree(wf, client):
+    """Load full workflow tree: activities, actions, and entity type names."""
+    wf_id = wf["Id"]
+    activities = client.get("WorkflowActivityTypes", params={
+        "$filter": f"WorkflowTypeId eq {wf_id}",
+        "$orderby": "Order",
+    }) or []
+    all_actions = []
+    for act in activities:
+        actions = client.get("WorkflowActionTypes", params={
+            "$filter": f"ActivityTypeId eq {act['Id']}",
+            "$orderby": "Order",
+        }) or []
+        act["ActionTypes"] = actions
+        all_actions.extend(actions)
+    _enrich_actions_entity_types(all_actions, client)
+    wf["ActivityTypes"] = activities
+    return wf
+
+
+def _get_action_settings(client, action_id):
+    """Fetch settings (attribute values) for a workflow action. Returns flat dict or None on error."""
+    try:
+        action = client.get(f"WorkflowActionTypes/{action_id}", params={
+            "loadAttributes": "simple",
+        })
+        if not action:
+            return None
+        attr_values = action.get("AttributeValues", {})
+        flat = {}
+        for k, v in attr_values.items():
+            if isinstance(v, dict):
+                flat[k] = v.get("Value", "")
+            else:
+                flat[k] = str(v) if v else ""
+        return flat
+    except Exception as e:
+        print(f"  Warning: could not load settings for action {action_id}: {e}", file=sys.stderr)
+        return None
+
+
+def cmd_workflows(args, client):
+    params = {
+        "$select": "Id,Name,Description,IsActive,CategoryId",
+        "$orderby": "Name",
+        "$top": args.limit,
+    }
+    if args.category:
+        params["$filter"] = f"Category/Name eq '{odata_str(args.category)}'"
+
+    workflows = client.get("WorkflowTypes", params=params)
+    if not workflows:
+        print("No workflows found.")
+        return
+
+    # Build category ID-to-name map for display
+    cat_ids = {wf["CategoryId"] for wf in workflows if wf.get("CategoryId")}
+    cat_names = {cid: _resolve_name(client, "Categories", cid) for cid in cat_ids}
+
+    print(f"Workflows ({len(workflows)}):\n")
+    for wf in workflows:
+        active = "" if wf.get("IsActive") else " [inactive]"
+        cat_name = cat_names.get(wf.get("CategoryId"), "")
+        cat_str = f" ({cat_name})" if cat_name else ""
+        print(f"  {wf['Id']:5d}  {wf['Name']}{cat_str}{active}")
+
+
+def cmd_workflow(args, client):
+    wf = _find_workflow(args.identifier, client)
+    if not wf:
+        return
+    _load_workflow_tree(wf, client)
+
+    if args.json:
+        print(json.dumps(wf, indent=2))
+    else:
+        print(format_workflow_tree(wf))
+
+
+def cmd_pages(args, client):
+    params = {
+        "$select": "Id,InternalName,PageTitle,ParentPageId,LayoutId,IsSystem",
+        "$orderby": "InternalName",
+        "$top": args.limit,
+    }
+    if args.site:
+        params["$filter"] = f"Layout/SiteId eq {args.site}"
+
+    pages = client.get("Pages", params=params)
+    if not pages:
+        print("No pages found.")
+        return
+
+    print(f"Pages ({len(pages)}):\n")
+    for p in pages:
+        name = p.get("InternalName") or p.get("PageTitle") or "(untitled)"
+        system = " [system]" if p.get("IsSystem") else ""
+        print(f"  {p['Id']:5d}  {name}{system}")
+
+
+def cmd_page(args, client):
+    identifier = args.identifier
+    page = None
+
+    # Try as ID
+    try:
+        page_id = int(identifier)
+        page = client.get(f"Pages/{page_id}")
+    except ValueError:
+        pass
+
+    # Try as route
+    if not page:
+        routes = client.get("PageRoutes", params={
+            "$filter": f"Route eq '{odata_str(identifier.lstrip('/'))}'",
+            "$top": 1,
+        })
+        if routes:
+            page_id = routes[0].get("PageId")
+            if page_id:
+                page = client.get(f"Pages/{page_id}")
+
+    # Search by name
+    if not page:
+        results = client.get("Pages", params={
+            "$filter": f"substringof('{odata_str(identifier)}', InternalName) eq true",
+            "$top": 5,
+        })
+        if results:
+            if len(results) == 1:
+                page = results[0]
+            else:
+                print(f"Multiple pages match '{identifier}':")
+                for r in results:
+                    name = r.get("InternalName") or r.get("PageTitle") or "(untitled)"
+                    print(f"  {r['Id']:5d}  {name}")
+                return
+
+    if not page:
+        print(f"No page found matching '{identifier}'")
+        return
+
+    # Get blocks on this page
+    blocks = client.get("Blocks", params={
+        "$filter": f"PageId eq {page['Id']}",
+        "$orderby": "Zone,Order",
+    })
+    if blocks:
+        bt_ids = {b.get("BlockTypeId") for b in blocks if b.get("BlockTypeId")}
+        bt_names = {btid: _resolve_name(client, "BlockTypes", btid) for btid in bt_ids}
+        for b in blocks:
+            b["BlockType"] = {"Name": bt_names.get(b.get("BlockTypeId"), "unknown")}
+
+    # Get routes
+    routes = client.get("PageRoutes", params={
+        "$filter": f"PageId eq {page['Id']}",
+        "$select": "Route",
+    })
+
+    if args.json:
+        page["Blocks"] = blocks or []
+        page["Routes"] = routes or []
+        print(json.dumps(page, indent=2))
+    else:
+        name = page.get("InternalName") or page.get("PageTitle") or "(untitled)"
+        print(f"{name} (ID: {page['Id']})")
+        if routes:
+            print(f"  Routes: {', '.join('/' + r['Route'] for r in routes)}")
+        print(f"  Layout ID: {page.get('LayoutId')}")
+        if blocks:
+            print(f"  Blocks ({len(blocks)}):")
+            current_zone = None
+            for b in blocks:
+                zone = b.get("Zone", "Main")
+                if zone != current_zone:
+                    current_zone = zone
+                    print(f"    Zone: {zone}")
+                bt_name = b.get("BlockType", {}).get("Name", "unknown")
+                print(f"      {b['Name'] or bt_name} [{bt_name}]")
+
+
+def cmd_search(args, client):
+    query = args.query
+    print(f"Searching for '{query}'...\n")
+
+    # Search workflows
+    workflows = client.get("WorkflowTypes", params={
+        "$filter": f"substringof('{odata_str(query)}', Name) eq true or substringof('{odata_str(query)}', Description) eq true",
+        "$select": "Id,Name,IsActive",
+        "$top": 10,
+    })
+    if workflows:
+        print(f"Workflows ({len(workflows)}):")
+        for wf in workflows:
+            print(f"  {wf['Id']:5d}  {wf['Name']}")
+        print()
+
+    # Search pages
+    pages = client.get("Pages", params={
+        "$filter": f"substringof('{odata_str(query)}', InternalName) eq true or substringof('{odata_str(query)}', PageTitle) eq true",
+        "$select": "Id,InternalName,PageTitle",
+        "$top": 10,
+    })
+    if pages:
+        print(f"Pages ({len(pages)}):")
+        for p in pages:
+            name = p.get("InternalName") or p.get("PageTitle") or "(untitled)"
+            print(f"  {p['Id']:5d}  {name}")
+        print()
+
+    # Search data views
+    dvs = client.get("DataViews", params={
+        "$filter": f"substringof('{odata_str(query)}', Name) eq true",
+        "$select": "Id,Name",
+        "$top": 10,
+    })
+    if dvs:
+        print(f"Data Views ({len(dvs)}):")
+        for dv in dvs:
+            print(f"  {dv['Id']:5d}  {dv['Name']}")
+        print()
+
+    # Search groups
+    groups = client.get("Groups", params={
+        "$filter": f"substringof('{odata_str(query)}', Name) eq true and GroupTypeId ne {FAMILY_GROUP_TYPE_ID} and GroupTypeId ne {KNOWN_RELATIONSHIPS_GROUP_TYPE_ID}",
+        "$select": "Id,Name",
+        "$top": 10,
+    })
+    if groups:
+        print(f"Groups ({len(groups)}):")
+        for g in groups:
+            print(f"  {g['Id']:5d}  {g['Name']}")
+        print()
+
+    if not workflows and not pages and not dvs and not groups:
+        print("No results found.")
+
+
+def _check_email(action, activity, settings, issues):
+    prefix = f"Action '{action['Name']}' in '{activity['Name']}'"
+    if not settings.get("To") and not settings.get("SendToEmailAddresses"):
+        issues.append(f"{prefix}: SendEmail has no recipient")
+    if not settings.get("Subject"):
+        issues.append(f"{prefix}: SendEmail has no Subject")
+    if not settings.get("Body"):
+        issues.append(f"{prefix}: SendEmail has no Body")
+
+
+def _check_sms(action, activity, settings, issues):
+    prefix = f"Action '{action['Name']}' in '{activity['Name']}'"
+    if not settings.get("To") and not settings.get("Recipient"):
+        issues.append(f"{prefix}: SendSms has no recipient")
+    if not settings.get("Message") and not settings.get("Body"):
+        issues.append(f"{prefix}: SendSms has no message body")
+
+
+def _print_audit(wf, issues, warnings):
+    active = "Active" if wf.get("IsActive") else "Inactive"
+    print(f"Audit: {wf['Name']} (ID: {wf['Id']})")
+    print(f"Status: {active}")
+    print()
+
+    activities = sorted(wf.get("ActivityTypes", []), key=lambda a: a.get("Order", 0))
+    if activities:
+        print("Structure:")
+        for i, act in enumerate(activities):
+            is_last = i == len(activities) - 1
+            prefix = "  └─" if is_last else "  ├─"
+            activated = " (activated)" if act.get("IsActivatedWithWorkflow") else ""
+            actions = sorted(act.get("ActionTypes", []), key=lambda a: a.get("Order", 0))
+            print(f"{prefix} {act['Name']}{activated} [{len(actions)} actions]")
+            for j, action in enumerate(actions):
+                is_last_action = j == len(actions) - 1
+                branch = "     " if is_last else "  │  "
+                ap = "└─" if is_last_action else "├─"
+                entity_name = (action.get("EntityType") or {}).get("FriendlyName", "?")
+                print(f"{branch} {ap} {action['Name']} [{entity_name}]")
+        print()
+
+    if issues:
+        print(f"Issues ({len(issues)}):")
+        for issue in issues:
+            print(f"  ✗ {issue}")
+        print()
+
+    if warnings:
+        print(f"Warnings ({len(warnings)}):")
+        for w in warnings:
+            print(f"  ! {w}")
+        print()
+
+    if not issues and not warnings:
+        print("✓ No issues found")
+
+
+def cmd_audit(args, client):
+    wf = _find_workflow(args.identifier, client)
+    if not wf:
+        return
+    _load_workflow_tree(wf, client)
+    if not wf:
+        return
+
+    issues = []
+    warnings = []
+
+    if not wf.get("IsActive"):
+        warnings.append("Workflow is inactive")
+
+    activities = sorted(wf.get("ActivityTypes", []), key=lambda a: a.get("Order", 0))
+
+    if not activities:
+        issues.append("Workflow has no activities")
+        _print_audit(wf, issues, warnings)
+        return
+
+    if not activities[0].get("IsActivatedWithWorkflow"):
+        issues.append(f"First activity '{activities[0]['Name']}' is not activated with workflow")
+
+    act_orders = [a.get("Order", 0) for a in activities]
+    if len(act_orders) != len(set(act_orders)):
+        issues.append(f"Duplicate activity orders: {act_orders}")
+
+    reachable = set()
+    for act in activities:
+        if act.get("IsActivatedWithWorkflow"):
+            reachable.add(str(act["Id"]))
+
+    for act in activities:
+        actions = _by_order(act.get("ActionTypes", []))
+
+        if not actions:
+            issues.append(f"Activity '{act['Name']}' (ID: {act['Id']}) has no actions")
+            continue
+
+        action_orders = [a.get("Order", 0) for a in actions]
+        if len(action_orders) != len(set(action_orders)):
+            issues.append(f"Duplicate action orders in '{act['Name']}': {action_orders}")
+
+        for i, action in enumerate(actions):
+            entity = action.get("EntityType") or {}
+            entity_name = entity.get("FriendlyName", "")
+
+            if not action.get("EntityTypeId") and not entity_name:
+                issues.append(
+                    f"Action '{action['Name']}' in '{act['Name']}' has no action type (broken reference)"
+                )
+                continue
+
+            if action.get("IsActivityCompletedOnSuccess") and i < len(actions) - 1:
+                warnings.append(
+                    f"Action '{action['Name']}' completes activity but isn't last in '{act['Name']}'"
+                )
+
+            settings = None
+
+            if entity_name and "activate" in entity_name.lower():
+                settings = _get_action_settings(client, action["Id"])
+                if settings:
+                    for key in ("Activity", "ActivityType", "ActivityTypeGuid"):
+                        val = settings.get(key, "")
+                        if val:
+                            reachable.add(str(val))
+
+            if not args.skip_settings and entity_name:
+                name_lower = entity_name.lower().replace(" ", "")
+                if "sendemail" in name_lower or "sendsms" in name_lower:
+                    if settings is None:
+                        settings = _get_action_settings(client, action["Id"])
+                    if settings is not None:
+                        if "sendemail" in name_lower:
+                            _check_email(action, act, settings, issues)
+                        else:
+                            _check_sms(action, act, settings, issues)
+
+    for act in activities:
+        if str(act["Id"]) not in reachable and not act.get("IsActivatedWithWorkflow"):
+            warnings.append(f"Activity '{act['Name']}' (ID: {act['Id']}) may be unreachable")
+
+    _print_audit(wf, issues, warnings)
+
+
+def cmd_actions(args, client):
+    act_id = int(args.activity_id)
+
+    act = client.get(f"WorkflowActivityTypes/{act_id}")
+    if not act:
+        print(f"Activity {act_id} not found")
+        return
+
+    actions = client.get("WorkflowActionTypes", params={
+        "$filter": f"ActivityTypeId eq {act_id}",
+        "$orderby": "Order",
+    }) or []
+    _enrich_actions_entity_types(actions, client)
+    print(f"Activity: {act['Name']} (ID: {act['Id']})")
+    print(f"  Activated with workflow: {act.get('IsActivatedWithWorkflow', False)}")
+    print(f"  Actions: {len(actions)}")
+    print()
+
+    for action in actions:
+        entity = action.get("EntityType") or {}
+        entity_name = entity.get("FriendlyName", "unknown")
+        print(f"  [{action.get('Order', '?')}] {action['Name']} (ID: {action['Id']})")
+        print(f"      Type: {entity_name}")
+        print(f"      Completes action: {action.get('IsActionCompletedOnSuccess', False)}")
+        print(f"      Completes activity: {action.get('IsActivityCompletedOnSuccess', False)}")
+
+        settings = _get_action_settings(client, action["Id"])
+        if settings:
+            print("      Settings:")
+            for k, v in settings.items():
+                val = str(v)[:120] + ("..." if len(str(v)) > 120 else "")
+                print(f"        {k}: {val}")
+        print()
+
+
+def cmd_attributes(args, client):
+    wf = _find_workflow(args.identifier, client)
+    if not wf:
+        return
+
+    attrs = client.get("Attributes", params={
+        "$filter": f"EntityTypeQualifierColumn eq 'WorkflowTypeId' and EntityTypeQualifierValue eq '{wf['Id']}'",
+        "$orderby": "Order",
+    })
+
+    if not attrs:
+        print(f"No attributes on '{wf['Name']}' (ID: {wf['Id']})")
+        return
+
+    # Resolve field type names
+    ft_ids = {a.get("FieldTypeId") for a in attrs if a.get("FieldTypeId")}
+    ft_names = {fid: _resolve_name(client, "FieldTypes", fid) for fid in ft_ids}
+
+    print(f"Attributes on '{wf['Name']}' (ID: {wf['Id']}):\n")
+    for attr in attrs:
+        ft = ft_names.get(attr.get("FieldTypeId"), "?")
+        req = " [required]" if attr.get("IsRequired") else ""
+        grid = " [grid]" if attr.get("IsGridColumn") else ""
+        print(f"  {attr.get('Order', '?'):3d}  {attr['Key']} ({ft}){req}{grid}")
+        if attr.get("Description"):
+            print(f"       {attr['Description'][:100]}")
+
+
+def cmd_dataviews(args, client):
+    params = {
+        "$select": "Id,Name,Description,EntityTypeId,CategoryId",
+        "$orderby": "Name",
+        "$top": args.limit,
+    }
+    if args.category:
+        params["$filter"] = f"substringof('{odata_str(args.category)}', Name) eq true"
+
+    dvs = client.get("DataViews", params=params)
+    if not dvs:
+        print("No data views found.")
+        return
+
+    print(f"Data Views ({len(dvs)}):\n")
+    for dv in dvs:
+        print(f"  {dv['Id']:5d}  {dv['Name']}")
+
+
+def _resolve_entity_type_name(client, entity_type_id):
+    if not entity_type_id:
+        return "unknown"
+    name = _resolve_name(client, "EntityTypes", entity_type_id, field="FriendlyName")
+    return "unknown" if name == "?" else name
+
+
+def _load_filter_tree(client, filter_id, depth=0):
+    """Recursively load a data view filter and its children."""
+    f = client.get(f"DataViewFilters/{filter_id}")
+    if not f:
+        return None
+
+    entity_name = _resolve_entity_type_name(client, f.get("EntityTypeId"))
+    prefix = "  " * depth
+    expr = EXPRESSION_TYPES.get(f.get("ExpressionType", 0), f"Type:{f.get('ExpressionType')}")
+
+    lines = []
+    if f.get("ExpressionType", 0) in (1, 2, 3, 4):
+        lines.append(f"{prefix}[{expr}]")
+    else:
+        selection = f.get("Selection", "") or ""
+        sel_short = selection[:120] + ("..." if len(selection) > 120 else "")
+        related_dv = f.get("RelatedDataViewId")
+        dv_note = f" (references DataView:{related_dv})" if related_dv else ""
+        lines.append(f"{prefix}Filter [{entity_name}]: {sel_short}{dv_note}")
+
+    children = client.get("DataViewFilters", params={
+        "$filter": f"ParentId eq {filter_id}",
+        "$select": "Id",
+    }) or []
+    for child in children:
+        child_lines = _load_filter_tree(client, child["Id"], depth + 1)
+        if child_lines:
+            lines.extend(child_lines)
+
+    return lines
+
+
+def cmd_dataview(args, client):
+    dv = _find_entity(client, "DataViews", args.identifier, label="data view")
+    if not dv:
+        return
+
+    if args.json:
+        print(json.dumps(dv, indent=2))
+        return
+
+    print(f"{dv['Name']} (ID: {dv['Id']})")
+    if dv.get("Description"):
+        print(f"  {dv['Description'][:200]}")
+
+    entity_name = _resolve_entity_type_name(client, dv.get("EntityTypeId"))
+    print(f"  Entity: {entity_name}")
+
+    transform_name = _resolve_entity_type_name(client, dv.get("TransformEntityTypeId"))
+    if dv.get("TransformEntityTypeId"):
+        print(f"  Transform: {transform_name}")
+
+    if dv.get("CategoryId"):
+        cat_name = _resolve_name(client, "Categories", dv["CategoryId"])
+        if cat_name != "?":
+            print(f"  Category: {cat_name}")
+
+    persisted = dv.get("PersistedScheduleIntervalMinutes")
+    if persisted:
+        print(f"  Persisted: every {persisted} min (last: {dv.get('PersistedLastRefreshDateTime', 'never')})")
+    print(f"  Last run: {dv.get('LastRunDateTime', 'never')} ({dv.get('TimeToRunDurationMilliseconds', 0)}ms)")
+
+    filter_id = dv.get("DataViewFilterId")
+    if filter_id:
+        print(f"\n  Filters:")
+        lines = _load_filter_tree(client, filter_id, depth=2)
+        if lines:
+            for line in lines:
+                print(line)
+    print()
+
+
+def cmd_person(args, client):
+    identifier = args.identifier
+
+    person = None
+    try:
+        pid = int(identifier)
+        person = client.get(f"People/{pid}")
+        if person:
+            _print_person(person, client)
+            return
+    except ValueError:
+        pass
+
+    # Search by email
+    if "@" in identifier:
+        results = client.get("People", params={
+            "$filter": f"Email eq '{odata_str(identifier)}'",
+            "$top": 5,
+        })
+    else:
+        parts = identifier.strip().split()
+        if len(parts) >= 2:
+            results = client.get("People", params={
+                "$filter": f"FirstName eq '{odata_str(parts[0])}' and LastName eq '{odata_str(parts[-1])}'",
+                "$top": 10,
+            })
+        else:
+            results = client.get("People", params={
+                "$filter": f"LastName eq '{odata_str(parts[0])}'",
+                "$top": 10,
+            })
+
+    if not results:
+        print(f"No person found matching '{identifier}'")
+        return
+
+    if len(results) == 1:
+        _print_person(results[0], client)
+    else:
+        print(f"People matching '{identifier}':\n")
+        campus_cache = {}
+        for p in results:
+            email = f" ({p.get('Email', '')})" if p.get("Email") else ""
+            campus = ""
+            if p.get("PrimaryCampusId"):
+                cid = p["PrimaryCampusId"]
+                if cid not in campus_cache:
+                    campus_cache[cid] = _resolve_name(client, "Campuses", cid)
+                if campus_cache[cid] != "?":
+                    campus = f" [{campus_cache[cid]}]"
+            print(f"  {p['Id']:6d}  {p.get('FirstName', '')} {p.get('LastName', '')}{email}{campus}")
+
+
+def _print_person(person, client):
+    print(f"{person.get('FirstName', '')} {person.get('LastName', '')} (ID: {person['Id']})")
+    if person.get("Email"):
+        print(f"  Email: {person['Email']}")
+    if person.get("Gender") and person["Gender"] != 0:
+        print(f"  Gender: {GENDERS.get(person['Gender'], 'Unknown')}")
+    if person.get("BirthDate"):
+        print(f"  DOB: {person['BirthDate'][:10]}")
+    if person.get("ConnectionStatusValueId"):
+        val = _resolve_name(client, "DefinedValues", person["ConnectionStatusValueId"], field="Value")
+        if val != "?":
+            print(f"  Connection Status: {val}")
+    if person.get("RecordStatusValueId"):
+        val = _resolve_name(client, "DefinedValues", person["RecordStatusValueId"], field="Value")
+        if val != "?":
+            print(f"  Record Status: {val}")
+    if person.get("PrimaryCampusId"):
+        campus = _resolve_name(client, "Campuses", person["PrimaryCampusId"])
+        if campus != "?":
+            print(f"  Campus: {campus}")
+
+    # Family
+    role_cache = {}
+    try:
+        families = client.get(f"Groups/GetFamilies/{person['Id']}")
+        if families:
+            for fam in families:
+                members = client.get("GroupMembers", params={
+                    "$filter": f"GroupId eq {fam['Id']}",
+                    "$select": "PersonId,GroupRoleId",
+                })
+                roles = {}
+                for m in (members or []):
+                    rid = m["GroupRoleId"]
+                    if rid not in role_cache:
+                        role_cache[rid] = _resolve_name(client, "GroupTypeRoles", rid)
+                    roles[m["PersonId"]] = role_cache[rid]
+                print(f"  Family: {fam['Name']} (ID: {fam['Id']})")
+                for m in (members or []):
+                    if m["PersonId"] == person["Id"]:
+                        continue
+                    try:
+                        p = client.get(f"People/{m['PersonId']}", params={"$select": "FirstName,LastName"})
+                        if p:
+                            print(f"    {roles.get(m['PersonId'], '?'):10s} {p['FirstName']} {p['LastName']}")
+                    except Exception as _e:
+                        log.debug("lookup failed: %s", _e)
+    except Exception as _e:
+        log.debug("lookup failed: %s", _e)
+
+    # Known relationships
+    try:
+        rel_groups = client.get("Groups", params={
+            "$filter": f"GroupTypeId eq {KNOWN_RELATIONSHIPS_GROUP_TYPE_ID} and Members/any(m: m/PersonId eq {person['Id']})",
+            "$select": "Id",
+            "$top": 1,
+        })
+        if rel_groups:
+            members = client.get("GroupMembers", params={
+                "$filter": f"GroupId eq {rel_groups[0]['Id']} and PersonId ne {person['Id']}",
+                "$select": "PersonId,GroupRoleId",
+            })
+            if members:
+                print(f"  Known Relationships:")
+                for m in members:
+                    try:
+                        p = client.get(f"People/{m['PersonId']}", params={"$select": "FirstName,LastName"})
+                        pname = f"{p['FirstName']} {p['LastName']}" if p else f"Person:{m['PersonId']}"
+                        rid = m["GroupRoleId"]
+                        if rid not in role_cache:
+                            role_cache[rid] = _resolve_name(client, "GroupTypeRoles", rid)
+                        print(f"    {role_cache[rid]:20s} {pname}")
+                    except Exception as _e:
+                        log.debug("lookup failed: %s", _e)
+    except Exception as _e:
+        log.debug("lookup failed: %s", _e)
+
+
+def cmd_group(args, client):
+    group = _find_entity(client, "Groups", args.identifier, label="group")
+    if not group:
+        return
+
+    if args.json:
+        print(json.dumps(group, indent=2))
+        return
+
+    print(f"{group['Name']} (ID: {group['Id']})")
+    if group.get("Description"):
+        print(f"  {group['Description'][:200]}")
+
+    # Group type
+    if group.get("GroupTypeId"):
+        gt_name = _resolve_name(client, "GroupTypes", group["GroupTypeId"])
+        if gt_name != "?":
+            print(f"  Type: {gt_name}")
+
+    print(f"  Active: {group.get('IsActive', False)}")
+    if group.get("CampusId"):
+        campus_name = _resolve_name(client, "Campuses", group["CampusId"])
+        if campus_name != "?":
+            print(f"  Campus: {campus_name}")
+    if group.get("ScheduleId"):
+        sched_name = _resolve_name(client, "Schedules", group["ScheduleId"])
+        if sched_name != "?":
+            print(f"  Schedule: {sched_name}")
+
+    # Members
+    members = client.get("GroupMembers", params={
+        "$filter": f"GroupId eq {group['Id']}",
+        "$select": "PersonId,GroupRoleId,GroupMemberStatus",
+        "$top": args.limit,
+    })
+    if members:
+        role_cache = {}
+        print(f"  Members ({len(members)}):")
+        for m in members:
+            rid = m.get("GroupRoleId")
+            if rid not in role_cache:
+                role_cache[rid] = _resolve_name(client, "GroupTypeRoles", rid)
+            try:
+                p = client.get(f"People/{m['PersonId']}", params={"$select": "FirstName,LastName"})
+                pname = f"{p['FirstName']} {p['LastName']}" if p else f"ID:{m['PersonId']}"
+            except Exception as _e:
+                log.debug("person lookup failed: %s", _e)
+                pname = f"ID:{m['PersonId']}"
+            status = GROUP_MEMBER_STATUSES.get(m.get("GroupMemberStatus"), "?")
+            print(f"    {pname:30s} {role_cache[rid]:15s} [{status}]")
+
+
+def cmd_report(args, client):
+    report = _find_entity(client, "Reports", args.identifier, label="report")
+    if not report:
+        return
+
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return
+
+    print(f"{report['Name']} (ID: {report['Id']})")
+    if report.get("Description"):
+        print(f"  {report['Description'][:200]}")
+
+    if report.get("DataViewId"):
+        dv_name = _resolve_name(client, "DataViews", report["DataViewId"])
+        if dv_name != "?":
+            print(f"  Data View: {dv_name} (ID: {report['DataViewId']})")
+        else:
+            print(f"  Data View ID: {report['DataViewId']}")
+
+    if report.get("CategoryId"):
+        cat_name = _resolve_name(client, "Categories", report["CategoryId"])
+        if cat_name != "?":
+            print(f"  Category: {cat_name}")
+
+    # Report fields
+    fields = client.get("ReportFields", params={
+        "$filter": f"ReportId eq {report['Id']}",
+        "$select": "ReportFieldType,ShowInGrid,ColumnOrder,ColumnHeaderText,DataSelectComponentEntityTypeId",
+    }) or []
+    if fields:
+        print(f"  Fields ({len(fields)}):")
+        for f in sorted(fields, key=lambda x: x.get("ColumnOrder", 0)):
+            header = f.get("ColumnHeaderText", "") or "(no header)"
+            print(f"    {f.get('ColumnOrder', '?'):3}  {header}")
+
+
+def cmd_exceptions(args, client):
+    params = {
+        "$orderby": "CreatedDateTime desc",
+        "$top": args.limit,
+    }
+    if args.type:
+        params["$filter"] = f"substringof('{odata_str(args.type)}', ExceptionType) eq true"
+
+    exceptions = client.get("ExceptionLogs", params=params)
+    if not exceptions:
+        print("No exceptions found.")
+        return
+
+    if args.summary:
+        # Group by ExceptionType and count
+        counts = {}
+        for ex in exceptions:
+            et = ex.get("ExceptionType", "Unknown")
+            short = et.split(".")[-1] if "." in et else et
+            counts[short] = counts.get(short, 0) + 1
+        print(f"Exception summary (last {args.limit}):\n")
+        for etype, count in sorted(counts.items(), key=lambda x: -x[1]):
+            print(f"  {count:4d}  {etype}")
+        return
+
+    print(f"Exceptions (last {len(exceptions)}):\n")
+    for ex in exceptions:
+        dt = (ex.get("CreatedDateTime") or "")[:19]
+        etype = ex.get("ExceptionType", "Unknown")
+        short_type = etype.split(".")[-1] if "." in etype else etype
+        desc = (ex.get("Description") or "")[:120]
+        url = ex.get("PageUrl", "")
+        print(f"  {ex['Id']:6d}  [{dt}] {short_type}")
+        if desc:
+            print(f"    {desc}")
+        if url:
+            print(f"    URL: {url}")
+        if args.verbose and ex.get("StackTrace"):
+            trace_lines = ex["StackTrace"].split("\n")[:5]
+            for line in trace_lines:
+                print(f"    {line.strip()}")
+        print()
+
+
+def cmd_exception(args, client):
+    ex = client.get(f"ExceptionLogs/{args.id}")
+    if not ex:
+        print(f"Exception {args.id} not found")
+        return
+
+    if args.json:
+        print(json.dumps(ex, indent=2))
+        return
+
+    dt = (ex.get("CreatedDateTime") or "")[:19]
+    print(f"Exception {ex['Id']} ({dt})")
+    print(f"  Type: {ex.get('ExceptionType', 'Unknown')}")
+    if ex.get("StatusCode"):
+        print(f"  HTTP Status: {ex['StatusCode']}")
+    if ex.get("Source"):
+        print(f"  Source: {ex['Source']}")
+    if ex.get("Description"):
+        print(f"  Description: {ex['Description']}")
+    if ex.get("PageUrl"):
+        print(f"  URL: {ex['PageUrl']}")
+    if ex.get("StackTrace"):
+        print(f"  Stack Trace:")
+        for line in ex["StackTrace"].split("\n")[:15]:
+            print(f"    {line.strip()}")
+    if ex.get("HasInnerException") and ex.get("Id"):
+        children = client.get("ExceptionLogs", params={
+            "$filter": f"ParentId eq {ex['Id']}",
+            "$top": 1,
+        })
+        if children:
+            print(f"  Inner Exception: {children[0].get('ExceptionType', '?')}")
+            if children[0].get("Description"):
+                print(f"    {children[0]['Description'][:200]}")
+
+
+def cmd_schedules(args, client):
+    params = {
+        "$select": "Id,Name,IsActive",
+        "$orderby": "Name",
+        "$top": args.limit,
+    }
+    filters = []
+    if args.active:
+        filters.append("IsActive eq true")
+    if args.query:
+        filters.append(f"substringof('{odata_str(args.query)}', Name) eq true")
+    if filters:
+        params["$filter"] = " and ".join(filters)
+
+    schedules = client.get("Schedules", params=params)
+    if not schedules:
+        print("No schedules found.")
+        return
+
+    print(f"Schedules ({len(schedules)}):\n")
+    for s in schedules:
+        active = "" if s.get("IsActive") else " [inactive]"
+        print(f"  {s['Id']:5d}  {s['Name']}{active}")
+
+
+def cmd_schedule(args, client):
+    schedule = _find_entity(client, "Schedules", args.identifier, label="schedule")
+    if not schedule:
+        return
+
+    if args.json:
+        print(json.dumps(schedule, indent=2))
+        return
+
+    print(f"{schedule['Name']} (ID: {schedule['Id']})")
+    print(f"  Active: {schedule.get('IsActive', False)}")
+    if schedule.get("Description"):
+        print(f"  Description: {schedule['Description'][:200]}")
+    if schedule.get("EffectiveStartDate"):
+        print(f"  Start: {schedule['EffectiveStartDate'][:10]}")
+    if schedule.get("EffectiveEndDate"):
+        print(f"  End: {schedule['EffectiveEndDate'][:10]}")
+    if schedule.get("CheckInStartOffsetMinutes"):
+        print(f"  Check-in window: -{schedule['CheckInStartOffsetMinutes']}min to +{schedule.get('CheckInEndOffsetMinutes', 0)}min")
+    if schedule.get("CategoryId"):
+        cat_name = _resolve_name(client, "Categories", schedule["CategoryId"])
+        if cat_name != "?":
+            print(f"  Category: {cat_name}")
+
+
+def cmd_registrations(args, client):
+    params = {
+        "$select": "Id,Name,StartDateTime,EndDateTime,MaxAttendees,IsActive,RegistrationTemplateId",
+        "$orderby": "StartDateTime desc",
+        "$top": args.limit,
+    }
+    filters = []
+    if args.active:
+        filters.append("IsActive eq true")
+    if args.query:
+        filters.append(f"substringof('{odata_str(args.query)}', Name) eq true")
+    if filters:
+        params["$filter"] = " and ".join(filters)
+
+    regs = client.get("RegistrationInstances", params=params)
+    if not regs:
+        print("No registration instances found.")
+        return
+
+    print(f"Registration Instances ({len(regs)}):\n")
+    for r in regs:
+        active = "" if r.get("IsActive") else " [inactive]"
+        start = (r.get("StartDateTime") or "")[:10]
+        end = (r.get("EndDateTime") or "")[:10]
+        date_range = f" ({start} to {end})" if start else ""
+        max_att = f" [max: {r['MaxAttendees']}]" if r.get("MaxAttendees") else ""
+        print(f"  {r['Id']:5d}  {r['Name']}{active}{date_range}{max_att}")
+
+
+def cmd_registration(args, client):
+    reg = _find_entity(client, "RegistrationInstances", args.identifier, label="registration")
+    if not reg:
+        return
+
+    if args.json:
+        print(json.dumps(reg, indent=2))
+        return
+
+    print(f"{reg['Name']} (ID: {reg['Id']})")
+    print(f"  Active: {reg.get('IsActive', False)}")
+    if reg.get("StartDateTime"):
+        print(f"  Start: {reg['StartDateTime'][:19]}")
+    if reg.get("EndDateTime"):
+        print(f"  End: {reg['EndDateTime'][:19]}")
+    if reg.get("MaxAttendees"):
+        print(f"  Max Attendees: {reg['MaxAttendees']}")
+    if reg.get("Cost"):
+        print(f"  Cost: ${reg['Cost']}")
+    if reg.get("ContactEmail"):
+        print(f"  Contact: {reg['ContactEmail']}")
+
+    # Registration template
+    if reg.get("RegistrationTemplateId"):
+        tmpl_name = _resolve_name(client, "RegistrationTemplates", reg["RegistrationTemplateId"])
+        if tmpl_name != "?":
+            print(f"  Template: {tmpl_name} (ID: {reg['RegistrationTemplateId']})")
+        else:
+            print(f"  Template ID: {reg['RegistrationTemplateId']}")
+
+    # Linked workflow
+    if reg.get("RegistrationWorkflowTypeId"):
+        wf_name = _resolve_name(client, "WorkflowTypes", reg["RegistrationWorkflowTypeId"])
+        if wf_name != "?":
+            print(f"  Workflow: {wf_name} (ID: {reg['RegistrationWorkflowTypeId']})")
+
+    if reg.get("Details"):
+        print(f"  Details: {reg['Details'][:200]}")
+
+
+def cmd_connections(args, client):
+    params = {
+        "$orderby": "CreatedDateTime desc",
+        "$top": args.limit,
+    }
+    filters = []
+    if args.state and args.state.lower() in CONNECTION_STATE_FILTER:
+        filters.append(f"ConnectionState eq {CONNECTION_STATE_FILTER[args.state.lower()]}")
+    if args.opportunity:
+        filters.append(f"substringof('{odata_str(args.opportunity)}', ConnectionOpportunity/Name) eq true")
+    if filters:
+        params["$filter"] = " and ".join(filters)
+
+    requests = client.get("ConnectionRequests", params=params)
+    if not requests:
+        print("No connection requests found.")
+        return
+
+    opp_cache = {}
+    status_cache = {}
+    person_cache = {}
+
+    print(f"Connection Requests ({len(requests)}):\n")
+    for cr in requests:
+        dt = (cr.get("CreatedDateTime") or "")[:10]
+        person = _resolve_person_name(client, cr.get("PersonAliasId"), person_cache)
+        connector = _resolve_person_name(client, cr.get("ConnectorPersonAliasId"), person_cache) if cr.get("ConnectorPersonAliasId") else "unassigned"
+        state = CONNECTION_STATES.get(cr.get("ConnectionState"), "?")
+
+        opp_id = cr.get("ConnectionOpportunityId")
+        if opp_id and opp_id not in opp_cache:
+            opp_cache[opp_id] = _resolve_name(client, "ConnectionOpportunities", opp_id)
+        opp_name = opp_cache.get(opp_id, "?")
+
+        status_id = cr.get("ConnectionStatusId")
+        if status_id and status_id not in status_cache:
+            status_cache[status_id] = _resolve_name(client, "ConnectionStatuses", status_id)
+        status_name = status_cache.get(status_id, "?")
+
+        print(f"  {cr['Id']:6d}  [{state:9s}] {person:25s} -> {connector}")
+        print(f"          {opp_name} | {status_name} | {dt}")
+        if cr.get("Comments"):
+            print(f"          {cr['Comments'][:100]}")
+        print()
+
+
+def cmd_block(args, client):
+    block_id = int(args.id)
+    block = client.get(f"Blocks/{block_id}", params={"loadAttributes": "simple"})
+    if not block:
+        print(f"Block {block_id} not found")
+        return
+
+    if args.json:
+        print(json.dumps(block, indent=2))
+        return
+
+    print(f"{block.get('Name', '(unnamed)')} (ID: {block['Id']})")
+    if block.get("BlockTypeId"):
+        bt_name = _resolve_name(client, "BlockTypes", block["BlockTypeId"])
+        if bt_name != "?":
+            print(f"  Block Type: {bt_name}")
+    print(f"  Zone: {block.get('Zone', '?')}")
+    print(f"  Order: {block.get('Order', '?')}")
+    if block.get("PageId"):
+        print(f"  Page ID: {block['PageId']}")
+
+    avs = block.get("AttributeValues", {})
+    if avs:
+        print(f"  Attributes ({len(avs)}):")
+        for key, val in avs.items():
+            if isinstance(val, dict):
+                v = val.get("Value", "")
+            else:
+                v = str(val) if val else ""
+            if not v:
+                continue
+            # Truncate long values but show more for HTML/Lava
+            max_len = 300 if key.lower() in ("query", "formattedoutput", "template", "lavatemplate") else 150
+            display = v[:max_len] + ("..." if len(v) > max_len else "")
+            print(f"    {key}: {display}")
+
+
+def cmd_bgc(args, client):
+    params = {
+        "$orderby": "RequestDate desc",
+        "$top": args.limit,
+    }
+    filters = []
+    if args.status:
+        filters.append(f"substringof('{odata_str(args.status)}', Status) eq true")
+    if args.person:
+        # Find person first
+        try:
+            pid = int(args.person)
+            alias = client.get("PersonAlias", params={
+                "$filter": f"PersonId eq {pid}", "$top": 1, "$select": "Id",
+            })
+            if alias:
+                filters.append(f"PersonAliasId eq {alias[0]['Id']}")
+        except ValueError:
+            parts = args.person.strip().split()
+            if len(parts) >= 2:
+                people = client.get("People", params={
+                    "$filter": f"FirstName eq '{odata_str(parts[0])}' and LastName eq '{odata_str(parts[-1])}'",
+                    "$select": "Id", "$top": 1,
+                })
+            else:
+                people = client.get("People", params={
+                    "$filter": f"LastName eq '{odata_str(parts[0])}'",
+                    "$select": "Id", "$top": 1,
+                })
+            if people:
+                alias = client.get("PersonAlias", params={
+                    "$filter": f"PersonId eq {people[0]['Id']}", "$top": 1, "$select": "Id",
+                })
+                if alias:
+                    filters.append(f"PersonAliasId eq {alias[0]['Id']}")
+    if filters:
+        params["$filter"] = " and ".join(filters)
+
+    checks = client.get("BackgroundChecks", params=params)
+    if not checks:
+        print("No background checks found.")
+        return
+
+    person_cache = {}
+
+    print(f"Background Checks ({len(checks)}):\n")
+    for bc in checks:
+        req_date = (bc.get("RequestDate") or "")[:10]
+        resp_date = (bc.get("ResponseDate") or "")[:10]
+        person = _resolve_person_name(client, bc.get("PersonAliasId"), person_cache)
+        status = bc.get("Status", "?")
+        found = " [RECORD FOUND]" if bc.get("RecordFound") else ""
+        pkg = bc.get("PackageName", "")
+        pkg_str = f" ({pkg})" if pkg else ""
+
+        print(f"  {bc['Id']:6d}  {person:25s} [{status}]{found}{pkg_str}")
+        print(f"          Requested: {req_date}  Responded: {resp_date or 'pending'}")
+
+
+def cmd_checkin(args, client):
+    # Check-in areas are GroupTypes with a specific purpose
+    # GroupType 15 = Check-in in most Rock instances
+    checkin_group_types = client.get("GroupTypes", params={
+        "$filter": "substringof('Check', Name) eq true",
+        "$select": "Id,Name",
+        "$top": 20,
+    })
+
+    if args.area:
+        # Show specific check-in area (group) with locations and schedules
+        group = None
+        try:
+            gid = int(args.area)
+            group = client.get(f"Groups/{gid}")
+        except ValueError:
+            results = client.get("Groups", params={
+                "$filter": f"substringof('{odata_str(args.area)}', Name) eq true",
+                "$top": 10,
+            })
+            # Filter to check-in group types
+            checkin_type_ids = {gt["Id"] for gt in (checkin_group_types or [])}
+            results = [g for g in (results or []) if g.get("GroupTypeId") in checkin_type_ids] if checkin_type_ids else results
+            if results and len(results) == 1:
+                group = results[0]
+            elif results:
+                print(f"Multiple check-in groups match '{args.area}':")
+                for g in results:
+                    print(f"  {g['Id']:6d}  {g['Name']}")
+                return
+
+        if not group:
+            print(f"No check-in area found matching '{args.area}'")
+            return
+
+        print(f"{group['Name']} (ID: {group['Id']})")
+        print(f"  Active: {group.get('IsActive', False)}")
+
+        # Locations
+        group_locs = client.get("GroupLocations", params={
+            "$filter": f"GroupId eq {group['Id']}",
+            "$select": "LocationId",
+        }) or []
+        if group_locs:
+            print(f"  Locations ({len(group_locs)}):")
+            for gl in group_locs:
+                loc_name = _resolve_name(client, "Locations", gl["LocationId"])
+                if loc_name != "?":
+                    print(f"    {loc_name} (ID: {gl['LocationId']})")
+                else:
+                    print(f"    Location ID: {gl['LocationId']}")
+
+        # Child groups (sub-areas)
+        children = client.get("Groups", params={
+            "$filter": f"ParentGroupId eq {group['Id']}",
+            "$select": "Id,Name,IsActive",
+            "$orderby": "Order",
+        }) or []
+        if children:
+            print(f"  Sub-areas ({len(children)}):")
+            for child in children:
+                active = "" if child.get("IsActive") else " [inactive]"
+                print(f"    {child['Id']:6d}  {child['Name']}{active}")
+        return
+
+    # Default: show check-in group type hierarchy
+    if not checkin_group_types:
+        print("No check-in group types found.")
+        return
+
+    print("Check-in Configuration:\n")
+    for gt in checkin_group_types:
+        print(f"  Group Type: {gt['Name']} (ID: {gt['Id']})")
+        # Top-level groups of this type
+        top_groups = client.get("Groups", params={
+            "$filter": f"GroupTypeId eq {gt['Id']} and ParentGroupId eq null",
+            "$select": "Id,Name,IsActive",
+            "$orderby": "Order",
+            "$top": 20,
+        }) or []
+        for g in top_groups:
+            active = "" if g.get("IsActive") else " [inactive]"
+            print(f"    {g['Id']:6d}  {g['Name']}{active}")
+            # First level children
+            children = client.get("Groups", params={
+                "$filter": f"ParentGroupId eq {g['Id']}",
+                "$select": "Id,Name,IsActive",
+                "$orderby": "Order",
+                "$top": 20,
+            }) or []
+            for child in children:
+                ca = "" if child.get("IsActive") else " [inactive]"
+                print(f"      {child['Id']:6d}  {child['Name']}{ca}")
+        print()
+
+
+def cmd_attendance(args, client):
+    params = {
+        "$orderby": "OccurrenceDate desc",
+        "$top": args.limit,
+    }
+    filters = []
+    if args.group:
+        try:
+            gid = int(args.group)
+            filters.append(f"GroupId eq {gid}")
+        except ValueError:
+            groups = client.get("Groups", params={
+                "$filter": f"substringof('{odata_str(args.group)}', Name) eq true",
+                "$select": "Id,Name",
+                "$top": 5,
+            })
+            if groups and len(groups) == 1:
+                filters.append(f"GroupId eq {groups[0]['Id']}")
+            elif groups:
+                print(f"Multiple groups match '{args.group}':")
+                for g in groups:
+                    print(f"  {g['Id']:6d}  {g['Name']}")
+                return
+            else:
+                print(f"No group found matching '{args.group}'")
+                return
+    if args.date:
+        filters.append(f"OccurrenceDate eq datetime'{args.date}'")
+    if filters:
+        params["$filter"] = " and ".join(filters)
+
+    occurrences = client.get("AttendanceOccurrences", params=params)
+    if not occurrences:
+        print("No attendance occurrences found.")
+        return
+
+    group_cache = {}
+    location_cache = {}
+
+    print(f"Attendance Occurrences ({len(occurrences)}):\n")
+    for occ in occurrences:
+        occ_date = (occ.get("OccurrenceDate") or "")[:10]
+
+        gid = occ.get("GroupId")
+        if gid and gid not in group_cache:
+            group_cache[gid] = _resolve_name(client, "Groups", gid)
+        group_name = group_cache.get(gid, "?")
+
+        lid = occ.get("LocationId")
+        if lid and lid not in location_cache:
+            location_cache[lid] = _resolve_name(client, "Locations", lid)
+        loc_name = location_cache.get(lid, "")
+
+        did_not = " [DID NOT OCCUR]" if occ.get("DidNotOccur") else ""
+        loc_str = f" @ {loc_name}" if loc_name else ""
+
+        print(f"  {occ['Id']:8d}  {occ_date}  {group_name}{loc_str}{did_not}")
+
+
+def cmd_occurrence(args, client):
+    occ = client.get(f"AttendanceOccurrences/{args.id}")
+    if not occ:
+        print(f"Occurrence {args.id} not found")
+        return
+
+    if args.json:
+        print(json.dumps(occ, indent=2))
+        return
+
+    occ_date = (occ.get("OccurrenceDate") or "")[:10]
+    print(f"Occurrence {occ['Id']} ({occ_date})")
+
+    for label, endpoint, key in [("Group", "Groups", "GroupId"), ("Location", "Locations", "LocationId"), ("Schedule", "Schedules", "ScheduleId")]:
+        if occ.get(key):
+            name = _resolve_name(client, endpoint, occ[key])
+            if name != "?":
+                print(f"  {label}: {name} (ID: {occ[key]})")
+            else:
+                print(f"  {label} ID: {occ[key]}")
+
+    if occ.get("DidNotOccur"):
+        print("  Status: DID NOT OCCUR")
+
+    # Attendees
+    attendees = client.get("Attendances", params={
+        "$filter": f"OccurrenceId eq {occ['Id']}",
+        "$select": "PersonAliasId,DidAttend,StartDateTime,RSVP",
+        "$top": args.limit,
+    }) or []
+
+    if attendees:
+        did_attend = sum(1 for a in attendees if a.get("DidAttend"))
+        print(f"  Attendees: {did_attend} attended / {len(attendees)} total")
+        if args.names:
+            person_cache = {}
+            for a in attendees:
+                aid = a.get("PersonAliasId")
+                pname = _resolve_person_name(client, aid, person_cache)
+                attended = "Y" if a.get("DidAttend") else "N"
+                rsvp = f" RSVP:{a['RSVP']}" if a.get("RSVP") else ""
+                print(f"    {pname:30s} [{attended}]{rsvp}")
+
+
+def cmd_block_set(args, client):
+    block_id = int(args.id)
+    block = client.get(f"Blocks/{block_id}")
+    if not block:
+        print(f"Block {block_id} not found")
+        return
+
+    print(f"Setting {args.key}={args.value[:80]}{'...' if len(args.value) > 80 else ''} on block {block_id}")
+    try:
+        client.post(f"Blocks/{block_id}/AttributeValues", {
+            "Key": args.key,
+            "Value": args.value,
+        })
+        log.info("block-set ok block=%d key=%s", block_id, args.key)
+        print("Done.")
+    except Exception as e1:
+        log.debug("block-set POST failed, trying PUT: %s", e1)
+        try:
+            client.put(f"Blocks/AttributeValue/{block_id}", {
+                "Key": args.key,
+                "Value": args.value,
+            })
+            log.info("block-set ok (PUT) block=%d key=%s", block_id, args.key)
+            print("Done.")
+        except Exception as e2:
+            log.error("block-set failed block=%d key=%s\n%s", block_id, args.key, traceback.format_exc())
+            print(f"Error setting attribute: {e2}")
+
+
+def cmd_person_create(args, client):
+    data = {
+        "FirstName": args.first,
+        "LastName": args.last,
+        "IsSystem": False,
+    }
+    if args.email:
+        data["Email"] = args.email
+    if args.connection_status:
+        data["ConnectionStatusValueId"] = int(args.connection_status)
+    if args.record_status:
+        data["RecordStatusValueId"] = int(args.record_status)
+    if args.campus:
+        data["CampusId"] = int(args.campus)
+
+    try:
+        pid = client.post("People", data)
+        print(f"Created person: {args.first} {args.last} (ID: {pid})")
+    except Exception as e:
+        print(f"Error creating person: {e}")
+
+
+def cmd_person_update(args, client):
+    pid = int(args.id)
+    person = client.get(f"People/{pid}")
+    if not person:
+        print(f"Person {pid} not found")
+        return
+
+    field_map = {
+        "firstname": "FirstName", "lastname": "LastName", "email": "Email",
+        "nickname": "NickName", "campus": "CampusId",
+        "connectionstatus": "ConnectionStatusValueId",
+        "recordstatus": "RecordStatusValueId",
+        "maritalstatus": "MaritalStatusValueId",
+        "birthdate": "BirthDate", "gender": "Gender",
+    }
+
+    data = {}
+    for kv in args.fields:
+        if "=" not in kv:
+            print(f"Invalid field format: {kv} (expected key=value)")
+            return
+        key, value = kv.split("=", 1)
+        mapped = field_map.get(key.lower(), key)
+        data[mapped] = value
+
+    if not data:
+        print("No fields to update.")
+        return
+
+    try:
+        client.put(f"People/{pid}", data)
+        pname = f"{person.get('FirstName', '')} {person.get('LastName', '')}"
+        print(f"Updated {pname} (ID: {pid}): {', '.join(f'{k}={v}' for k, v in data.items())}")
+    except Exception as e:
+        print(f"Error updating person: {e}")
+
+
+def cmd_exception_clear(args, client):
+    params = {"$select": "Id", "$top": args.limit, "$orderby": "CreatedDateTime asc"}
+    filters = []
+    if args.before:
+        filters.append(f"CreatedDateTime lt datetime'{args.before}T00:00:00'")
+    if args.type:
+        filters.append(f"substringof('{odata_str(args.type)}', ExceptionType) eq true")
+    if filters:
+        params["$filter"] = " and ".join(filters)
+
+    exceptions = client.get("ExceptionLogs", params=params)
+    if not exceptions:
+        print("No exceptions matching criteria.")
+        return
+
+    print(f"Deleting {len(exceptions)} exception logs...")
+    deleted = 0
+    errors = 0
+    for ex in exceptions:
+        try:
+            client.delete(f"ExceptionLogs/{ex['Id']}")
+            deleted += 1
+        except Exception as _e:
+            log.debug("exception delete failed id=%d: %s", ex['Id'], _e)
+            errors += 1
+    log.info("exception-clear deleted=%d errors=%d", deleted, errors)
+    print(f"Deleted {deleted}/{len(exceptions)} exceptions." + (f" ({errors} errors)" if errors else ""))
+
+
+# This script is shipped by the read-only `rock` plugin, but four of its
+# subcommands write to Rock. The `rock-build` plugin sets ROCK_ALLOW_WRITES=1;
+# nothing else does, so a read-only install cannot reach them even though the
+# code is on disk. See ADR 0016.
+WRITE_COMMANDS = {
+    "person-create": "creates a person record",
+    "person-update": "modifies a person record",
+    "block-set": "changes a block's settings",
+    "exception-clear": "deletes exception logs",
+}
+
+
+def _guard_writes(command):
+    if command not in WRITE_COMMANDS or os.environ.get("ROCK_ALLOW_WRITES") == "1":
+        return
+    print(
+        f"Refusing to run '{command}': it {WRITE_COMMANDS[command]}, and this is the "
+        f"read-only Rock plugin.\n"
+        f"Changing Rock needs the 'rock-build' plugin, which your department may not have.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Query Rock RMS entities")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    p_wfs = subparsers.add_parser("workflows", help="List workflow types")
+    p_wfs.add_argument("--category", help="Filter by category name")
+    p_wfs.add_argument("--limit", type=int, default=100)
+    p_wfs.set_defaults(func=cmd_workflows)
+
+    p_wf = subparsers.add_parser("workflow", help="Get a workflow by name or ID")
+    p_wf.add_argument("identifier", help="Workflow name or ID")
+    p_wf.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_wf.set_defaults(func=cmd_workflow)
+
+    p_pgs = subparsers.add_parser("pages", help="List pages")
+    p_pgs.add_argument("--site", type=int, help="Filter by site ID")
+    p_pgs.add_argument("--limit", type=int, default=100)
+    p_pgs.set_defaults(func=cmd_pages)
+
+    p_pg = subparsers.add_parser("page", help="Get a page by name, route, or ID")
+    p_pg.add_argument("identifier", help="Page name, route, or ID")
+    p_pg.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_pg.set_defaults(func=cmd_page)
+
+    p_search = subparsers.add_parser("search", help="Search across entities")
+    p_search.add_argument("query", help="Search text")
+    p_search.set_defaults(func=cmd_search)
+
+    p_audit = subparsers.add_parser("audit", help="Audit a workflow for issues")
+    p_audit.add_argument("identifier", help="Workflow name or ID")
+    p_audit.add_argument("--skip-settings", action="store_true",
+                         help="Skip per-action settings checks (faster)")
+    p_audit.set_defaults(func=cmd_audit)
+
+    p_actions = subparsers.add_parser("actions", help="Show detailed actions for an activity")
+    p_actions.add_argument("activity_id", help="Activity type ID")
+    p_actions.set_defaults(func=cmd_actions)
+
+    p_attrs = subparsers.add_parser("attributes", help="Show workflow attributes")
+    p_attrs.add_argument("identifier", help="Workflow name or ID")
+    p_attrs.set_defaults(func=cmd_attributes)
+
+    p_dvs = subparsers.add_parser("dataviews", help="List data views")
+    p_dvs.add_argument("--category", help="Filter by name substring")
+    p_dvs.add_argument("--limit", type=int, default=100)
+    p_dvs.set_defaults(func=cmd_dataviews)
+
+    p_dv = subparsers.add_parser("dataview", help="Get a data view by name or ID")
+    p_dv.add_argument("identifier", help="Data view name or ID")
+    p_dv.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_dv.set_defaults(func=cmd_dataview)
+
+    p_person = subparsers.add_parser("person", help="Look up a person by name, email, or ID")
+    p_person.add_argument("identifier", help="Person name, email, or ID")
+    p_person.set_defaults(func=cmd_person)
+
+    p_group = subparsers.add_parser("group", help="Get a group by name or ID")
+    p_group.add_argument("identifier", help="Group name or ID")
+    p_group.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_group.add_argument("--limit", type=int, default=50, help="Max members to show")
+    p_group.set_defaults(func=cmd_group)
+
+    p_report = subparsers.add_parser("report", help="Get a report by name or ID")
+    p_report.add_argument("identifier", help="Report name or ID")
+    p_report.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_report.set_defaults(func=cmd_report)
+
+    p_exs = subparsers.add_parser("exceptions", help="List recent exception logs")
+    p_exs.add_argument("--type", help="Filter by exception type substring")
+    p_exs.add_argument("--summary", action="store_true", help="Group by type with counts")
+    p_exs.add_argument("--verbose", action="store_true", help="Show stack traces")
+    p_exs.add_argument("--limit", type=int, default=50)
+    p_exs.set_defaults(func=cmd_exceptions)
+
+    p_ex = subparsers.add_parser("exception", help="Get exception detail by ID")
+    p_ex.add_argument("id", type=int, help="Exception log ID")
+    p_ex.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_ex.set_defaults(func=cmd_exception)
+
+    p_scheds = subparsers.add_parser("schedules", help="List schedules")
+    p_scheds.add_argument("--active", action="store_true", help="Active only")
+    p_scheds.add_argument("--query", help="Filter by name substring")
+    p_scheds.add_argument("--limit", type=int, default=100)
+    p_scheds.set_defaults(func=cmd_schedules)
+
+    p_sched = subparsers.add_parser("schedule", help="Get a schedule by name or ID")
+    p_sched.add_argument("identifier", help="Schedule name or ID")
+    p_sched.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_sched.set_defaults(func=cmd_schedule)
+
+    p_regs = subparsers.add_parser("registrations", help="List registration instances")
+    p_regs.add_argument("--active", action="store_true", help="Active only")
+    p_regs.add_argument("--query", help="Filter by name substring")
+    p_regs.add_argument("--limit", type=int, default=50)
+    p_regs.set_defaults(func=cmd_registrations)
+
+    p_reg = subparsers.add_parser("registration", help="Get a registration instance by name or ID")
+    p_reg.add_argument("identifier", help="Registration name or ID")
+    p_reg.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_reg.set_defaults(func=cmd_registration)
+
+    p_conns = subparsers.add_parser("connections", help="List connection requests")
+    p_conns.add_argument("--state", help="Filter by state (active, inactive, future, connected)")
+    p_conns.add_argument("--opportunity", help="Filter by opportunity name substring")
+    p_conns.add_argument("--limit", type=int, default=50)
+    p_conns.set_defaults(func=cmd_connections)
+
+    p_block = subparsers.add_parser("block", help="Get block with attributes by ID")
+    p_block.add_argument("id", help="Block ID")
+    p_block.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_block.set_defaults(func=cmd_block)
+
+    p_bgc = subparsers.add_parser("bgc", help="List background checks")
+    p_bgc.add_argument("--status", help="Filter by status substring")
+    p_bgc.add_argument("--person", help="Filter by person name or ID")
+    p_bgc.add_argument("--limit", type=int, default=50)
+    p_bgc.set_defaults(func=cmd_bgc)
+
+    p_checkin = subparsers.add_parser("checkin", help="Show check-in configuration")
+    p_checkin.add_argument("--area", help="Specific check-in area name or ID")
+    p_checkin.set_defaults(func=cmd_checkin)
+
+    p_att = subparsers.add_parser("attendance", help="List attendance occurrences")
+    p_att.add_argument("--group", help="Filter by group name or ID")
+    p_att.add_argument("--date", help="Filter by date (YYYY-MM-DD)")
+    p_att.add_argument("--limit", type=int, default=50)
+    p_att.set_defaults(func=cmd_attendance)
+
+    p_occ = subparsers.add_parser("occurrence", help="Get attendance occurrence detail")
+    p_occ.add_argument("id", type=int, help="Occurrence ID")
+    p_occ.add_argument("--names", action="store_true", help="Show attendee names")
+    p_occ.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_occ.add_argument("--limit", type=int, default=200, help="Max attendees to show")
+    p_occ.set_defaults(func=cmd_occurrence)
+
+    p_bset = subparsers.add_parser("block-set", help="Set a block attribute value")
+    p_bset.add_argument("id", help="Block ID")
+    p_bset.add_argument("key", help="Attribute key")
+    p_bset.add_argument("value", help="Attribute value")
+    p_bset.set_defaults(func=cmd_block_set)
+
+    p_pcreate = subparsers.add_parser("person-create", help="Create a new person record")
+    p_pcreate.add_argument("--first", required=True, help="First name")
+    p_pcreate.add_argument("--last", required=True, help="Last name")
+    p_pcreate.add_argument("--email", help="Email address")
+    p_pcreate.add_argument("--connection-status", help="ConnectionStatusValueId")
+    p_pcreate.add_argument("--record-status", help="RecordStatusValueId")
+    p_pcreate.add_argument("--campus", help="CampusId")
+    p_pcreate.set_defaults(func=cmd_person_create)
+
+    p_pupdate = subparsers.add_parser("person-update", help="Update a person's fields")
+    p_pupdate.add_argument("id", help="Person ID")
+    p_pupdate.add_argument("fields", nargs="+", help="Field=value pairs (e.g. Email=foo@bar.com)")
+    p_pupdate.set_defaults(func=cmd_person_update)
+
+    p_exclear = subparsers.add_parser("exception-clear", help="Delete exception logs")
+    p_exclear.add_argument("--before", help="Delete exceptions before date (YYYY-MM-DD)")
+    p_exclear.add_argument("--type", help="Filter by exception type substring")
+    p_exclear.add_argument("--limit", type=int, default=500, help="Max exceptions to delete per run")
+    p_exclear.set_defaults(func=cmd_exception_clear)
+
+    parsed = parser.parse_args()
+    _guard_writes(parsed.command)
+    log.info("cmd=%s args=%s", parsed.command, " ".join(sys.argv[2:]))
+    client = RockClient()
+    try:
+        parsed.func(parsed, client)
+        log.info("cmd=%s ok", parsed.command)
+    except Exception:
+        log.error("cmd=%s failed\n%s", parsed.command, traceback.format_exc())
+        raise
+
+
+if __name__ == "__main__":
+    main()

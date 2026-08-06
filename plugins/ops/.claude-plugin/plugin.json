@@ -1,0 +1,5 @@
+{
+  "name": "ops",
+  "description": "Everything the Ops department needs. Install this one.",
+  "dependencies": ["general", "plan"]
+}
