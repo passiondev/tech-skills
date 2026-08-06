@@ -2,7 +2,7 @@
 
 **This document is instructions for Claude Code.** A person has asked you to
 set them up with the Passion tech skills and named their department. Work
-through the five steps below with them.
+through the six steps below with them.
 
 If you are the person rather than the agent: everything here is doable by hand,
 and step 1 is the only part that is fiddly.
@@ -62,9 +62,50 @@ parse as JSON, stop and tell them — do not guess at a repair.
 Exactly one department bundle is needed. It pulls in everything else through
 its dependencies; there is nothing else to enable.
 
+This step makes the bundle *enabled* and turns auto-update on. It does not
+reliably put the plugins on disk — that is step 2, and skipping it is the one
+way to end up half-installed.
+
 ---
 
-## Step 2 — Check for `uv`
+## Step 2 — Install the bundle
+
+```bash
+claude plugin install <department>@passion-tech
+```
+
+Then check what landed:
+
+```bash
+claude plugin list
+```
+
+Every plugin must read `✔ enabled`. If the bundle reads `✘ failed to load`
+with a message naming a dependency, run the command in that message and list
+again.
+
+Do not skip this in favour of restarting. Enabling a bundle in `settings.json`
+does not dependably install the capability plugins it depends on: a startup can
+install the bundle and stop, leaving it permanently `✘ failed to load` on a
+missing dependency, and further restarts do not repair it. `claude plugin
+install` resolves the whole dependency closure in one pass, so it is what makes
+this install deterministic rather than lucky.
+
+Expected counts, all skills present:
+
+| Department | Plugins | Skills |
+| --- | ---: | ---: |
+| `global-engineering` | 5 | 23 |
+| `local-engineering` | 7 | 31 |
+| `ops` | 4 | 15 |
+| `analytics` | 6 | 28 |
+| `service-and-support` | 4 | 15 |
+
+Plugin counts include the department bundle itself, which holds no skills.
+
+---
+
+## Step 3 — Check for `uv`
 
 Only needed for `local-engineering`, `analytics`, and `service-and-support` —
 the departments with Rock. Skip it otherwise.
@@ -86,7 +127,7 @@ without asking.
 
 ---
 
-## Step 3 — Write `~/.claude/passion.env`
+## Step 4 — Write `~/.claude/passion.env`
 
 Everyone needs Jira. Rock departments also need Rock.
 
@@ -127,26 +168,21 @@ conversation.
 
 ---
 
-## Step 4 — Restart and verify
+## Step 5 — Restart and verify
 
-Plugins load at startup, so they need to restart Claude Code.
+Plugins load at startup, so they need to restart Claude Code. Step 2 put them on
+disk; this is what makes their skills available.
 
-Afterwards:
-
-```bash
-claude plugin list
-```
-
-They should see their department bundle plus its capability plugins. Then a
-live check — `/jira:sprint` if they gave a project key, or ask Claude to look
-up any ticket by key.
+Afterwards, a live check — `/jira:sprint` if they gave a project key, or ask
+Claude to look up any ticket by key. The counts were already confirmed in step
+2, so this is checking that credentials work, not that plugins installed.
 
 For Rock departments, the first Rock command installs the Python runtime into
 `~/.claude/passion-rock`. That takes a few seconds once, and is silent after.
 
 ---
 
-## Step 5 — Tell them what they have
+## Step 6 — Tell them what they have
 
 Point them at the README's skill list for their department, and make these four
 points:
@@ -164,9 +200,11 @@ points:
 | Symptom | Cause |
 | --- | --- |
 | `claude plugin list` shows nothing new | Claude Code was not restarted, or `settings.json` did not parse |
-| Plugin listed, skills not available | The department bundle was enabled but the restart came before the fetch — restart again |
+| Bundle reads `✘ failed to load`, naming a dependency | Step 2 was skipped or half-finished. Run the `claude plugin install` command in the error, then list again. Restarting does **not** fix this |
+| Fewer plugins listed than step 2's table | Same cause — the settings-driven install stopped early. Re-run step 2 |
+| Plugin listed, skills not available | Restart came before the fetch — restart again |
 | A skill says a variable is missing | It names the variable and the file; add it to `~/.claude/passion.env` |
-| Rock says `uv` is not installed | Step 2 |
+| Rock says `uv` is not installed | Step 3 |
 | Jira returns 401 | The token was pasted with a truncation, or `JIRA_EMAIL` is not the address that owns it |
 
 Check `~/.claude/settings.json` parses, and that the department key reads
