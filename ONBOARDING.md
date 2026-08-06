@@ -23,6 +23,23 @@ is corrected by editing one string.
 
 ---
 
+## If they already have it
+
+Check before you change anything:
+
+```bash
+claude plugin list
+```
+
+Compare the result against the table in step 2.
+
+- **Nothing from `passion-tech`.** Start at step 1.
+- **Every plugin reads `✔ enabled`, and the count matches.** Say so and stop.
+- **Fewer plugins than the table, or one reads `✘ failed to load`.** Go straight
+  to step 2. Step 1 has nothing left to do.
+
+---
+
 ## Step 1 — Merge two keys into `~/.claude/settings.json`
 
 This is the whole install. Two keys, `extraKnownMarketplaces` and

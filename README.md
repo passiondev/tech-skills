@@ -5,23 +5,36 @@ your department once; it stays current on its own.
 
 ## Install
 
-Paste this into Claude Code, with your department in place of the example:
+Paste this into Claude Code. Put your department in place of the example.
 
-> Set me up with the Passion tech skills. I'm in **local engineering**.
+> Set me up with the Passion tech skills for **local engineering**.
+> Check whether I already have them. Install them only if I do not.
 > The instructions are at
 > https://github.com/passiondev/tech-skills/blob/main/ONBOARDING.md
-
-Claude reads the document, merges two keys into your `~/.claude/settings.json`,
-installs your department bundle, helps you get a Jira API token, and writes your
-credentials to `~/.claude/passion.env`. It shows you every change before making
-it, and checks the plugin count afterwards so a half-finished install is caught
-while someone is still there to fix it.
 
 Departments: `global-engineering`, `local-engineering`, `ops`, `analytics`,
 `service-and-support`.
 
-If you would rather do it by hand, [`ONBOARDING.md`](ONBOARDING.md) is what
-Claude will be reading — the settings block is in there.
+Claude reads the document, then works through it with you:
+
+- Merges two keys into your `~/.claude/settings.json`
+- Installs your department bundle
+- Helps you get a Jira API token
+- Writes your credentials to `~/.claude/passion.env`
+- Counts the plugins at the end, because a half-installed bundle is easy to miss
+
+Claude shows you every change before it writes that change. The paste is safe to
+repeat. On a machine that already has the marketplace, Claude checks the count
+and stops.
+
+To check for yourself:
+
+```
+claude plugin list | grep passion-tech
+```
+
+To do the install by hand, read [`ONBOARDING.md`](ONBOARDING.md). It holds the
+settings block and the two install commands.
 
 ## What you get
 
