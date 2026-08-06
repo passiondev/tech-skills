@@ -67,9 +67,10 @@ something, assume it will be read by people outside the church, forever.
 
 ## Contributing
 
-Open a pull request. One curator reviews and merges; CI checks the manifests,
-the dependency graph, and scans for anything that looks like a hostname or a
-credential.
+Open a pull request — `main` takes changes no other way, including from the
+curator. One curator reviews and merges; CI checks the manifests, the dependency
+graph, and scans for anything that looks like a hostname or a credential. A
+pull request cannot merge until that check is green.
 
 Set your commit email before your first commit, in your clone of this repo:
 
