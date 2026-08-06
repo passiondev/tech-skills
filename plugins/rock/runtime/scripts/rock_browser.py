@@ -17,7 +17,17 @@ from pathlib import Path
 
 import rock_paths
 
-from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
+try:
+    from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
+except ModuleNotFoundError:
+    sys.exit(
+        "Rock's browser tooling is not installed. It is opt-in, because it needs\n"
+        "Playwright and a ~150 MB Chromium download that nothing else here uses.\n"
+        "\n"
+        "  ROCK_WITH_BROWSER=1 rock.sh catalog status\n"
+        "\n"
+        "That installs both, once. Every later command keeps them."
+    )
 
 from rock_client import get_credentials
 from rock_log import get_logger

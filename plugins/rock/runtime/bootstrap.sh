@@ -31,7 +31,18 @@ manifest() {
 }
 
 mkdir -p "$ROCK_HOME"
+
+# Asking for the browser is sticky, and it has to be part of the stamp. The
+# manifest covers shipped files only, so ROCK_WITH_BROWSER=1 was invisible to
+# the comparison below and the documented opt-in no-opped on every machine that
+# had already run a Rock command — which is all of them, because the first Rock
+# command is what installs the runtime. Sticky also means a later plain run
+# re-syncs with the group instead of uninstalling Playwright behind you.
+BROWSER_MARK="$ROCK_HOME/.browser"
+[[ "${ROCK_WITH_BROWSER:-}" == "1" ]] && : > "$BROWSER_MARK"
+
 NEW="$(manifest)"
+[[ -f "$BROWSER_MARK" ]] && NEW="$NEW"$'\n'"group:browser"
 
 if [[ -f "$STAMP" ]] && [[ "$NEW" == "$(cat "$STAMP")" ]]; then
   exit 0
@@ -44,9 +55,16 @@ cp "$SRC"/pyproject.toml "$SRC"/uv.lock "$SRC"/config.yaml "$ROCK_HOME/"
 cp "$SRC"/scripts/*.py "$ROCK_HOME/scripts/"
 
 SYNC_ARGS=(--frozen)
-[[ "${ROCK_WITH_BROWSER:-}" == "1" ]] && SYNC_ARGS+=(--group browser)
+[[ -f "$BROWSER_MARK" ]] && SYNC_ARGS+=(--group browser)
 
 ( cd "$ROCK_HOME" && uv sync "${SYNC_ARGS[@]}" )
+
+# uv installs the Playwright package. The browser binary it drives is a
+# separate download, and nothing else here performs it.
+if [[ -f "$BROWSER_MARK" ]]; then
+  echo "Downloading Chromium (~150 MB, once) ..." >&2
+  ( cd "$ROCK_HOME" && uv run --frozen playwright install chromium )
+fi
 
 printf '%s' "$NEW" > "$STAMP"
 echo "Rock runtime ready." >&2
