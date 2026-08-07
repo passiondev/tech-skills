@@ -67,23 +67,32 @@ You don't. `autoUpdate` is set on the marketplace, so opening Claude Code
 fetches the marketplace and its installed plugins. There are no version numbers.
 `main` is what everyone runs, which is why nothing merges without review.
 
-Two gaps in that, both closed by the same command. Headless runs (`claude -p`)
-do not auto-update, so a machine that only ever drives these skills from a
-script or a scheduled job stays frozen at whatever it installed. And a session
-already open when `main` moves does not pick the change up.
+Two gaps in that. Headless runs (`claude -p`) do not auto-update, so a machine
+that only ever drives these skills from a script or a scheduled job stays frozen
+at whatever it installed. And a session already open when `main` moves does not
+pick the change up.
+
+Both close by updating every installed plugin, which takes effect on the next
+start:
 
 ```
-claude plugin marketplace update passion-tech
+claude plugin list | grep -o '[a-z-]*@passion-tech' | sort -u \
+  | xargs -n1 claude plugin update
 ```
 
-To see which commit you are on:
+`claude plugin marketplace update passion-tech` is not the command for this. It
+refreshes the marketplace clone and leaves every installed plugin where it was,
+so it reports success and changes nothing you run.
+
+To see what you are on:
 
 ```
-git -C ~/.claude/plugins/marketplaces/passion-tech log --oneline -1
+claude plugin list
 ```
 
-Do not use `claude plugin list` for this. It reports the version you installed
-at, not the one on disk.
+The version beside each plugin is the commit that plugin runs. Reading the
+marketplace clone with `git log` misleads you here, because the clone sits ahead
+of the plugins installed from it.
 
 The corollary of no version numbers: a skill can change under you, and one can
 disappear. If something behaved differently today, read the git history on
