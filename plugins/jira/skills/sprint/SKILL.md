@@ -32,7 +32,7 @@ A specific question — "what's overdue?", "what should I pick up next?" — is 
 ## Cookbook
 
 <If: the sprint has no issues assigned to them>
-<Then: the project key is probably wrong, or no sprint is open. Say which is likelier, and offer to try another project.>
+<Then: the key is good — the script exits with an error when it is not — so either no sprint is open or nothing in it is theirs. Say that, and offer to widen to their open issues across the project.>
 
 <If: the user asks about someone else's work>
 <Then: the report only ever covers the authenticated user. Say so, and offer to write the JQL for the other person instead.>

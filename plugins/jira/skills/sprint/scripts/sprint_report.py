@@ -31,19 +31,9 @@ import passion_env  # noqa: E402
 SECTIONS = (("In progress", "indeterminate"), ("To do", "new"))
 
 
-def search(base_url: str, email: str, token: str, jql: str) -> dict:
-    payload = json.dumps({
-        "jql": jql,
-        "fields": ["summary", "status", "priority", "duedate"],
-        "maxResults": 100,
-    })
+def _call(args: list) -> dict:
     result = subprocess.run(
-        ["curl", "-s", "-w", "\n%{http_code}",
-         "-u", f"{email}:{token}",
-         "-H", "Accept: application/json",
-         "-H", "Content-Type: application/json",
-         "-X", "POST", f"{base_url}/rest/api/3/search/jql",
-         "-d", payload],
+        ["curl", "-s", "-w", "\n%{http_code}"] + args,
         capture_output=True, text=True, timeout=60,
     )
     body, _, code = result.stdout.rpartition("\n")
@@ -60,6 +50,41 @@ def search(base_url: str, email: str, token: str, jql: str) -> dict:
         sys.exit(f"ERROR: Jira returned {status}. {detail}".rstrip())
 
     return json.loads(body)
+
+
+def search(base_url: str, email: str, token: str, jql: str) -> list:
+    """Every matching issue. The endpoint pages at maxResults and reports more
+    with isLast/nextPageToken, so a single call silently drops the tail of a
+    busy sprint."""
+    issues = []
+    token_page = None
+    while True:
+        page = {"jql": jql,
+                "fields": ["summary", "status", "priority", "duedate"],
+                "maxResults": 100}
+        if token_page:
+            page["nextPageToken"] = token_page
+        data = _call(["-u", f"{email}:{token}",
+                      "-H", "Accept: application/json",
+                      "-H", "Content-Type: application/json",
+                      "-X", "POST", f"{base_url}/rest/api/3/search/jql",
+                      "-d", json.dumps(page)])
+        issues += data.get("issues", [])
+        token_page = data.get("nextPageToken")
+        if data.get("isLast", True) or not token_page:
+            return issues
+
+
+def project_exists(base_url: str, email: str, token: str, project: str) -> bool:
+    """The search endpoint answers an unknown project key with an empty result,
+    identical to a real project with no open sprint. This tells them apart."""
+    result = subprocess.run(
+        ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+         "-u", f"{email}:{token}", "-H", "Accept: application/json",
+         f"{base_url}/rest/api/3/project/{project}"],
+        capture_output=True, text=True, timeout=30,
+    )
+    return result.stdout.strip() != "404"
 
 
 def normalise(issues: list) -> list:
@@ -93,14 +118,15 @@ def table(rows: list, show_priority: bool = True) -> list:
 def render(rows: list, project: str, today: str) -> str:
     out = [f"# Sprint report — {project} — {today}", ""]
 
+    # Overdue leads: the skill's Step 2 asks for what needs attention first.
+    overdue = [r for r in rows if r["due"] and r["due"] < today and r["category"] != "done"]
+    if overdue:
+        out += ["## Overdue", ""] + table(overdue, show_priority=False) + [""]
+
     for title, category in SECTIONS:
         section = [r for r in rows if r["category"] == category]
         if section:
             out += [f"## {title}", ""] + table(section) + [""]
-
-    overdue = [r for r in rows if r["due"] and r["due"] < today and r["category"] != "done"]
-    if overdue:
-        out += ["## Overdue", ""] + table(overdue, show_priority=False) + [""]
 
     counts = {}
     for r in rows:
@@ -124,9 +150,14 @@ def main():
     if not project:
         sys.exit("ERROR: no project key. Pass --project ABC or set JIRA_PROJECT in ~/.claude/passion.env")
 
+    base_url = base_url.rstrip("/")
     jql = (f"project = {project} AND assignee = currentUser() "
            "AND sprint in openSprints() ORDER BY status ASC, priority DESC")
-    rows = normalise(search(base_url.rstrip("/"), email, token, jql).get("issues", []))
+    rows = normalise(search(base_url, email, token, jql))
+
+    if not rows and not project_exists(base_url, email, token, project):
+        sys.exit(f"ERROR: no project {project} on this Jira site, or your account cannot see it. "
+                 "Check the key, or pass --project with the right one.")
 
     if args.json:
         json.dump({"project": project, "issues": rows}, sys.stdout, indent=2)
