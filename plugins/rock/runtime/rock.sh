@@ -6,8 +6,13 @@
 #   rock.sh browser screenshot /volunteers
 #
 # Bootstraps on first use and after any plugin update; a no-op (~0.05s)
-# otherwise. Runs read commands only — `rock.sh query person-create` is
-# refused. See ADR 0016.
+# otherwise.
+#
+# Reads only. The write subcommands refuse unless ROCK_ALLOW_WRITES is set,
+# which only rock-build sets — the refusal comes before any network call, so
+# a write reaches Rock from this path never. Note the guard sits behind
+# argument parsing, so an incomplete write command reports its missing
+# arguments rather than the refusal; neither one writes. See ADR 0016.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

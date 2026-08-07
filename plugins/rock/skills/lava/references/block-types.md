@@ -11,7 +11,7 @@ Common block types for page building. The catalog (`~/.claude/passion-rock/catal
 **Content Channel View** -- Display items from a Content Channel (blog posts, news, etc.).
 - ContentChannelId, template settings
 
-**Markdown Detail** -- Render markdown content.
+**Dynamic Data** -- Render a SQL query as report, HTML, or XML, with Lava.
 
 ## People
 
@@ -42,8 +42,8 @@ Common block types for page building. The catalog (`~/.claude/passion-rock/catal
 
 ## Check-in
 
-**Check-in Manager** -- Staff check-in management console.
 **Check-in Kiosk** -- Self-service check-in display.
+**Check-in Scheduled Locations** -- Which locations are open for a schedule.
 
 ## Communication
 
@@ -60,14 +60,14 @@ Common block types for page building. The catalog (`~/.claude/passion-rock/catal
 
 **Page Menu** -- Navigation menu for child pages.
 **Login** -- Login form.
-**Registration** -- New account registration.
+**Account Entry** -- New account registration.
 **Redirect** -- Redirect to another URL.
-**Page/Zone Block List** -- Admin block for managing blocks on a page.
+**Page/Zone Blocks Editor** -- Admin block for managing blocks on a page.
 
 ## Reporting
 
 **Dynamic Data** -- Display results of a DataView or SQL query.
-**Report Viewer** -- Display a Rock report.
+**Report Detail** -- Display a Rock report.
 **Metric Detail** -- Show metric values and charts.
 
 ## Notes
