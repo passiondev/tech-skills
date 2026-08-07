@@ -23,6 +23,37 @@ rock_paths.ensure()
 CATALOG_PATH = rock_paths.CATALOG
 
 
+PAGE = 500
+
+
+def get_all(client, endpoint, params=None, page=PAGE):
+    """Every row from an endpoint, following $skip until the pages run out.
+
+    A bare $top silently returns the first N and says nothing about the rest.
+    Measured against a production instance, the old caps here were exceeded by
+    roughly two to one on several endpoints. Because these fetches carry an
+    $orderby, what went missing was the alphabetical tail -- so block types
+    past the middle of the alphabet were absent from the catalog entirely, and
+    read as "not found" to anything that looked one up.
+
+    Asked with no $top at all, that instance returned every row in one
+    response, so this loop is not working around a known server page cap. It
+    is declining to assume the absence of one on an instance we do not run.
+    """
+    params = dict(params or {})
+    params.pop("$top", None)
+    params.pop("$skip", None)
+    rows, skip = [], 0
+    while True:
+        batch = client.get(endpoint, params={**params, "$top": page, "$skip": skip})
+        if not batch:
+            return rows
+        rows += batch
+        if len(batch) < page:
+            return rows
+        skip += page
+
+
 def load_catalog():
     try:
         with open(CATALOG_PATH) as f:
@@ -37,16 +68,24 @@ def save_catalog(catalog):
 
 
 def fetch_action_components(client, config):
-    """Pull workflow action component EntityTypes from Rock."""
+    """Workflow action components, and how they were found.
+
+    The two paths do not mean the same thing, which matters to anyone reading
+    the result. The IsComponent filter lists what this Rock *offers*; the
+    fallback scans existing workflows and so lists only what is *already in
+    use*, and an action type absent from it may still be perfectly available.
+    Current Rock has no IsComponent property on EntityType at all -- it answers
+    the filter with a 400, not an empty list -- so the fallback is not a rare
+    degraded path, it is the only path.
+    """
     prefixes = config.get("catalog", {}).get("action_assemblies", ["Rock"])
 
     # Try EntityTypes with IsComponent filter (not available in all Rock versions)
     actions = []
     try:
-        all_types = client.get("EntityTypes", params={
+        all_types = get_all(client, "EntityTypes", params={
             "$filter": "IsComponent eq true",
             "$select": "Id,Name,FriendlyName,AssemblyName",
-            "$top": 500,
         })
         if all_types:
             for et in all_types:
@@ -64,12 +103,14 @@ def fetch_action_components(client, config):
     except (RuntimeError, ValueError) as e:
         log.info("IsComponent filter unavailable, will fall back: %s", e)
 
+    source = "components"
+
     # Fallback: scan existing workflow action types for their entity types
     if not actions:
+        source = "workflow-scan"
         print("  Component filter empty, falling back to existing workflow scan...")
-        existing = client.get("WorkflowActionTypes", params={
+        existing = get_all(client, "WorkflowActionTypes", params={
             "$select": "EntityTypeId",
-            "$top": 1000,
         })
         if existing:
             seen_ids = set()
@@ -92,14 +133,13 @@ def fetch_action_components(client, config):
                 except Exception:
                     continue
 
-    return sorted(actions, key=lambda a: a["name"])
+    return sorted(actions, key=lambda a: a["name"]), source
 
 
 def fetch_block_types(client):
     """Pull all registered BlockTypes."""
-    blocks = client.get("BlockTypes", params={
+    blocks = get_all(client, "BlockTypes", params={
         "$select": "Id,Name,Description,Category",
-        "$top": 500,
         "$orderby": "Name",
     })
     if not blocks:
@@ -114,9 +154,8 @@ def fetch_block_types(client):
 
 def fetch_field_types(client):
     """Pull all registered FieldTypes."""
-    fields = client.get("FieldTypes", params={
+    fields = get_all(client, "FieldTypes", params={
         "$select": "Id,Name,Description,Assembly,Class",
-        "$top": 200,
         "$orderby": "Name",
     })
     if not fields:
@@ -131,9 +170,8 @@ def fetch_field_types(client):
 
 def fetch_categories(client):
     """Pull workflow and page categories."""
-    cats = client.get("Categories", params={
+    cats = get_all(client, "Categories", params={
         "$select": "Id,Name,ParentCategoryId,EntityTypeId",
-        "$top": 500,
         "$orderby": "Name",
     })
     if not cats:
@@ -148,9 +186,8 @@ def fetch_categories(client):
 
 def fetch_sites(client):
     """Pull sites for page creation context."""
-    sites = client.get("Sites", params={
+    sites = get_all(client, "Sites", params={
         "$select": "Id,Name,IsActive",
-        "$top": 20,
     })
     if not sites:
         return []
@@ -163,9 +200,8 @@ def fetch_sites(client):
 
 def fetch_layouts(client):
     """Pull page layouts."""
-    layouts = client.get("Layouts", params={
+    layouts = get_all(client, "Layouts", params={
         "$select": "Id,Name,SiteId,FileName",
-        "$top": 100,
     })
     if not layouts:
         return []
@@ -183,8 +219,9 @@ def refresh(client):
     print("Refreshing Rock catalog...")
 
     print("  Fetching action components...")
-    actions = fetch_action_components(client, config)
-    print(f"    {len(actions)} action types")
+    actions, actions_source = fetch_action_components(client, config)
+    scope = "in use" if actions_source == "workflow-scan" else "available"
+    print(f"    {len(actions)} action types ({scope})")
 
     print("  Fetching block types...")
     blocks = fetch_block_types(client)
@@ -210,6 +247,7 @@ def refresh(client):
         "refreshed_at": datetime.now(timezone.utc).isoformat(),
         "instance_url": client.base_url,
         "action_components": actions,
+        "action_components_source": actions_source,
         "block_types": blocks,
         "field_types": fields,
         "categories": categories,
@@ -235,7 +273,12 @@ def show():
     print(f"Instance: {catalog['instance_url']}\n")
 
     actions = catalog.get("action_components", [])
-    print(f"Action Components ({len(actions)}):")
+    if catalog.get("action_components_source") == "workflow-scan":
+        print(f"Action Components ({len(actions)} in use — this Rock has no "
+              "component list, so these were read off existing workflows and\n"
+              "an action type missing here may still be available):")
+    else:
+        print(f"Action Components ({len(actions)} available):")
     for a in actions[:30]:
         print(f"  {a['name']:40s} {a['class_name']}")
     if len(actions) > 30:

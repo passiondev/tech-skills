@@ -28,6 +28,61 @@ GROUP_MEMBER_STATUSES = {0: "Inactive", 1: "Active", 2: "Pending"}
 EXPRESSION_TYPES = {0: "Filter", 1: "GroupAll", 2: "GroupAny", 3: "GroupAllFalse", 4: "GroupAnyFalse"}
 FAMILY_GROUP_TYPE_ID = 10
 KNOWN_RELATIONSHIPS_GROUP_TYPE_ID = 11
+SEARCH_LIMIT = 10
+CHOOSER_LIMIT = 5
+# `search` has no --limit to raise, so its cap needs different advice.
+WIDEN = "narrow the term or list that entity directly"
+
+
+# Rock rejects a filter past 100 expression nodes, and has no `in` operator to
+# express this compactly. Measured: an or-chain of 15 ids alongside a
+# substringof is accepted, 20 comes back a 400.
+TYPE_CHUNK = 15
+
+
+def groups_of_types(client, name_filter, type_ids, limit):
+    """Groups matching a name, restricted to a set of group types.
+
+    The restriction belongs in the query, not after it -- filtering afterwards
+    spends the cap on rows that are about to be discarded. It goes in chunks
+    because the whole type list in one or-chain exceeds Rock's node limit.
+    """
+    seen, rows = set(), []
+    for i in range(0, len(type_ids), TYPE_CHUNK):
+        types = " or ".join(f"GroupTypeId eq {t}" for t in type_ids[i:i + TYPE_CHUNK])
+        for g in client.get("Groups", params={
+            "$filter": f"{name_filter} and ({types})",
+            "$select": "Id,Name",
+            "$top": limit + 1,
+        }) or []:
+            if g["Id"] not in seen:
+                seen.add(g["Id"])
+                rows.append(g)
+    return rows[:limit], len(rows) > limit
+
+
+def more_note(identifier):
+    """A disambiguation list that silently drops candidates is worse than a
+    long one: the entity someone wants reads as not existing."""
+    return f"  ... and more match '{identifier}' — narrow it, or pass the ID."
+
+
+def get_capped(client, endpoint, params, limit):
+    """Rows up to `limit`, and whether Rock held more than that.
+
+    A bare $top returns the first N and says nothing about the rest, so a
+    header printing len() of the result presents a cap as a total: `dataviews`
+    announced "Data Views (100)" on an instance holding more than ten times
+    that. Asking for one row more than will be shown is what makes the
+    difference visible without a second count query.
+    """
+    rows = client.get(endpoint, params={**params, "$top": limit + 1}) or []
+    return rows[:limit], len(rows) > limit
+
+
+def tally(rows, more, hint="raise --limit"):
+    """A header count that admits when it is a cap rather than a total."""
+    return f"first {len(rows)} — more exist, {hint}" if more else str(len(rows))
 
 
 def _resolve_name(client, endpoint, entity_id, field="Name"):
@@ -79,15 +134,17 @@ def _find_entity(client, endpoint, identifier, name_field="Name", label=None):
     })
     if results:
         return results[0]
-    results = client.get(endpoint, params={
-        "$filter": f"substringof('{odata_str(identifier)}', {name_field}) eq true", "$top": 5,
-    })
+    results, more = get_capped(client, endpoint, {
+        "$filter": f"substringof('{odata_str(identifier)}', {name_field}) eq true",
+    }, CHOOSER_LIMIT)
     if results and len(results) == 1:
         return results[0]
     if results:
         print(f"Multiple {label}s match '{identifier}':")
         for r in results:
             print(f"  {r['Id']:5d}  {r.get(name_field, '?')}")
+        if more:
+            print(more_note(identifier))
         return None
     print(f"No {label} found matching '{identifier}'")
     return None
@@ -189,12 +246,11 @@ def cmd_workflows(args, client):
     params = {
         "$select": "Id,Name,Description,IsActive,CategoryId",
         "$orderby": "Name",
-        "$top": args.limit,
     }
     if args.category:
         params["$filter"] = f"Category/Name eq '{odata_str(args.category)}'"
 
-    workflows = client.get("WorkflowTypes", params=params)
+    workflows, more = get_capped(client, "WorkflowTypes", params, args.limit)
     if not workflows:
         print("No workflows found.")
         return
@@ -203,7 +259,7 @@ def cmd_workflows(args, client):
     cat_ids = {wf["CategoryId"] for wf in workflows if wf.get("CategoryId")}
     cat_names = {cid: _resolve_name(client, "Categories", cid) for cid in cat_ids}
 
-    print(f"Workflows ({len(workflows)}):\n")
+    print(f"Workflows ({tally(workflows, more)}):\n")
     for wf in workflows:
         active = "" if wf.get("IsActive") else " [inactive]"
         cat_name = cat_names.get(wf.get("CategoryId"), "")
@@ -227,17 +283,16 @@ def cmd_pages(args, client):
     params = {
         "$select": "Id,InternalName,PageTitle,ParentPageId,LayoutId,IsSystem",
         "$orderby": "InternalName",
-        "$top": args.limit,
     }
     if args.site:
         params["$filter"] = f"Layout/SiteId eq {args.site}"
 
-    pages = client.get("Pages", params=params)
+    pages, more = get_capped(client, "Pages", params, args.limit)
     if not pages:
         print("No pages found.")
         return
 
-    print(f"Pages ({len(pages)}):\n")
+    print(f"Pages ({tally(pages, more)}):\n")
     for p in pages:
         name = p.get("InternalName") or p.get("PageTitle") or "(untitled)"
         system = " [system]" if p.get("IsSystem") else ""
@@ -268,10 +323,9 @@ def cmd_page(args, client):
 
     # Search by name
     if not page:
-        results = client.get("Pages", params={
+        results, more = get_capped(client, "Pages", {
             "$filter": f"substringof('{odata_str(identifier)}', InternalName) eq true",
-            "$top": 5,
-        })
+        }, CHOOSER_LIMIT)
         if results:
             if len(results) == 1:
                 page = results[0]
@@ -280,6 +334,8 @@ def cmd_page(args, client):
                 for r in results:
                     name = r.get("InternalName") or r.get("PageTitle") or "(untitled)"
                     print(f"  {r['Id']:5d}  {name}")
+                if more:
+                    print(more_note(identifier))
                 return
 
     if not page:
@@ -330,50 +386,46 @@ def cmd_search(args, client):
     print(f"Searching for '{query}'...\n")
 
     # Search workflows
-    workflows = client.get("WorkflowTypes", params={
+    workflows, wf_more = get_capped(client, "WorkflowTypes", {
         "$filter": f"substringof('{odata_str(query)}', Name) eq true or substringof('{odata_str(query)}', Description) eq true",
         "$select": "Id,Name,IsActive",
-        "$top": 10,
-    })
+    }, SEARCH_LIMIT)
     if workflows:
-        print(f"Workflows ({len(workflows)}):")
+        print(f"Workflows ({tally(workflows, wf_more, WIDEN)}):")
         for wf in workflows:
             print(f"  {wf['Id']:5d}  {wf['Name']}")
         print()
 
     # Search pages
-    pages = client.get("Pages", params={
+    pages, pg_more = get_capped(client, "Pages", {
         "$filter": f"substringof('{odata_str(query)}', InternalName) eq true or substringof('{odata_str(query)}', PageTitle) eq true",
         "$select": "Id,InternalName,PageTitle",
-        "$top": 10,
-    })
+    }, SEARCH_LIMIT)
     if pages:
-        print(f"Pages ({len(pages)}):")
+        print(f"Pages ({tally(pages, pg_more, WIDEN)}):")
         for p in pages:
             name = p.get("InternalName") or p.get("PageTitle") or "(untitled)"
             print(f"  {p['Id']:5d}  {name}")
         print()
 
     # Search data views
-    dvs = client.get("DataViews", params={
+    dvs, dv_more = get_capped(client, "DataViews", {
         "$filter": f"substringof('{odata_str(query)}', Name) eq true",
         "$select": "Id,Name",
-        "$top": 10,
-    })
+    }, SEARCH_LIMIT)
     if dvs:
-        print(f"Data Views ({len(dvs)}):")
+        print(f"Data Views ({tally(dvs, dv_more, WIDEN)}):")
         for dv in dvs:
             print(f"  {dv['Id']:5d}  {dv['Name']}")
         print()
 
     # Search groups
-    groups = client.get("Groups", params={
+    groups, gp_more = get_capped(client, "Groups", {
         "$filter": f"substringof('{odata_str(query)}', Name) eq true and GroupTypeId ne {FAMILY_GROUP_TYPE_ID} and GroupTypeId ne {KNOWN_RELATIONSHIPS_GROUP_TYPE_ID}",
         "$select": "Id,Name",
-        "$top": 10,
-    })
+    }, SEARCH_LIMIT)
     if groups:
-        print(f"Groups ({len(groups)}):")
+        print(f"Groups ({tally(groups, gp_more, WIDEN)}):")
         for g in groups:
             print(f"  {g['Id']:5d}  {g['Name']}")
         print()
@@ -593,17 +645,16 @@ def cmd_dataviews(args, client):
     params = {
         "$select": "Id,Name,Description,EntityTypeId,CategoryId",
         "$orderby": "Name",
-        "$top": args.limit,
     }
     if args.category:
         params["$filter"] = f"substringof('{odata_str(args.category)}', Name) eq true"
 
-    dvs = client.get("DataViews", params=params)
+    dvs, more = get_capped(client, "DataViews", params, args.limit)
     if not dvs:
         print("No data views found.")
         return
 
-    print(f"Data Views ({len(dvs)}):\n")
+    print(f"Data Views ({tally(dvs, more)}):\n")
     for dv in dvs:
         print(f"  {dv['Id']:5d}  {dv['Name']}")
 
@@ -848,14 +899,13 @@ def cmd_group(args, client):
             print(f"  Schedule: {sched_name}")
 
     # Members
-    members = client.get("GroupMembers", params={
+    members, mem_more = get_capped(client, "GroupMembers", {
         "$filter": f"GroupId eq {group['Id']}",
         "$select": "PersonId,GroupRoleId,GroupMemberStatus",
-        "$top": args.limit,
-    })
+    }, args.limit)
     if members:
         role_cache = {}
-        print(f"  Members ({len(members)}):")
+        print(f"  Members ({tally(members, mem_more)}):")
         for m in members:
             rid = m.get("GroupRoleId")
             if rid not in role_cache:
@@ -991,7 +1041,6 @@ def cmd_schedules(args, client):
     params = {
         "$select": "Id,Name,IsActive",
         "$orderby": "Name",
-        "$top": args.limit,
     }
     filters = []
     if args.active:
@@ -1001,12 +1050,12 @@ def cmd_schedules(args, client):
     if filters:
         params["$filter"] = " and ".join(filters)
 
-    schedules = client.get("Schedules", params=params)
+    schedules, more = get_capped(client, "Schedules", params, args.limit)
     if not schedules:
         print("No schedules found.")
         return
 
-    print(f"Schedules ({len(schedules)}):\n")
+    print(f"Schedules ({tally(schedules, more)}):\n")
     for s in schedules:
         active = "" if s.get("IsActive") else " [inactive]"
         print(f"  {s['Id']:5d}  {s['Name']}{active}")
@@ -1041,7 +1090,6 @@ def cmd_registrations(args, client):
     params = {
         "$select": "Id,Name,StartDateTime,EndDateTime,MaxAttendees,IsActive,RegistrationTemplateId",
         "$orderby": "StartDateTime desc",
-        "$top": args.limit,
     }
     filters = []
     if args.active:
@@ -1051,12 +1099,12 @@ def cmd_registrations(args, client):
     if filters:
         params["$filter"] = " and ".join(filters)
 
-    regs = client.get("RegistrationInstances", params=params)
+    regs, more = get_capped(client, "RegistrationInstances", params, args.limit)
     if not regs:
         print("No registration instances found.")
         return
 
-    print(f"Registration Instances ({len(regs)}):\n")
+    print(f"Registration Instances ({tally(regs, more)}):\n")
     for r in regs:
         active = "" if r.get("IsActive") else " [inactive]"
         start = (r.get("StartDateTime") or "")[:10]
@@ -1109,7 +1157,6 @@ def cmd_registration(args, client):
 def cmd_connections(args, client):
     params = {
         "$orderby": "CreatedDateTime desc",
-        "$top": args.limit,
     }
     filters = []
     if args.state and args.state.lower() in CONNECTION_STATE_FILTER:
@@ -1119,7 +1166,7 @@ def cmd_connections(args, client):
     if filters:
         params["$filter"] = " and ".join(filters)
 
-    requests = client.get("ConnectionRequests", params=params)
+    requests, more = get_capped(client, "ConnectionRequests", params, args.limit)
     if not requests:
         print("No connection requests found.")
         return
@@ -1128,7 +1175,7 @@ def cmd_connections(args, client):
     status_cache = {}
     person_cache = {}
 
-    print(f"Connection Requests ({len(requests)}):\n")
+    print(f"Connection Requests ({tally(requests, more)}):\n")
     for cr in requests:
         dt = (cr.get("CreatedDateTime") or "")[:10]
         person = _resolve_person_name(client, cr.get("PersonAliasId"), person_cache)
@@ -1192,7 +1239,6 @@ def cmd_block(args, client):
 def cmd_bgc(args, client):
     params = {
         "$orderby": "RequestDate desc",
-        "$top": args.limit,
     }
     filters = []
     if args.status:
@@ -1227,14 +1273,14 @@ def cmd_bgc(args, client):
     if filters:
         params["$filter"] = " and ".join(filters)
 
-    checks = client.get("BackgroundChecks", params=params)
+    checks, more = get_capped(client, "BackgroundChecks", params, args.limit)
     if not checks:
         print("No background checks found.")
         return
 
     person_cache = {}
 
-    print(f"Background Checks ({len(checks)}):\n")
+    print(f"Background Checks ({tally(checks, more)}):\n")
     for bc in checks:
         req_date = (bc.get("RequestDate") or "")[:10]
         resp_date = (bc.get("ResponseDate") or "")[:10]
@@ -1251,32 +1297,46 @@ def cmd_bgc(args, client):
 def cmd_checkin(args, client):
     # Check-in areas are GroupTypes with a specific purpose
     # GroupType 15 = Check-in in most Rock instances
+    # No $top: a production instance matched half again as many types as the
+    # 20 that used to be asked for, and what got dropped were whole check-in
+    # areas no subcommand could then see. The filter already bounds this.
     checkin_group_types = client.get("GroupTypes", params={
         "$filter": "substringof('Check', Name) eq true",
         "$select": "Id,Name",
-        "$top": 20,
+        "$orderby": "Name",
     })
 
     if args.area:
         # Show specific check-in area (group) with locations and schedules
         group = None
+        truncated = False
         try:
             gid = int(args.area)
             group = client.get(f"Groups/{gid}")
         except ValueError:
-            results = client.get("Groups", params={
-                "$filter": f"substringof('{odata_str(args.area)}', Name) eq true",
-                "$top": 10,
-            })
-            # Filter to check-in group types
-            checkin_type_ids = {gt["Id"] for gt in (checkin_group_types or [])}
-            results = [g for g in (results or []) if g.get("GroupTypeId") in checkin_type_ids] if checkin_type_ids else results
+            # Filter by group type in the query rather than after it. Filtering
+            # afterwards spent the cap on rows that were about to be discarded:
+            # a common word can match hundreds of groups of every type, and if
+            # no check-in group lands in the first ten the command answers "No
+            # check-in area found" for areas that plainly exist. Worse, the
+            # fetch carried no $orderby, so which ten came back differed
+            # between identical runs. Now the cap falls on check-in groups.
+            name_filter = f"substringof('{odata_str(args.area)}', Name) eq true"
+            checkin_type_ids = sorted(gt["Id"] for gt in (checkin_group_types or []))
+            if checkin_type_ids:
+                results, truncated = groups_of_types(
+                    client, name_filter, checkin_type_ids, SEARCH_LIMIT)
+            else:
+                results, truncated = get_capped(
+                    client, "Groups", {"$filter": name_filter, "$select": "Id,Name"}, SEARCH_LIMIT)
             if results and len(results) == 1:
                 group = results[0]
             elif results:
                 print(f"Multiple check-in groups match '{args.area}':")
                 for g in results:
                     print(f"  {g['Id']:6d}  {g['Name']}")
+                if truncated:
+                    print(more_note(args.area))
                 return
 
         if not group:
@@ -1347,7 +1407,6 @@ def cmd_checkin(args, client):
 def cmd_attendance(args, client):
     params = {
         "$orderby": "OccurrenceDate desc",
-        "$top": args.limit,
     }
     filters = []
     if args.group:
@@ -1355,17 +1414,18 @@ def cmd_attendance(args, client):
             gid = int(args.group)
             filters.append(f"GroupId eq {gid}")
         except ValueError:
-            groups = client.get("Groups", params={
+            groups, more = get_capped(client, "Groups", {
                 "$filter": f"substringof('{odata_str(args.group)}', Name) eq true",
                 "$select": "Id,Name",
-                "$top": 5,
-            })
+            }, CHOOSER_LIMIT)
             if groups and len(groups) == 1:
                 filters.append(f"GroupId eq {groups[0]['Id']}")
             elif groups:
                 print(f"Multiple groups match '{args.group}':")
                 for g in groups:
                     print(f"  {g['Id']:6d}  {g['Name']}")
+                if more:
+                    print(more_note(args.group))
                 return
             else:
                 print(f"No group found matching '{args.group}'")
@@ -1375,7 +1435,7 @@ def cmd_attendance(args, client):
     if filters:
         params["$filter"] = " and ".join(filters)
 
-    occurrences = client.get("AttendanceOccurrences", params=params)
+    occurrences, more = get_capped(client, "AttendanceOccurrences", params, args.limit)
     if not occurrences:
         print("No attendance occurrences found.")
         return
@@ -1383,7 +1443,7 @@ def cmd_attendance(args, client):
     group_cache = {}
     location_cache = {}
 
-    print(f"Attendance Occurrences ({len(occurrences)}):\n")
+    print(f"Attendance Occurrences ({tally(occurrences, more)}):\n")
     for occ in occurrences:
         occ_date = (occ.get("OccurrenceDate") or "")[:10]
 
@@ -1428,15 +1488,17 @@ def cmd_occurrence(args, client):
         print("  Status: DID NOT OCCUR")
 
     # Attendees
-    attendees = client.get("Attendances", params={
+    attendees, att_more = get_capped(client, "Attendances", {
         "$filter": f"OccurrenceId eq {occ['Id']}",
         "$select": "PersonAliasId,DidAttend,StartDateTime,RSVP",
-        "$top": args.limit,
-    }) or []
+    }, args.limit)
 
     if attendees:
+        # "N total" from a capped fetch misstates the attendance rate itself,
+        # not just the list length, so say plainly when the roll is cut short.
         did_attend = sum(1 for a in attendees if a.get("DidAttend"))
-        print(f"  Attendees: {did_attend} attended / {len(attendees)} total")
+        cut = " — more exist, raise --limit" if att_more else ""
+        print(f"  Attendees: {did_attend} attended / {len(attendees)} total{cut}")
         if args.names:
             person_cache = {}
             for a in attendees:
