@@ -232,7 +232,7 @@ points:
 | Bundle reads `✘ failed to load`, naming a dependency | Step 2 was skipped or half-finished. Run the `claude plugin install` command in the error, then list again. Restarting does **not** fix this |
 | Fewer plugins listed than step 2's table | Same cause — the settings-driven install stopped early. Re-run step 2 |
 | Plugin listed, skills not available | Restart came before the fetch — restart again |
-| Plugins are behind `main`, or a skill looks out of date | A startup was missed, or Claude Code only ran headless — `claude -p` does not auto-update. Run `claude plugin marketplace update passion-tech`. To read the commit they are on: `git -C ~/.claude/plugins/marketplaces/passion-tech log --oneline -1` |
+| Plugins are behind `main`, or a skill looks out of date | A startup was missed, or Claude Code only ran headless — `claude -p` does not auto-update. Update each plugin, then restart: `claude plugin list \| grep -o '[a-z-]*@passion-tech' \| sort -u \| xargs -n1 claude plugin update`. `claude plugin marketplace update` will not do it — it moves the marketplace clone and leaves the installed plugins behind. The version beside each entry in `claude plugin list` is what that plugin is running |
 | A skill says a variable is missing | It names the variable and the file; add it to `~/.claude/passion.env` |
 | Rock says `uv` is not installed | Step 3 |
 | Jira returns 401 | The token was pasted with a truncation, or `JIRA_EMAIL` is not the address that owns it |
