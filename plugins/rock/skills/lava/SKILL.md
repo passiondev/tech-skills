@@ -15,6 +15,9 @@ the reference rather than from memory:
   action: the action components and their settings
 - `references/block-types.md` — read when the template goes in a page block:
   the block types and their attributes
+- `references/coding-standards.md` — read before writing any template that
+  lands in Rock: support header, numbered SECTIONS, comments, naming, SQL and
+  CSS formatting, and the pre-deploy checklist
 
 ## The three things that come up constantly
 

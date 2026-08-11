@@ -7,6 +7,11 @@ description: Repair an existing Rock RMS workflow — change action settings, re
 
 This changes production. Four steps, in order, every time.
 
+Where a repair means editing code that lands in Rock — action Lava, a form
+header, a Dynamic Data query — it follows the coding standards in `/rock:lava`'s
+`references/coding-standards.md`. Bring the part you touched up to standard and
+leave the rest.
+
 ## 1. Audit first
 
 Run `/rock-build:audit`, including when someone has already described the fault —

@@ -7,6 +7,11 @@ description: Build something new in Rock RMS — a workflow with its activities 
 
 This changes production. Five steps, in order, every time.
 
+Anything you write that lands in Rock — HtmlContent, Pre/PostHtml, Dynamic Data
+SQL, workflow Lava, a form header — follows the coding standards in
+`/rock:lava`'s `references/coding-standards.md`. Read it before you write, not
+after.
+
 ## 1. Understand the request
 
 Get all four before touching anything, asking the requester for any you do not
