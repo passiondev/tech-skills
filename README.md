@@ -15,17 +15,22 @@ Paste this into Claude Code. Put your department in place of the example.
 Departments: `global-engineering`, `local-engineering`, `ops`, `analytics`,
 `service-and-support`.
 
-Claude reads the document, then works through it with you:
+Claude reads the document, then works through it with you, one step at a time:
 
-- Merges two keys into your `~/.claude/settings.json`
-- Installs your department bundle
-- Helps you get a Jira API token
+- Explains the permission prompts before the first one appears
+- Installs your department bundle and turns auto-update on
+- Counts the plugins, because a half-installed bundle is easy to miss
+- Helps you create a Jira API token, click by click
 - Writes your credentials to `~/.claude/passion.env`
-- Counts the plugins at the end, because a half-installed bundle is easy to miss
+- Switches the new skills on without restarting, then runs one on your own work
+- Leaves a one-page reference on your machine and opens it
 
 Claude shows you every change before it writes that change. The paste is safe to
 repeat. On a machine that already has the marketplace, Claude checks the count
-and stops.
+and skips ahead.
+
+You need no command line experience for any of this. Six approvals, four
+answers, and one visit to Atlassian.
 
 To check for yourself:
 
@@ -33,8 +38,8 @@ To check for yourself:
 claude plugin list | grep passion-tech
 ```
 
-To do the install by hand, read [`ONBOARDING.md`](ONBOARDING.md). It holds the
-settings block and the two install commands.
+To do the install by hand, read [`ONBOARDING.md`](ONBOARDING.md) — step 3 is the
+whole of it, and it is two commands.
 
 ## What you get
 
