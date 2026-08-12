@@ -197,21 +197,28 @@ but leaves auto-update off, because third-party marketplaces default to off.
 That one flag is what keeps everyone current, so add it.
 
 Read the file, find the `passion-tech` entry that the previous command wrote,
-and add one key inside it:
+and add one key inside it. This is what that entry should read afterwards:
 
 ```json
-"extraKnownMarketplaces": {
-  "passion-tech": {
-    "source": { "source": "github", "repo": "passiondev/tech-skills" },
-    "autoUpdate": true
+{
+  "extraKnownMarketplaces": {
+    "passion-tech": {
+      "source": { "source": "github", "repo": "passiondev/tech-skills" },
+      "autoUpdate": true
+    }
   }
 }
 ```
 
-Show them the one added line before you write it. Change nothing else in that
-file — not the formatting, not another key, and not `enabledPlugins`, which the
-install has already filled in correctly with every dependency. If the file does
-not parse as JSON, stop and tell them rather than guessing at a repair.
+**That is one added line, not a file to paste.** The entry is already there
+bar the `autoUpdate` line; the outer braces are shown so the example parses, not
+because the file contains only this. Their settings file will have other keys in
+it, and every one of them stays.
+
+Show them the added line before you write it. Change nothing else — not the
+formatting, not another key, and not `enabledPlugins`, which the install has
+already filled in with every dependency. If the file does not parse as JSON,
+stop and tell them rather than guessing at a repair.
 
 ---
 
