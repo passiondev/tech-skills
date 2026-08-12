@@ -29,6 +29,10 @@ Overdue first, then in progress, then the rest of the queue — in the full repo
 
 A specific question — "what's overdue?", "what should I pick up next?" — is answered from the JSON in a sentence or two, naming the issue keys. A request for a report, a standup summary, or an overview gets the markdown as it stands.
 
+## Writing back to Jira
+
+The report reads; nothing here writes. A request that comes out of it — "move that one to In Review", "comment on the overdue ones", "log two hours against ABC-123" — is a hand-rolled API call under the user's own name with no undo, so it stops for an explicit yes first. Show the exact change and name every issue it touches. A batch may go in one question, as long as that question lists each issue with what happens to it and nothing is posted until they answer. `/jira:ticket` carries the full rule and the shape to show it in.
+
 ## Cookbook
 
 <If: the sprint has no issues assigned to them>
