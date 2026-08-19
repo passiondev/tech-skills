@@ -591,8 +591,26 @@ def _provenance():
         directory = ROOT / "plugins" / entry["plugin"] / "skills" / skill
         _files_recorded(f'skills["{skill}"].files', entry.get("files", []),
                         [p for p in shipped if directory in p.parents], directory)
-    _files_recorded("runtime.files", vend.get("runtime", {}).get("files", {}),
-                    repo_files("plugins/rock/runtime/"), ROOT)
+    # Every plugin's runtime, not only rock's. A second one arrived with jira's
+    # shared client, and until this loop the files under it were the one part of
+    # plugins/ that no list named — the check read `runtime.files` against a
+    # hardcoded `plugins/rock/runtime/`, so a whole directory of new shipped
+    # code recorded no provenance and nothing said so.
+    runtimes = vend.get("runtime", {})
+    have_runtime = sorted({plugin for plugin, _ in map(owner_of, shipped)
+                           if (PLUGINS / plugin / "runtime").is_dir()})
+    for plugin in have_runtime:
+        entry = runtimes.get(plugin)
+        if entry is None:
+            fail("docs/vendored.json",
+                 f"`runtime` has no entry for `{plugin}`, whose runtime files "
+                 "therefore record where they came from nowhere")
+            continue
+        _files_recorded(f'runtime["{plugin}"].files', entry.get("files", {}),
+                        repo_files(f"plugins/{plugin}/runtime/"), ROOT)
+    for plugin in sorted(set(runtimes) - set(have_runtime)):
+        fail("docs/vendored.json",
+             f"`runtime` names `{plugin}`, which ships no runtime directory")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -701,14 +719,46 @@ def _secrets():
 
 @check("passion_env")
 def _passion_env():
-    copies = [p for p in repo_files("plugins/") if p.name == "passion_env.py"]
-    if len(copies) < 2:
-        fail("passion_env", f"expected several copies, found {len(copies)}")
+    """One copy of passion_env.py per plugin, and every copy identical.
+
+    ADR 0004 argues against copies, and against this very check: "every
+    mechanism for preventing that -- a sync command, a CI equality check, a
+    release checklist -- is machinery that exists only to paper over having made
+    a copy in the first place." That is right about a copy somebody chose.
+
+    This one is not chosen. `${CLAUDE_PLUGIN_ROOT}` resolves to the plugin being
+    invoked, so no script in `jira` can name a file in `rock` by a path that
+    survives an install, and a department installing one and not the other still
+    has to get working credentials. One copy per plugin is the floor, and the
+    equality check is what guards a boundary rather than what excuses a habit.
+
+    A second copy inside one plugin is a different thing, and is what `jira` had:
+    one per skill, because a skill's own scripts directory was the only place its
+    scripts could import from. So this counts per plugin rather than in total.
+    """
+    copies = collections.defaultdict(list)
+    for path in repo_files("plugins/"):
+        if path.name == "passion_env.py":
+            copies[owner_of(path)[0]].append(path)
+
+    if not copies:
+        fail("passion_env", "nothing ships passion_env.py — every plugin that "
+                            "reads a credential needs its own copy (ADR 0005)")
         return
-    texts = {c.read_text() for c in copies}
-    if len(texts) != 1:
-        listing = "\n    ".join(str(c.relative_to(ROOT)) for c in copies)
-        fail("passion_env", "copies have drifted apart. They must be byte-identical:\n    " + listing)
+
+    def listing(paths):
+        return "\n    ".join(str(path.relative_to(ROOT)) for path in paths)
+
+    for plugin, paths in sorted(copies.items()):
+        if len(paths) > 1:
+            fail("passion_env", f"`{plugin}` ships {len(paths)} copies. The plugin "
+                 "boundary forces one; a second is a copy somebody made:\n    "
+                 + listing(paths))
+
+    flat = [path for paths in copies.values() for path in paths]
+    if len({path.read_text() for path in flat}) != 1:
+        fail("passion_env", "copies have drifted apart. They must be "
+                            "byte-identical:\n    " + listing(flat))
 
 
 @check("write-guard")

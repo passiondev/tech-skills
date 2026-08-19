@@ -14,7 +14,7 @@ description: >
 ## Step 1: Run the report
 
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/sprint/scripts/sprint_report.py"
+python3 "${CLAUDE_PLUGIN_ROOT}/runtime/scripts/sprint_report.py"
 ```
 
 - `--project <KEY>` — add it whenever the user names a project; without it the script uses `JIRA_PROJECT`.

@@ -240,10 +240,12 @@ class TestProvenanceReadsTheFileLists(CheckTestCase):
     """provenance — every shipped file is named in docs/vendored.json."""
 
     def vendored(self, files):
+        # `runtime` is keyed by plugin. Empty here: this fixture ships no runtime
+        # directory, and an entry for one that is absent is its own failure.
         return json.dumps({
             "skills": {"rock": {"plugin": "rock", "upstream": "somewhere",
                                 "files": files}},
-            "runtime": {"files": {}},
+            "runtime": {},
         })
 
     def repo(self, listed, on_disk, extra=None):
@@ -277,13 +279,34 @@ class TestProvenanceReadsTheFileLists(CheckTestCase):
 
     def test_the_runtime_list_is_read_too(self):
         found = self.run_check(checks._provenance, {
-            "docs/vendored.json": json.dumps({"skills": {}, "runtime": {
-                "files": {"plugins/rock/runtime/scripts/gone.py": "patched"}}}),
+            "docs/vendored.json": json.dumps({"skills": {}, "runtime": {"rock": {
+                "files": {"plugins/rock/runtime/scripts/gone.py": "patched"}}}}),
             "plugins/rock/runtime/scripts/rock_client.py": "x = 1\n",
         })
         self.assertEqual(len(found), 2, found)
         self.assertTrue(any("gone.py" in f and "no longer ships" in f for f in found), found)
         self.assertTrue(any("rock_client.py" in f for f in found), found)
+
+    def test_every_plugin_runtime_is_read_not_only_rocks(self):
+        """The check went to a hardcoded plugins/rock/runtime/, so jira's
+        arrived as a directory of shipped code that no list named."""
+        found = self.run_check(checks._provenance, {
+            "docs/vendored.json": json.dumps({"skills": {}, "runtime": {"rock": {
+                "files": {"plugins/rock/runtime/scripts/rock_client.py": "patched"}}}}),
+            "plugins/rock/runtime/scripts/rock_client.py": "x = 1\n",
+            "plugins/jira/runtime/scripts/jira_client.py": "x = 1\n",
+        })
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("no entry for `jira`", found[0])
+
+    def test_a_runtime_entry_for_a_plugin_with_no_runtime_is_stale(self):
+        found = self.run_check(checks._provenance, {
+            "docs/vendored.json": json.dumps({"skills": {}, "runtime": {
+                "rock": {"files": {}}}}),
+            "plugins/rock/skills/rock/SKILL.md": "body\n",
+        })
+        self.assertTrue(any("names `rock`" in f and "no runtime" in f
+                            for f in found), found)
 
     def test_the_repository_itself_passes(self):
         """Not a repository of our making — this one, and its 54 filenames."""
@@ -489,6 +512,62 @@ class TestWhoOwnsAFile(CheckTestCase):
     def test_the_skills_directory_itself_owns_nothing(self):
         """`plugins/dev/skills` is three parts, and a skill needs a file in it."""
         self.assertEqual(self.owner("dev/skills"), ("dev", None))
+
+
+class TestTheCredentialLoaderEveryPluginCarries(CheckTestCase):
+    """passion_env — one copy per plugin, byte-identical, and no second one.
+
+    The check counted copies in total and passed on "two or more", so it read
+    jira's two — one per skill, because a skill's scripts directory was the only
+    place its own scripts could import from — as the floor rather than as a copy
+    somebody made. ADR 0004 argues against copies and against this check; what
+    makes it earn its place is counting per plugin, since `${CLAUDE_PLUGIN_ROOT}`
+    forces exactly one per plugin and excuses nothing beyond that.
+    """
+
+    BODY = "ENV_FILE = 1\n"
+
+    def repo(self, *paths, drift=()):
+        files = {rel: (self.BODY + "# changed\n" if rel in drift else self.BODY)
+                 for rel in paths}
+        return self.run_check(checks._passion_env, files)
+
+    def test_one_copy_per_plugin_passes(self):
+        self.assertEqual(self.repo("plugins/rock/runtime/scripts/passion_env.py",
+                                   "plugins/jira/runtime/scripts/passion_env.py"), [])
+
+    def test_a_single_plugin_with_a_single_copy_passes(self):
+        """Two was never the point. One plugin needing credentials needs one."""
+        self.assertEqual(
+            self.repo("plugins/rock/runtime/scripts/passion_env.py"), [])
+
+    def test_a_second_copy_inside_one_plugin_is_caught(self):
+        found = self.repo("plugins/jira/skills/ticket/scripts/passion_env.py",
+                          "plugins/jira/skills/sprint/scripts/passion_env.py")
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("`jira` ships 2 copies", found[0])
+        self.assertIn("skills/ticket", found[0], "say which files")
+
+    def test_copies_that_have_drifted_are_caught(self):
+        found = self.repo("plugins/rock/runtime/scripts/passion_env.py",
+                          "plugins/jira/runtime/scripts/passion_env.py",
+                          drift=("plugins/jira/runtime/scripts/passion_env.py",))
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("drifted apart", found[0])
+
+    def test_shipping_none_at_all_is_caught(self):
+        found = self.repo("plugins/rock/runtime/scripts/rock_client.py")
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("nothing ships", found[0])
+
+    def test_the_repository_itself_passes(self):
+        kept = list(checks.failures)
+        checks.failures.clear()
+        try:
+            checks._passion_env()
+            self.assertEqual(checks.failures, [])
+        finally:
+            checks.failures[:] = kept
 
 
 SETTINGS = {"extraKnownMarketplaces": {"passion-tech": {

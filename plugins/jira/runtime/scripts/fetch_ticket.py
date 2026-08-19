@@ -2,8 +2,8 @@
 """Fetch JIRA ticket details and output structured context for plan generation.
 
 Pulls the ticket's summary/description, all comments, and downloads any image
-attachments locally so they can be read into context. Uses curl for HTTP
-requests to avoid macOS SSL certificate issues with urllib.
+attachments locally so they can be read into context. Requests go through
+jira_client, which uses curl to avoid macOS SSL certificate issues with urllib.
 
 Credentials come from the environment, falling back to ~/.claude/passion.env:
     JIRA_BASE_URL: JIRA instance URL (e.g., https://mycompany.atlassian.net)
@@ -16,54 +16,32 @@ Usage:
 
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import passion_env  # noqa: E402
+import jira_client  # noqa: E402
 
 # Attachments are written outside every repository, so a screenshot pulled from a
 # ticket can never be committed by accident. See ADR 0001.
 DOWNLOAD_ROOT = Path(os.environ.get("CLAUDE_PLUGIN_DATA") or Path.home() / ".claude") / "jira-attachments"
 
-
-def _auth():
-    # require() is idempotent, so this is safe to call per attachment; it also
-    # means the download path fails with a named variable rather than a 401.
-    return passion_env.require("JIRA_EMAIL", "JIRA_API_TOKEN")
+FIELDS = "summary,description,status,priority,labels,issuetype,assignee,comment,attachment"
 
 
-def fetch_ticket(issue_key: str) -> dict:
-    base_url, email, token = passion_env.require("JIRA_BASE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN")
-    base_url = base_url.rstrip("/")
-
-    fields = "summary,description,status,priority,labels,issuetype,assignee,comment,attachment"
-    url = f"{base_url}/rest/api/3/issue/{issue_key}?fields={fields}"
-
-    result = subprocess.run(
-        ["curl", "-s", "-w", "\n%{http_code}", "-u", f"{email}:{token}", "-H", "Accept: application/json", url],
-        capture_output=True, text=True, timeout=30,
-    )
-
-    lines = result.stdout.rsplit("\n", 1)
-    body = lines[0] if len(lines) > 1 else result.stdout
-    status_code = int(lines[1]) if len(lines) > 1 else 0
-
-    if status_code == 404:
-        print(f"ERROR: Ticket {issue_key} not found", file=sys.stderr)
-        sys.exit(1)
-    elif status_code == 401:
-        print("ERROR: Authentication failed — check JIRA_EMAIL and JIRA_API_TOKEN", file=sys.stderr)
-        sys.exit(1)
-    elif status_code == 403:
-        print(f"ERROR: Permission denied for ticket {issue_key}", file=sys.stderr)
-        sys.exit(1)
-    elif status_code < 200 or status_code >= 300:
-        print(f"ERROR: JIRA API returned {status_code}", file=sys.stderr)
-        sys.exit(1)
-
-    return json.loads(body)
+def fetch_ticket(client, issue_key: str) -> dict:
+    try:
+        ticket = client.get(f"issue/{issue_key}", params={"fields": FIELDS})
+    except jira_client.JiraNotFound:
+        # Jira answers 404 for a ticket that is not there and for one this
+        # account cannot see, and the reader has to check both.
+        raise jira_client.JiraError(
+            f"Ticket {issue_key} not found. Confirm the key, and that your "
+            "Jira account can see that project.") from None
+    if not isinstance(ticket, dict):
+        raise jira_client.JiraError(
+            f"Jira answered for {issue_key} with no ticket in the body.")
+    return ticket
 
 
 def extract_adf_text(node: dict) -> str:
@@ -110,19 +88,14 @@ def extract_comments(comment_field) -> list:
     return out
 
 
-def download_attachment(url: str, dest_path: str) -> bool:
-    email, token = _auth()
-    result = subprocess.run(
-        ["curl", "-s", "-L", "-w", "%{http_code}", "-u", f"{email}:{token}", "-o", dest_path, url],
-        capture_output=True, text=True, timeout=60,
-    )
-    # With -o, the body is written to the file, so stdout is only %{http_code}.
-    code = result.stdout.strip()
-    return code.isdigit() and 200 <= int(code) < 300
+def process_attachments(client, attachment_field, issue_key: str) -> list:
+    """List all attachments; download image attachments locally for context.
 
-
-def process_attachments(attachment_field, issue_key: str) -> list:
-    """List all attachments; download image attachments locally for context."""
+    One image that will not download is not a reason to lose the ticket, so a
+    failure is recorded against that attachment and the rest carry on. What
+    failed is recorded too: the reader is told to fall back to the URL, and
+    "403" and "the file is gone" call for different next steps.
+    """
     if not isinstance(attachment_field, list):
         return []
 
@@ -141,6 +114,7 @@ def process_attachments(attachment_field, issue_key: str) -> list:
             "is_image": mime.startswith("image/"),
             "download_url": content_url,
             "local_path": None,
+            "download_error": None,
         }
 
         if entry["is_image"] and content_url:
@@ -151,10 +125,13 @@ def process_attachments(attachment_field, issue_key: str) -> list:
             att_id = a.get("id")
             safe_name = f"{att_id}_{filename}" if att_id else filename
             dest = os.path.join(download_dir, safe_name)
-            if download_attachment(content_url, dest):
+            try:
+                client.download(content_url, dest)
                 entry["local_path"] = dest
-            elif os.path.exists(dest):
-                os.remove(dest)
+            except jira_client.JiraError as exc:
+                entry["download_error"] = str(exc)
+                if os.path.exists(dest):
+                    os.remove(dest)
 
         out.append(entry)
 
@@ -167,33 +144,32 @@ def main():
         sys.exit(1)
 
     issue_key = sys.argv[1].strip().upper()
-    data = fetch_ticket(issue_key)
 
-    fields = data.get("fields", {})
-    key = data.get("key", issue_key)
-    summary = fields.get("summary", "")
-    description = extract_description(fields.get("description"))
-    status = fields.get("status", {}).get("name", "Unknown")
-    priority = fields.get("priority", {}).get("name", "None")
-    labels = fields.get("labels", [])
-    issue_type = fields.get("issuetype", {}).get("name", "Task")
-    assignee_field = fields.get("assignee")
-    assignee = assignee_field.get("displayName", "Unassigned") if assignee_field else "Unassigned"
-    comments = extract_comments(fields.get("comment"))
-    attachments = process_attachments(fields.get("attachment"), key)
+    with jira_client.api_errors_reported():
+        client = jira_client.JiraClient()
+        data = fetch_ticket(client, issue_key)
 
-    output = {
-        "key": key,
-        "summary": summary,
-        "description": description,
-        "status": status,
-        "priority": priority,
-        "labels": labels,
-        "issue_type": issue_type,
-        "assignee": assignee,
-        "comments": comments,
-        "attachments": attachments,
-    }
+        fields = data.get("fields") or {}
+        key = data.get("key", issue_key)
+        assignee_field = fields.get("assignee")
+
+        output = {
+            "key": key,
+            "summary": fields.get("summary", ""),
+            "description": extract_description(fields.get("description")),
+            # `or {}` rather than a default: Jira sends these fields as null on
+            # an unprioritised issue rather than omitting them, so a default
+            # only fires for the field that is absent and the read still
+            # crashes on the field that is there and empty. sprint_report.py
+            # has always guarded this way.
+            "status": (fields.get("status") or {}).get("name", "Unknown"),
+            "priority": (fields.get("priority") or {}).get("name", "None"),
+            "labels": fields.get("labels") or [],
+            "issue_type": (fields.get("issuetype") or {}).get("name", "Task"),
+            "assignee": assignee_field.get("displayName", "Unassigned") if assignee_field else "Unassigned",
+            "comments": extract_comments(fields.get("comment")),
+            "attachments": process_attachments(client, fields.get("attachment"), key),
+        }
 
     json.dump(output, sys.stdout, indent=2)
 

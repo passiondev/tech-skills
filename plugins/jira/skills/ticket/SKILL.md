@@ -20,7 +20,7 @@ Done when you hold a key and have matched the request to one of the branches in 
 ## Step 2: Fetch the ticket
 
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/ticket/scripts/fetch_ticket.py" <ISSUE_KEY>
+python3 "${CLAUDE_PLUGIN_ROOT}/runtime/scripts/fetch_ticket.py" <ISSUE_KEY>
 ```
 
 Credentials come from the environment, falling back to `~/.claude/passion.env` — the script works from any directory. On a missing variable it exits naming the variable, the file it belongs in, and where to get a token; relay that message as it stands.
@@ -28,11 +28,11 @@ Credentials come from the environment, falling back to `~/.claude/passion.env` �
 It prints the ticket as JSON. Two fields need care:
 
 - `comments` — `{ author, created, updated, body }`, oldest first. Treat them as authoritative over the description: clarifications, scope changes, and acceptance criteria all land here after the fact.
-- `attachments` — `{ filename, mime_type, size, is_image, download_url, local_path }`. Images are downloaded to `local_path`, outside any repository. Everything else is listed as metadata only.
+- `attachments` — `{ filename, mime_type, size, is_image, download_url, local_path, download_error }`. Images are downloaded to `local_path`, outside any repository. Everything else is listed as metadata only.
 
 ## Step 3: Read the images
 
-Read every attachment that has `is_image: true` and a `local_path`, before you act on the ticket — a screenshot or a mockup carries detail that appears nowhere in the text. Where `local_path` is `null` the download failed: give the user the `download_url` and work from the text.
+Read every attachment that has `is_image: true` and a `local_path`, before you act on the ticket — a screenshot or a mockup carries detail that appears nowhere in the text. Where `local_path` is `null` the download failed and `download_error` says why: relay that, give the user the `download_url`, and work from the text. A 403 there means their account cannot reach the file, which is a different ask of them than a file that is gone.
 
 Done when every image attachment has been Read or reported as failed.
 
