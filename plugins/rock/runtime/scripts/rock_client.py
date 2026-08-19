@@ -7,14 +7,20 @@ trees are assembled with sequential calls; no contains(), so filters use
 substringof(); IsComponent is absent from EntityType, Path from BlockType, and
 FriendlyScheduleText from Schedule.
 
+Every method here either returns or raises. None of them ends the process: a
+failed request is a `RockError`, and the one place that decides a raise stops
+the program is `api_errors_reported`, which entry points wrap their body in.
+That split is what lets a caller mid-plan report the three entities it already
+created before it exits.
+
 Usage:
   uv run scripts/rock_client.py status    # test connection
 """
 
 import json
-import os
 import sys
 import traceback
+from contextlib import contextmanager
 from pathlib import Path
 
 import requests
@@ -28,6 +34,90 @@ log = get_logger("rock.client")
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = ROOT / "config.yaml"
 
+BASE_URL_ENV = "ROCK_BASE_URL"
+USERNAME_ENV = "ROCK_USERNAME"
+PASSWORD_ENV = "ROCK_PASSWORD"
+
+
+class RockError(RuntimeError):
+    """Anything that stops this runtime talking to Rock.
+
+    Carries the operator-facing wording with it, so the message a person sees
+    for a 403 is written once and not once per command.
+    """
+
+    def operator_message(self):
+        return str(self)
+
+
+class RockConfigError(RockError):
+    """The credentials or the base URL are missing or unusable."""
+
+
+class RockApiError(RockError):
+    """Rock answered with a status the caller has to deal with."""
+
+    def __init__(self, status, method, endpoint, detail):
+        self.status = status
+        self.method = method
+        self.endpoint = endpoint
+        self.detail = detail
+        super().__init__(f"Rock API HTTP {status} on {method} {endpoint}: {detail}")
+
+    def operator_message(self):
+        return f"Error: {self}"
+
+
+class RockNotFound(RockApiError):
+    """The row is not there.
+
+    Lookup ladders raise past this one on purpose: "not an integer" and "no such
+    row" are both "try the next strategy", and a ladder catches both.
+    """
+
+    def operator_message(self):
+        return f"Error: not found (404): {self.endpoint}"
+
+
+class RockAuthError(RockApiError):
+    """401 or 403. Either the credentials are wrong or the account cannot."""
+
+    def operator_message(self):
+        if self.status == 401:
+            return ("Error: Rock login failed or the session expired. "
+                    f"Check {USERNAME_ENV} and {PASSWORD_ENV} in {passion_env.ENV_FILE}")
+        return (f"Error: access denied (403) on {self.method} {self.endpoint}. "
+                "The account may lack permission for this endpoint.")
+
+
+class RockRateLimited(RockApiError):
+    """429."""
+
+    def operator_message(self):
+        return "Error: rate limited by the Rock API. Try again later."
+
+
+_STATUS_ERRORS = {404: RockNotFound, 401: RockAuthError, 403: RockAuthError,
+                  429: RockRateLimited}
+
+
+@contextmanager
+def api_errors_reported():
+    """Print one operator message for a Rock failure, then exit 1.
+
+    This is the only place in the runtime that turns a Rock error into a dead
+    process. Entry points wrap their body in it; library code does not, so a
+    handler is free to catch a 403 and finish reporting what it managed to do.
+    """
+    try:
+        yield
+    except RockError as exc:
+        print(exc.operator_message())
+        sys.exit(1)
+    except requests.RequestException as exc:
+        print(f"Error: could not reach Rock. {exc}")
+        sys.exit(1)
+
 
 def load_config():
     with open(CONFIG_PATH) as f:
@@ -35,15 +125,15 @@ def load_config():
 
 
 def get_credentials():
-    config = load_config()
     base_url, username, password = passion_env.require(
-        config["base_url_env"], config["username_env"], config["password_env"]
+        BASE_URL_ENV, USERNAME_ENV, PASSWORD_ENV
     )
     if not base_url.startswith("https://"):
-        log.error("ROCK_BASE_URL not HTTPS: %s", base_url[:20])
-        print(f"Error: ROCK_BASE_URL must use HTTPS (got: {base_url[:20]}...)")
-        print("  Credentials must not be transmitted over plain HTTP.")
-        sys.exit(1)
+        log.error("%s not HTTPS: %s", BASE_URL_ENV, base_url[:20])
+        raise RockConfigError(
+            f"Error: {BASE_URL_ENV} must use HTTPS (got: {base_url[:20]}...)\n"
+            "  Credentials must not be transmitted over plain HTTP."
+        )
     return base_url.rstrip("/"), username, password
 
 
@@ -73,31 +163,37 @@ class RockClient:
             return
         if resp.status_code == 401:
             log.error("login failed user=%s status=401", self._username)
-            print(f"Error: Rock login failed. Check ROCK_USERNAME and ROCK_PASSWORD in {passion_env.ENV_FILE}")
-            sys.exit(1)
+            raise RockAuthError(401, "POST", "Auth/Login", "login rejected")
         log.error("login unexpected status=%d user=%s body=%s",
                    resp.status_code, self._username, resp.text[:200])
-        resp.raise_for_status()
+        raise RockApiError(resp.status_code, "POST", "Auth/Login", resp.text[:200])
+
+    def _request(self, method, endpoint, params=None, data=None, timeout=30):
+        """Send one request. Every verb below goes through here.
+
+        `json=data` with `data` None sends no body at all, which some Rock
+        routes require: SetAttributeValue binds from the query string, and a
+        body makes the request match the OData route instead and 404.
+        """
+        url = f"{self.base_url}/api/{endpoint.lstrip('/')}"
+        resp = self.session.request(method, url, json=data, params=params,
+                                    timeout=timeout)
+        self._handle_error(resp, method, endpoint, params=params, data=data)
+        log.info("%s %s ok %dB", method, endpoint, len(resp.content))
+        return resp
 
     def get(self, endpoint, params=None, timeout=30):
-        url = f"{self.base_url}/api/{endpoint.lstrip('/')}"
-        resp = self.session.get(url, params=params, timeout=timeout)
-        self._handle_error(resp, "GET", endpoint, params=params)
-        log.info("GET %s ok %dB", endpoint, len(resp.content))
+        resp = self._request("GET", endpoint, params=params, timeout=timeout)
         return resp.json() if resp.content else None
 
     def post(self, endpoint, data=None, params=None, timeout=30):
         """POST, with or without a JSON body.
 
-        Some Rock routes are convention-based rather than OData, and bind their
-        arguments from the query string with no body at all — SetAttributeValue
-        is the one this runtime uses. Passing `json=None` sends no body, which
-        is what those routes need: a body makes the request match the OData
-        route instead, and that 404s.
+        Returns the created id where Rock answers 201 with one, otherwise the
+        parsed body.
         """
-        url = f"{self.base_url}/api/{endpoint.lstrip('/')}"
-        resp = self.session.post(url, json=data, params=params, timeout=timeout)
-        self._handle_error(resp, "POST", endpoint, params=params, data=data)
+        resp = self._request("POST", endpoint, params=params, data=data,
+                             timeout=timeout)
         result = None
         if resp.status_code == 201:
             try:
@@ -106,7 +202,7 @@ class RockClient:
                 pass
         if result is None:
             result = resp.json() if resp.content else None
-        log.info("POST %s ok id=%s", endpoint, result)
+        log.info("POST %s id=%s", endpoint, result)
         return result
 
     def patch(self, endpoint, data, timeout=30):
@@ -114,13 +210,10 @@ class RockClient:
 
         This is the verb for any partial update. See `put` for why.
         """
-        url = f"{self.base_url}/api/{endpoint.lstrip('/')}"
-        resp = self.session.patch(url, json=data, timeout=timeout)
-        self._handle_error(resp, "PATCH", endpoint, data=data)
-        log.info("PATCH %s ok", endpoint)
+        self._request("PATCH", endpoint, data=data, timeout=timeout)
         return True
 
-    def put(self, endpoint, data, timeout=30):
+    def put(self, endpoint, data, *, full_replace, timeout=30):
         """Replace the whole entity. Almost never what you want — use `patch`.
 
         Rock's PUT is not a merge. `ApiController<T>.Put` calls
@@ -139,19 +232,44 @@ class RockClient:
 
         A caller that means it must send the entity back whole — every field it
         read, including Id, Guid, and the Created* pair.
+
+        `full_replace` is keyword-only and has no default, so the difference
+        between this and `patch` is visible at the call site rather than left to
+        a reviewer, a docstring, or a CI pattern over the source text.
         """
-        url = f"{self.base_url}/api/{endpoint.lstrip('/')}"
-        resp = self.session.put(url, json=data, timeout=timeout)
-        self._handle_error(resp, "PUT", endpoint, data=data)
-        log.info("PUT %s ok", endpoint)
+        if not full_replace:
+            raise ValueError(
+                "put() replaces every column in the row, nulling the ones you "
+                "omit. Pass full_replace=True and send the entity back whole, "
+                "or call patch() to change only the fields you supply."
+            )
+        self._request("PUT", endpoint, data=data, timeout=timeout)
         return True
 
     def delete(self, endpoint, timeout=30):
-        url = f"{self.base_url}/api/{endpoint.lstrip('/')}"
-        resp = self.session.delete(url, timeout=timeout)
-        self._handle_error(resp, "DELETE", endpoint)
-        log.info("DELETE %s ok", endpoint)
+        self._request("DELETE", endpoint, timeout=timeout)
         return True
+
+    def set_attribute_value(self, entity, entity_id, key, value, timeout=30):
+        """Set one attribute value on one entity.
+
+        Rock routes this by convention rather than through OData and binds both
+        arguments from the query string:
+
+          POST /api/{Entity}/AttributeValue/{id}?attributeKey=K&attributeValue=V
+
+        with no body. Neither parameter is optional — omit attributeKey and the
+        request stops matching the route at all. A body is worse than ignored:
+        it makes the request match the OData route, which is where the 404s that
+        went unnoticed for the life of this plugin came from.
+
+        An unrecognised key is a 400 and nothing is written, so the raise
+        propagates. The shape this replaced swallowed both.
+        """
+        return self.post(f"{entity}/AttributeValue/{entity_id}", params={
+            "attributeKey": key,
+            "attributeValue": "" if value is None else str(value),
+        }, timeout=timeout)
 
     def _handle_error(self, resp, method="?", endpoint="?", params=None, data=None):
         if resp.ok:
@@ -167,7 +285,7 @@ class RockClient:
         # 404s are expected in lookup helpers -- log at debug, not error
         if status == 404:
             log.debug("%s %s status=404", method, endpoint)
-            raise ValueError(f"Not found (404): {detail}")
+            raise RockNotFound(404, method, endpoint, detail)
 
         log.error(
             "%s %s status=%d params=%s data=%s\n  response: %s\n  traceback:\n%s",
@@ -177,18 +295,8 @@ class RockClient:
             detail_str[:500],
             "".join(traceback.format_stack()),
         )
-
-        if status == 401:
-            print(f"Error: session expired or auth failed. Check credentials in {passion_env.ENV_FILE}")
-            sys.exit(1)
-        elif status == 403:
-            print("Error: access denied (403). Account may lack permissions for this endpoint.")
-            sys.exit(1)
-        elif status == 429:
-            print("Error: rate limited by Rock API. Try again later.")
-            sys.exit(1)
-        else:
-            raise RuntimeError(f"Rock API HTTP {status}: {detail_str}")
+        raise _STATUS_ERRORS.get(status, RockApiError)(
+            status, method, endpoint, detail_str)
 
 
 def odata_str(value):
@@ -197,16 +305,12 @@ def odata_str(value):
 
 
 def main():
-    client = RockClient()
-    try:
+    with api_errors_reported():
+        client = RockClient()
         campuses = client.get("Campuses", params={"$top": 1})
         print(f"Connected to Rock RMS at {client.base_url}")
-        if campuses and len(campuses) > 0:
+        if campuses:
             print(f"  Campus: {campuses[0].get('Name', 'unknown')}")
-    except Exception as e:
-        print(f"Failed to connect to Rock RMS at {client.base_url}")
-        print(f"  {e}")
-        sys.exit(1)
 
 
 if __name__ == "__main__":

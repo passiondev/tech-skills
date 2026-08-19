@@ -12,7 +12,7 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
-from rock_client import RockClient, load_config
+from rock_client import RockClient, api_errors_reported, load_config
 from rock_log import get_logger
 
 log = get_logger("rock.catalog")
@@ -316,6 +316,11 @@ def main():
 
     cmd = sys.argv[1]
 
+    with api_errors_reported():
+        _dispatch(cmd)
+
+
+def _dispatch(cmd):
     if cmd == "status":
         client = RockClient()
         try:

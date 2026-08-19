@@ -118,7 +118,7 @@ def _session_factory():
     return s
 
 
-_stub("requests", Session=_session_factory)
+_stub("requests", Session=_session_factory, RequestException=OSError)
 _stub("yaml", safe_load=lambda *a, **k: {})
 
 if str(ROCK_SCRIPTS) not in sys.path:
@@ -170,13 +170,21 @@ class FakeClient:
         self._record("PATCH", endpoint, data=data)
         return True
 
-    def put(self, endpoint, data, timeout=30):
+    def put(self, endpoint, data, *, full_replace, timeout=30):
+        if not full_replace:
+            raise ValueError("put() replaces every column; pass full_replace=True")
         self._record("PUT", endpoint, data=data)
         return True
 
     def delete(self, endpoint, timeout=30):
         self._record("DELETE", endpoint)
         return True
+
+    def set_attribute_value(self, entity, entity_id, key, value, timeout=30):
+        return self.post(f"{entity}/AttributeValue/{entity_id}", params={
+            "attributeKey": key,
+            "attributeValue": "" if value is None else str(value),
+        })
 
     # -- assertions --------------------------------------------------------
     @property
@@ -257,8 +265,99 @@ class TestClientVerbs(unittest.TestCase):
     def test_put_still_exists_for_deliberate_full_replacement(self):
         c, session = self.client()
         session.sent.clear()
-        c.put("Groups/3", {"Name": "Team", "GroupTypeId": 1})
+        c.put("Groups/3", {"Name": "Team", "GroupTypeId": 1}, full_replace=True)
         self.assertEqual(session.sent[-1]["method"], "PUT")
+
+    def test_put_refuses_a_caller_that_did_not_say_full_replace(self):
+        """The rule used to live only in a CI regex keyed to one function name.
+
+        Renaming the file or the function silently unguarded it. Now the
+        signature carries it, so the difference between a merge and a
+        whole-entity replace is visible where the call is written."""
+        c, session = self.client()
+        session.sent.clear()
+        with self.assertRaises(ValueError):
+            c.put("Groups/3", {"Name": "Team"}, full_replace=False)
+        self.assertEqual(session.sent, [], "nothing may leave the process")
+
+    def test_put_cannot_be_called_positionally_like_patch(self):
+        c, _ = self.client()
+        with self.assertRaises(TypeError):
+            c.put("Groups/3", {"Name": "Team"})
+
+    def test_set_attribute_value_uses_the_convention_route(self):
+        c, session = self.client()
+        session.sent.clear()
+        c.set_attribute_value("Blocks", 9, "EnableDebug", False)
+        sent = session.sent[-1]
+        self.assertEqual(sent["method"], "POST")
+        self.assertEqual(sent["url"], "https://example.com/api/Blocks/AttributeValue/9")
+        self.assertEqual(sent["params"],
+                         {"attributeKey": "EnableDebug", "attributeValue": "False"})
+        self.assertIsNone(sent["json"], "a body makes this match the OData route")
+
+
+class TestClientErrorsAreRaisedNotExited(unittest.TestCase):
+    """The client used to call sys.exit on 401, 403 and 429.
+
+    A plan that created three entities and then hit a 403 died inside the
+    client, so nothing reported the three. Every verb now raises and one context
+    manager at the entry point decides that a raise ends the process."""
+
+    def client(self):
+        c = rock_client.RockClient(base_url="https://example.com",
+                                   username="svc", password="x")
+        return c, _SESSIONS[-1]
+
+    def _raises_on(self, status, expected):
+        c, session = self.client()
+        session.next_response = _FakeResponse(status, text="nope")
+        try:
+            with self.assertRaises(expected) as caught:
+                c.get("Groups/1")
+        finally:
+            session.next_response = None
+        return caught.exception
+
+    def test_403_raises_an_auth_error(self):
+        exc = self._raises_on(403, rock_client.RockAuthError)
+        self.assertEqual(exc.status, 403)
+        self.assertIn("access denied", exc.operator_message())
+
+    def test_401_raises_an_auth_error_naming_the_env_file(self):
+        exc = self._raises_on(401, rock_client.RockAuthError)
+        self.assertIn("ROCK_PASSWORD", exc.operator_message())
+
+    def test_429_raises_a_rate_limit_error(self):
+        exc = self._raises_on(429, rock_client.RockRateLimited)
+        self.assertIn("rate limited", exc.operator_message())
+
+    def test_404_raises_not_found_which_a_lookup_ladder_catches(self):
+        exc = self._raises_on(404, rock_client.RockNotFound)
+        self.assertIsInstance(exc, rock_client.RockApiError)
+
+    def test_500_raises_the_generic_api_error(self):
+        exc = self._raises_on(500, rock_client.RockApiError)
+        self.assertEqual(exc.status, 500)
+
+    def test_every_error_is_a_rock_error(self):
+        for cls in (rock_client.RockConfigError, rock_client.RockApiError,
+                    rock_client.RockNotFound, rock_client.RockAuthError,
+                    rock_client.RockRateLimited):
+            self.assertTrue(issubclass(cls, rock_client.RockError), cls.__name__)
+
+
+class TestOneExitPolicy(unittest.TestCase):
+    def test_the_context_manager_prints_the_message_and_exits_one(self):
+        with self.assertRaises(SystemExit) as caught:
+            with rock_client.api_errors_reported():
+                raise rock_client.RockAuthError(403, "PATCH", "Groups/1", "no")
+        self.assertEqual(caught.exception.code, 1)
+
+    def test_it_lets_anything_that_is_not_a_rock_error_through(self):
+        with self.assertRaises(KeyError):
+            with rock_client.api_errors_reported():
+                raise KeyError("workflow")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

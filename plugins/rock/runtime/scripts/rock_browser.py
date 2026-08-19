@@ -29,7 +29,7 @@ except ModuleNotFoundError:
         "That installs both, once. Every later command keeps them."
     )
 
-from rock_client import get_credentials
+from rock_client import api_errors_reported, get_credentials
 from rock_log import get_logger
 
 log = get_logger("rock.browser")
@@ -269,14 +269,15 @@ def main():
     p_vp.add_argument("page_id", type=int, help="Rock page ID")
 
     parsed = parser.parse_args()
-    if parsed.command == "login":
-        cmd_login(parsed)
-    elif parsed.command == "screenshot":
-        cmd_screenshot(parsed)
-    elif parsed.command == "check-element":
-        cmd_check_element(parsed)
-    elif parsed.command == "verify-page":
-        cmd_verify_page(parsed)
+    with api_errors_reported():
+        if parsed.command == "login":
+            cmd_login(parsed)
+        elif parsed.command == "screenshot":
+            cmd_screenshot(parsed)
+        elif parsed.command == "check-element":
+            cmd_check_element(parsed)
+        elif parsed.command == "verify-page":
+            cmd_verify_page(parsed)
 
 
 if __name__ == "__main__":

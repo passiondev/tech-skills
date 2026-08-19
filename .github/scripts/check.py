@@ -566,6 +566,13 @@ def _rock_write_shapes():
     runtime keeps is inside `api_request`, which refuses to send one without an
     explicit `full_replace` acknowledgement.
 
+    This check is now the backstop rather than the guard. `client.put` takes a
+    required keyword-only `full_replace`, so a caller who meant `patch` gets a
+    TypeError before a request leaves the process. That matters because the
+    allow-list below is a pair of strings: renaming the file or the function
+    would have silently stopped this check from guarding anything, and a
+    signature cannot be renamed around.
+
     Attribute values are the other one. There is no `{Entity}/{id}/AttributeValues`
     route; both shapes that look plausible answer "The OData path is invalid."
     The real route binds from the query string.

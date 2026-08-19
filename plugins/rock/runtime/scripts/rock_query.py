@@ -16,7 +16,7 @@ import os
 import sys
 import traceback
 
-from rock_client import RockClient, odata_str
+from rock_client import RockClient, RockNotFound, api_errors_reported, odata_str
 from rock_log import get_logger
 
 log = get_logger("rock.query")
@@ -127,7 +127,7 @@ def _find_entity(client, endpoint, identifier, name_field="Name", label=None):
         result = client.get(f"{endpoint}/{eid}")
         if result:
             return result
-    except ValueError:
+    except (ValueError, RockNotFound):
         pass
     results = client.get(endpoint, params={
         "$filter": f"{name_field} eq '{odata_str(identifier)}'", "$top": 1,
@@ -307,7 +307,7 @@ def cmd_page(args, client):
     try:
         page_id = int(identifier)
         page = client.get(f"Pages/{page_id}")
-    except ValueError:
+    except (ValueError, RockNotFound):
         pass
 
     # Try as route
@@ -748,7 +748,7 @@ def cmd_person(args, client):
         if person:
             _print_person(person, client)
             return
-    except ValueError:
+    except (ValueError, RockNotFound):
         pass
 
     # Search by email
@@ -1252,7 +1252,7 @@ def cmd_bgc(args, client):
             })
             if alias:
                 filters.append(f"PersonAliasId eq {alias[0]['Id']}")
-        except ValueError:
+        except (ValueError, RockNotFound):
             parts = args.person.strip().split()
             if len(parts) >= 2:
                 people = client.get("People", params={
@@ -1313,7 +1313,7 @@ def cmd_checkin(args, client):
         try:
             gid = int(args.area)
             group = client.get(f"Groups/{gid}")
-        except ValueError:
+        except (ValueError, RockNotFound):
             # Filter by group type in the query rather than after it. Filtering
             # afterwards spent the cap on rows that were about to be discarded:
             # a common word can match hundreds of groups of every type, and if
@@ -1525,10 +1525,7 @@ def cmd_block_set(args, client):
     # block-set had never once changed a block setting, and said "Done." only
     # when the second 404 was also swallowed.
     try:
-        client.post(f"Blocks/AttributeValue/{block_id}", params={
-            "attributeKey": args.key,
-            "attributeValue": args.value,
-        })
+        client.set_attribute_value("Blocks", block_id, args.key, args.value)
         log.info("block-set ok block=%d key=%s", block_id, args.key)
         print("Done.")
     except Exception as e:
@@ -1823,13 +1820,14 @@ def main():
     parsed = parser.parse_args()
     _guard_writes(parsed.command)
     log.info("cmd=%s args=%s", parsed.command, " ".join(sys.argv[2:]))
-    client = RockClient()
-    try:
-        parsed.func(parsed, client)
-        log.info("cmd=%s ok", parsed.command)
-    except Exception:
-        log.error("cmd=%s failed\n%s", parsed.command, traceback.format_exc())
-        raise
+    with api_errors_reported():
+        client = RockClient()
+        try:
+            parsed.func(parsed, client)
+            log.info("cmd=%s ok", parsed.command)
+        except Exception:
+            log.error("cmd=%s failed\n%s", parsed.command, traceback.format_exc())
+            raise
 
 
 if __name__ == "__main__":

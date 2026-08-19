@@ -25,7 +25,7 @@ from pathlib import Path
 from urllib.parse import unquote
 
 import rock_paths
-from rock_client import RockClient, odata_str
+from rock_client import RockClient, api_errors_reported, odata_str
 from rock_catalog import load_catalog
 from rock_log import get_logger
 
@@ -173,24 +173,17 @@ def _next_order(client, endpoint, filter_str):
 
 
 def set_attribute_values(client, endpoint, entity_id, settings):
-    """Set attribute values on an entity.
+    """Set several attribute values on one entity.
 
-    Rock routes this one by convention, not by OData, and binds both arguments
-    from the query string: POST /api/{Entity}/AttributeValue/{id} with
-    attributeKey and attributeValue. Neither is optional — omit attributeKey and
-    the request stops matching the route at all and 404s.
-
-    An unrecognised key is a 400 and nothing is written, so a failure here has
-    to propagate. The version this replaced sent a JSON body to two routes that
-    do not exist, caught both 404s, printed `Warning: could not set X`, and let
-    the entity count as created — which is how a workflow could be reported
-    built with not one of its actions configured.
+    The route lives on the client, which is now the only place that knows Rock
+    binds both arguments from the query string and takes no body. What is left
+    here is the loop, and the rule that a failure propagates: an unrecognised
+    key is a 400 and nothing is written, so a swallowed error means a workflow
+    reported built with not one of its actions configured. That is exactly what
+    the version this replaced did.
     """
     for attr_key, attr_value in settings.items():
-        client.post(f"{endpoint}/AttributeValue/{entity_id}", params={
-            "attributeKey": attr_key,
-            "attributeValue": "" if attr_value is None else str(attr_value),
-        })
+        client.set_attribute_value(endpoint, entity_id, attr_key, attr_value)
 
 
 def apply_settings(result, client, endpoint, entity_id, label, settings):
@@ -1326,7 +1319,7 @@ def api_request(plan, client, catalog):
             # nobody could undo what the PUT is about to do.
             saved = snapshot_entity(client, endpoint)
             print(f"  saved the current entity to {saved}")
-            client.put(endpoint, body)
+            client.put(endpoint, body, full_replace=True)
             result.add("Response", label, endpoint)
         else:
             client.delete(endpoint)
@@ -1439,10 +1432,10 @@ def main():
         print("Error: no catalog found. Refresh it: rock_catalog.py refresh")
         sys.exit(1)
 
-    client = RockClient()
-
-    log.info("build operation=%s", operation)
-    result = handler(plan, client, catalog or {})
+    with api_errors_reported():
+        client = RockClient()
+        log.info("build operation=%s", operation)
+        result = handler(plan, client, catalog or {})
 
     if not result.success:
         sys.exit(1)
