@@ -17,6 +17,7 @@ Run:  python3 -m unittest discover -s tests
 """
 
 import io
+import json
 import unittest
 from contextlib import redirect_stdout
 from types import SimpleNamespace
@@ -234,10 +235,6 @@ class TestWhatAnOperatorMeansByAPerson(unittest.TestCase):
         self.assertIn("O''Brien", rock_query._people_filter("O'Brien"))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestAListingRendersItself(unittest.TestCase):
     """`Listing` — the rows a command found, and the one place they print."""
 
@@ -371,3 +368,304 @@ class TestWhatAReadCommandReturns(unittest.TestCase):
             FakeClient(responses={"ExceptionLogs": rows}))
         self.assertEqual(quiet.rows[0][2], [])
         self.assertEqual(loud.rows[0][2], ["at A()", "at B()"])
+
+
+class TestADetailRendersItself(unittest.TestCase):
+    """`Detail` and `Section` — one entity, and the one place it prints."""
+
+    def render(self, report):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rock_query.render(report)
+        return out.getvalue()
+
+    def test_a_heading_prints_at_the_margin(self):
+        self.assertEqual(self.render(rock_query.Detail("Ushers (ID: 7)")),
+                         "Ushers (ID: 7)\n")
+
+    def test_a_field_sits_one_step_under_the_heading(self):
+        detail = rock_query.Detail("Ushers (ID: 7)")
+        detail.field("Campus", "Downtown")
+        self.assertEqual(self.render(detail).splitlines()[1], "  Campus: Downtown")
+
+    def test_a_missing_value_adds_no_line(self):
+        detail = rock_query.Detail("Ushers (ID: 7)")
+        detail.field("Email", None).field("Description", "")
+        self.assertEqual(len(self.render(detail).splitlines()), 1,
+                         "thirteen views wrote `if x.get(...)` around every line")
+
+    def test_false_and_zero_are_answers_rather_than_absences(self):
+        detail = rock_query.Detail("Ushers (ID: 7)")
+        detail.field("Active", False).field("Order", 0)
+        self.assertIn("  Active: False", self.render(detail))
+        self.assertIn("  Order: 0", self.render(detail),
+                      "a group at order zero is at order zero")
+
+    def test_a_deeper_line_sits_under_the_one_above_it(self):
+        detail = rock_query.Detail("Ada Lovelace (ID: 31)")
+        detail.field("Family", "Lovelace Family (ID: 88)")
+        detail.line("Child      Byron Lovelace", depth=1)
+        lines = self.render(detail).splitlines()
+        self.assertEqual(lines[1].index("Family"), 2)
+        self.assertEqual(lines[2].index("Child"), 4)
+
+    def test_a_section_titles_itself_with_a_count(self):
+        detail = rock_query.Detail("Ushers (ID: 7)")
+        detail.section("Members", [1, 2, 3]).add("Ada Lovelace")
+        self.assertIn("  Members (3):", self.render(detail))
+
+    def test_a_capped_section_says_more_exist(self):
+        detail = rock_query.Detail("Ushers (ID: 7)")
+        detail.section("Members", [1], more=True).add("Ada Lovelace")
+        self.assertIn("first 1 — more exist, raise --limit", self.render(detail))
+
+    def test_a_child_section_names_the_remedy_it_actually_has(self):
+        detail = rock_query.Detail("Give (ID: 12)")
+        detail.section("Blocks", [1], more=True,
+                       hint=rock_query.CHILD_HINT).add("Giving")
+        self.assertIn("no --limit", self.render(detail),
+                      "blocks on a page have no --limit to raise")
+
+    def test_a_section_with_nothing_in_it_prints_nothing(self):
+        detail = rock_query.Detail("Ushers (ID: 7)")
+        detail.section("Members", [])
+        self.assertEqual(self.render(detail), "Ushers (ID: 7)\n",
+                         "twelve commands guarded their own header instead")
+
+    def test_a_section_can_have_no_count_at_all(self):
+        detail = rock_query.Detail("Exception 5 (2026-08-01)")
+        detail.section("Stack Trace").add("at A()")
+        self.assertIn("  Stack Trace:", self.render(detail))
+
+    def test_a_section_row_uses_the_one_id_column(self):
+        detail = rock_query.Detail("Nursery (ID: 44)")
+        detail.section("Sub-areas", [1]).row(1900412, "Toddlers")
+        listing = rock_query.Listing("Groups")
+        listing.add(1900412, "Toddlers")
+        in_section = self.render(detail).splitlines()[-1]
+        in_listing = self.render(listing).splitlines()[-1]
+        self.assertEqual(in_section.strip(), in_listing.strip())
+        self.assertTrue(in_section.startswith("    "),
+                        "a section indents the column it shares")
+
+    def test_a_blank_line_is_not_a_line(self):
+        detail = rock_query.Detail("Ushers (ID: 7)")
+        detail.line("").line(None)
+        detail.section("Members", [1]).add("").add("Ada")
+        self.assertEqual(len(self.render(detail).splitlines()), 3)
+
+    def test_raw_prints_the_entity_rock_sent(self):
+        text = self.render(rock_query.Raw({"Id": 7, "Name": "Ushers"}))
+        self.assertEqual(json.loads(text), {"Id": 7, "Name": "Ushers"})
+        self.assertIn("\n  ", text, "indented, so a person can read it too")
+
+    def test_text_prints_what_it_holds(self):
+        self.assertEqual(self.render(rock_query.Text("Block 9 not found")),
+                         "Block 9 not found\n")
+
+
+class TestWhatADetailViewReturns(unittest.TestCase):
+    """Thirteen views that printed. The return value is the test surface."""
+
+    def test_a_group_carries_its_type_campus_and_roster(self):
+        client = FakeClient(responses={
+            "Groups/7": {"Id": 7, "Name": "Ushers", "GroupTypeId": 4,
+                         "IsActive": True, "CampusId": 2},
+            "GroupTypes/4": {"Name": "Serving Team"},
+            "Campuses/2": {"Name": "Downtown"},
+            "GroupMembers": [{"PersonId": 31, "GroupRoleId": 9,
+                              "GroupMemberStatus": 1}],
+            "GroupTypeRoles/9": {"Name": "Leader"},
+            "People/31": {"FirstName": "Ada", "LastName": "Lovelace"}})
+        detail = rock_query.cmd_group(
+            SimpleNamespace(identifier="7", json=False, limit=50), client)
+        self.assertEqual(detail.heading, "Ushers (ID: 7)")
+        self.assertIn("Type: Serving Team", [p for _, p in detail.parts
+                                             if isinstance(p, str)])
+        roster = [p for _, p in detail.parts if isinstance(p, rock_query.Section)][0]
+        self.assertEqual(roster.title, "Members")
+        self.assertIn("Ada Lovelace", roster.lines[0][1])
+        self.assertIn("[Active]", roster.lines[0][1])
+
+    def test_an_unresolved_lookup_leaves_the_field_out(self):
+        """`_resolve_name` answers "?" for a row it could not read.
+
+        The guard is at the call site rather than in `field`, so "?" stays a
+        thing only the resolver says.
+        """
+        client = FakeClient(responses={
+            "Groups/7": {"Id": 7, "Name": "Ushers", "CampusId": 2}})
+        self.assertEqual(rock_query._resolve_name(client, "Campuses", 2, "Name"),
+                         "?")
+        detail = rock_query.cmd_group(
+            SimpleNamespace(identifier="7", json=False, limit=50), client)
+        fields = [p for _, p in detail.parts if isinstance(p, str)]
+        self.assertEqual([f for f in fields if f.endswith(": ?")], [],
+                         f"a field the resolver could not fill: {fields}")
+
+    def test_json_answers_with_the_entity_and_fetches_nothing_further(self):
+        client = FakeClient(responses={"Groups/7": {"Id": 7, "Name": "Ushers"}})
+        report = rock_query.cmd_group(
+            SimpleNamespace(identifier="7", json=True, limit=50), client)
+        self.assertEqual(report.entity, {"Id": 7, "Name": "Ushers"})
+        self.assertEqual(len(client.calls), 1,
+                         "a roster nobody will print is a request nobody needs")
+
+    def test_a_person_nests_their_family_under_the_family_line(self):
+        client = FakeClient(responses={
+            "People/31": {"Id": 31, "FirstName": "Ada", "LastName": "Lovelace"},
+            "Groups/GetFamilies/31": [{"Id": 88, "Name": "Lovelace Family"}],
+            "GroupMembers": [{"PersonId": 31, "GroupRoleId": 3},
+                             {"PersonId": 32, "GroupRoleId": 4}],
+            "GroupTypeRoles/3": {"Name": "Adult"},
+            "GroupTypeRoles/4": {"Name": "Child"},
+            "People/32": {"FirstName": "Byron", "LastName": "Lovelace"}})
+        detail = rock_query.cmd_person(SimpleNamespace(identifier="31"), client)
+        depths = [(depth, text) for depth, text in detail.parts
+                  if isinstance(text, str)]
+        self.assertEqual(depths[0], (0, "Family: Lovelace Family (ID: 88)"))
+        self.assertEqual(depths[1][0], 1, "a member sits under their family")
+        self.assertIn("Byron Lovelace", depths[1][1])
+        self.assertNotIn("Ada", depths[1][1], "the person is not their own relative")
+
+    def test_several_people_are_a_listing_that_counts_them(self):
+        client = FakeClient(responses={"People": [
+            {"Id": 31, "FirstName": "Ada", "LastName": "Lovelace"},
+            {"Id": 32, "FirstName": "Ada", "LastName": "Byron"}]})
+        listing = rock_query.cmd_person(SimpleNamespace(identifier="Ada"), client)
+        self.assertEqual([r[0] for r in listing.rows], [31, 32])
+        self.assertIn("Ada", listing.title)
+
+    def test_a_capped_chooser_says_how_to_narrow_it(self):
+        client = FakeClient(responses={"People": [
+            {"Id": i, "FirstName": "Ada", "LastName": str(i)} for i in range(11)]})
+        listing = rock_query.cmd_person(SimpleNamespace(identifier="Ada"), client)
+        self.assertTrue(listing.more)
+        self.assertIn("pass the ID", listing.hint)
+
+    def test_nobody_matching_is_a_sentence_not_a_crash(self):
+        report = rock_query.cmd_person(SimpleNamespace(identifier="zzz"),
+                                       FakeClient())
+        self.assertEqual(report.text, "No person found matching 'zzz'")
+
+    def test_a_page_groups_its_blocks_by_zone(self):
+        client = FakeClient(responses={
+            "Pages/12": {"Id": 12, "InternalName": "Give", "LayoutId": 3},
+            "Blocks": [{"Id": 1, "Name": "Giving", "Zone": "Main", "BlockTypeId": 5},
+                       {"Id": 2, "Name": None, "Zone": "Footer", "BlockTypeId": 6}],
+            "BlockTypes/5": {"Name": "Transaction Entry"},
+            "BlockTypes/6": {"Name": "Html Content"},
+            "PageRoutes": [{"Route": "give"}]})
+        detail = rock_query.cmd_page(
+            SimpleNamespace(identifier="12", json=False), client)
+        blocks = [p for _, p in detail.parts if isinstance(p, rock_query.Section)][0]
+        self.assertEqual([d for d, _ in blocks.lines], [0, 1, 0, 1],
+                         "a zone heading sits above the blocks in it")
+        self.assertIn("Zone: Main", blocks.lines[0][1])
+        self.assertIn("Html Content [Html Content]", blocks.lines[3][1],
+                      "an unnamed block falls back to its type")
+
+    def test_an_exception_keeps_its_trace_and_its_inner_cause(self):
+        client = FakeClient(responses={
+            "ExceptionLogs/77012": {
+                "Id": 77012, "ExceptionType": "System.NullReferenceException",
+                "StackTrace": "  at A()\n  at B()", "HasInnerException": True},
+            "ExceptionLogs": [{"Id": 77013, "ExceptionType": "System.Inner",
+                               "Description": "the real cause"}]})
+        detail = rock_query.cmd_exception(
+            SimpleNamespace(id=77012, json=False), client)
+        trace = [p for _, p in detail.parts if isinstance(p, rock_query.Section)][0]
+        self.assertEqual([t for _, t in trace.lines], ["at A()", "at B()"])
+        deeper = [(d, t) for d, t in detail.parts if isinstance(t, str) and d]
+        self.assertEqual(deeper, [(1, "the real cause")])
+
+    def test_an_exception_that_is_gone_says_so(self):
+        report = rock_query.cmd_exception(
+            SimpleNamespace(id=1, json=False), FakeClient())
+        self.assertEqual(report.text, "Exception 1 not found")
+
+    def test_the_exception_summary_counts_by_short_type(self):
+        rows = [{"Id": 1, "ExceptionType": "System.NullReferenceException"},
+                {"Id": 2, "ExceptionType": "System.NullReferenceException"},
+                {"Id": 3, "ExceptionType": "System.TimeoutException"}]
+        summary = rock_query.cmd_exceptions(
+            SimpleNamespace(type=None, summary=True, verbose=False, limit=50),
+            FakeClient(responses={"ExceptionLogs": rows}))
+        lines = [text for _, text in summary.parts]
+        self.assertEqual(lines, ["   2  NullReferenceException",
+                                 "   1  TimeoutException"])
+        self.assertIn("3 most recent", summary.heading,
+                      "the window is the rows fetched, not the log")
+
+    def test_a_capped_summary_says_the_window_is_a_cap(self):
+        rows = [{"Id": i, "ExceptionType": "System.Boom"} for i in range(4)]
+        summary = rock_query.cmd_exceptions(
+            SimpleNamespace(type=None, summary=True, verbose=False, limit=3),
+            FakeClient(responses={"ExceptionLogs": rows}))
+        self.assertIn("of more", summary.heading)
+
+    def test_attendee_names_only_appear_when_asked_for(self):
+        responses = {
+            "AttendanceOccurrences/5": {"Id": 5, "OccurrenceDate": "2026-08-16"},
+            "Attendances": [{"PersonAliasId": 88, "DidAttend": True}],
+            "PersonAlias/88": {"PersonId": 31},
+            "People/31": {"FirstName": "Ada", "LastName": "Lovelace"}}
+        args = dict(id=5, json=False, limit=200)
+        quiet = rock_query.cmd_occurrence(SimpleNamespace(names=False, **args),
+                                         FakeClient(responses=responses))
+        loud = rock_query.cmd_occurrence(SimpleNamespace(names=True, **args),
+                                        FakeClient(responses=responses))
+        self.assertEqual([t for _, t in quiet.parts],
+                         ["Attendees: 1 attended / 1 total"])
+        self.assertIn("Ada Lovelace", loud.parts[-1][1])
+
+    def test_a_check_in_area_lists_its_locations_and_sub_areas(self):
+        client = FakeClient(responses={
+            "GroupTypes": [{"Id": 20, "Name": "Check-in by Age"}],
+            "Groups": [{"Id": 44, "Name": "Nursery", "IsActive": True}],
+            "GroupLocations": [{"LocationId": 61}],
+            "Locations/61": {"Name": "Room 101"}})
+        detail = rock_query.cmd_checkin(SimpleNamespace(area="Nursery"), client)
+        sections = [p for _, p in detail.parts
+                    if isinstance(p, rock_query.Section)]
+        self.assertEqual([s.title for s in sections], ["Locations", "Sub-areas"])
+        self.assertIn("Room 101 (ID: 61)", sections[0].lines[0][1])
+
+    def test_a_workflow_with_no_attributes_names_the_workflow(self):
+        client = FakeClient(responses={
+            "WorkflowTypes/4821": {"Id": 4821, "Name": "Serving Signup"}})
+        report = rock_query.cmd_attributes(
+            SimpleNamespace(identifier="4821"), client)
+        self.assertEqual(report.text,
+                         "No attributes on 'Serving Signup' (ID: 4821)")
+
+    def test_an_audit_answers_with_the_tree_and_both_lists(self):
+        wf = {"Id": 4821, "Name": "Serving Signup", "IsActive": True,
+              "ActivityTypes": [{"Id": 1, "Name": "Start", "Order": 0,
+                                 "IsActivatedWithWorkflow": True,
+                                 "ActionTypes": []}]}
+        report = rock_query._audit_report(wf, ["no actions"], ["unreachable"])
+        self.assertIn("Issues (1):", report.text)
+        self.assertIn("✗ no actions", report.text)
+        self.assertIn("! unreachable", report.text)
+
+    def test_an_audit_that_found_nothing_says_that_instead(self):
+        wf = {"Id": 4821, "Name": "Serving Signup", "IsActive": True}
+        report = rock_query._audit_report(wf, [], [])
+        self.assertIn("✓ No issues found", report.text)
+        self.assertNotIn("Issues (0)", report.text)
+
+    def test_the_check_in_hierarchy_comes_back_as_a_tree(self):
+        client = FakeClient(responses={
+            "GroupTypes": [{"Id": 20, "Name": "Check-in by Age"}],
+            "Groups": []})
+        report = rock_query.cmd_checkin(SimpleNamespace(area=None), client)
+        self.assertIn("Group Type: Check-in by Age (ID: 20)", report.text)
+
+    def test_no_check_in_group_types_is_a_sentence(self):
+        report = rock_query.cmd_checkin(SimpleNamespace(area=None), FakeClient())
+        self.assertEqual(report.text, "No check-in group types found.")
+
+
+if __name__ == "__main__":
+    unittest.main()

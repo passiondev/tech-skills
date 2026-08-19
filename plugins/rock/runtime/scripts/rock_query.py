@@ -9,9 +9,13 @@ Usage:
   uv run scripts/rock_query.py page 456                      # get by ID
   uv run scripts/rock_query.py search "volunteer"            # search across entities
 
-A command that answers with a list of entities builds a `Listing` and returns
-it; `render` prints it at the boundary. The detail views still print for
-themselves, which is the part of this that is half done.
+No read view prints its own answer. A list of entities is a `Listing`, one
+entity is a `Detail`, `--json` is a `Raw`, and a tree or a single sentence is a
+`Text`. Each is built, returned, and printed by `render` at the boundary, which
+makes the return value the test surface rather than captured stdout.
+
+The write commands at the bottom still print as they go, because each reports a
+step that has already landed and a caller reading them needs them in order.
 """
 
 import argparse
@@ -112,8 +116,16 @@ def tally(rows, more, hint="raise --limit"):
     return f"first {len(rows)} — more exist, {hint}" if more else str(len(rows))
 
 
+def _inactive(entity):
+    """The suffix a row carries when Rock has it switched off."""
+    return "" if entity.get("IsActive") else " [inactive]"
+
+
 ID_WIDTH = 6
 _LABEL_COLUMN = 2 + ID_WIDTH + 2
+# A detail heading starts at the margin, its fields one step in, and each
+# further depth one step past that. One number, so nothing drifts.
+_DETAIL_INDENT = 2
 
 
 def row(entity_id, label, indent=2):
@@ -169,11 +181,130 @@ class Listing:
                 print()
 
 
-def render(report):
-    """Print what a command returned, and say whether it found anything.
+class Section:
+    """A child list under a detail heading: a title, a count, and its lines.
 
-    This is the only place a listing reaches stdout. A command that returns
-    nothing printed for itself, which is still true of the detail views.
+    `rows` is what was fetched, and only its length is read from it. The lines
+    arrive separately because they are not always one per row -- blocks on a
+    page interleave a zone heading, and a family prints a line per member under
+    a line per family.
+
+    A section that ends up with no lines prints nothing, so a command no longer
+    guards its own header with `if members:`. Twelve of them did.
+    """
+
+    def __init__(self, title, rows=None, more=False, hint="raise --limit"):
+        self.title = title
+        self.count = None if rows is None else tally(rows, more, hint)
+        self.lines = []
+
+    def add(self, text, depth=0):
+        """One line under the section title. A blank one adds nothing."""
+        if text:
+            self.lines.append((depth, text))
+        return self
+
+    def row(self, entity_id, label, depth=0):
+        """One line that leads with the id column, as a listing does."""
+        self.lines.append((depth, row(entity_id, label, indent=0)))
+        return self
+
+
+class Detail:
+    """One entity: a heading, the fields under it, and its child sections.
+
+    Thirteen views printed this shape for themselves. Each carried its own
+    two-space indent, its own `if x.get(...)` around every optional line, its
+    own `if args.json` branch, and no return value, so a test of one had to
+    capture stdout and match formatted text. The return value is the test
+    surface now, the same way `Listing` did it for the eight list views.
+
+    Depth is what nests: a field sits under the heading, and a line at depth 1
+    sits under the field above it.
+    """
+
+    def __init__(self, heading):
+        self.heading = heading
+        self.parts = []
+
+    def field(self, label, value):
+        """A `Label: value` line. A missing value adds no line at all.
+
+        `False` and `0` are values -- "Active: False" is the answer to a
+        question somebody asked -- so only None and the empty string drop out.
+        """
+        if value is None or value == "":
+            return self
+        return self.line(f"{label}: {value}")
+
+    def line(self, text, depth=0):
+        """A line under the heading carrying no label of its own."""
+        if text:
+            self.parts.append((depth, text))
+        return self
+
+    def section(self, title, rows=None, more=False, hint="raise --limit"):
+        """Open a child list and hand it back, for the caller to fill."""
+        made = Section(title, rows, more, hint)
+        self.parts.append((0, made))
+        return made
+
+    def render(self):
+        print(self.heading)
+        for depth, part in self.parts:
+            if isinstance(part, str):
+                print(f"{' ' * (_DETAIL_INDENT + 2 * depth)}{part}")
+                continue
+            if not part.lines:
+                continue
+            title = part.title if part.count is None else f"{part.title} ({part.count})"
+            print(f"{' ' * _DETAIL_INDENT}{title}:")
+            for line_depth, text in part.lines:
+                print(f"{' ' * (_DETAIL_INDENT + 2 + 2 * line_depth)}{text}")
+
+
+class Raw:
+    """The entity as Rock sent it, for `--json`.
+
+    Ten commands held the same three lines -- dump, print, return -- so ten
+    commands each picked an indent and each answered a caller with nothing.
+    """
+
+    def __init__(self, entity):
+        self.entity = entity
+
+    def render(self):
+        print(json.dumps(self.entity, indent=2))
+
+
+class Text:
+    """Text a command formatted itself, printed at the boundary like the rest.
+
+    Three views build a tree rather than a heading with fields under it: a
+    workflow with its activities and actions, the check-in hierarchy, and an
+    audit. A tree is not a `Detail`, and forcing it into one would cost more
+    than it saves. What still applies is the reason the detail views moved: a
+    command that prints answers its caller with nothing. So these return the
+    text they built, and so do the commands whose whole answer is one sentence.
+    """
+
+    def __init__(self, text):
+        self.text = text
+
+    def render(self):
+        print(self.text)
+
+
+def render(report):
+    """Print what a read command returned. Nothing else on the read side prints.
+
+    A command answers with a `Listing`, a `Detail`, a `Raw`, a `Text`, or a list
+    of them where a view has two parts. The only thing asked of any of them is
+    that it renders itself, and a list gets a blank line between its parts.
+
+    `None` means the command already reported the problem: a lookup matching
+    nothing says so through `_find_entity`, which is the one helper on this side
+    that still prints. So there is nothing left here to print.
     """
     if report is None:
         return
@@ -391,7 +522,7 @@ def cmd_workflows(args, client):
 
     listing = Listing("Workflows", more)
     for wf in workflows:
-        active = "" if wf.get("IsActive") else " [inactive]"
+        active = _inactive(wf)
         cat_name = cat_names.get(wf.get("CategoryId"), "")
         cat_str = f" ({cat_name})" if cat_name else ""
         listing.add(wf["Id"], f"{wf['Name']}{cat_str}{active}")
@@ -404,11 +535,7 @@ def cmd_workflow(args, client):
     if not wf:
         return
     _load_workflow_tree(wf, client)
-
-    if args.json:
-        print(json.dumps(wf, indent=2))
-    else:
-        print(format_workflow_tree(wf))
+    return Raw(wf) if args.json else Text(format_workflow_tree(wf))
 
 
 def cmd_pages(args, client):
@@ -470,24 +597,25 @@ def cmd_page(args, client):
     if args.json:
         page["Blocks"] = blocks or []
         page["Routes"] = routes or []
-        print(json.dumps(page, indent=2))
-    else:
-        name = page.get("InternalName") or page.get("PageTitle") or "(untitled)"
-        print(f"{name} (ID: {page['Id']})")
-        if routes:
-            shown = ", ".join("/" + r["Route"] for r in routes)
-            print(f"  Routes: {shown}" + (", ..." if routes_capped else ""))
-        print(f"  Layout ID: {page.get('LayoutId')}")
-        if blocks:
-            print(f"  Blocks ({tally(blocks, blocks_capped, hint=CHILD_HINT)}):")
-            current_zone = None
-            for b in blocks:
-                zone = b.get("Zone", "Main")
-                if zone != current_zone:
-                    current_zone = zone
-                    print(f"    Zone: {zone}")
-                bt_name = b.get("BlockType", {}).get("Name", "?")
-                print(f"      {b['Name'] or bt_name} [{bt_name}]")
+        return Raw(page)
+
+    name = page.get("InternalName") or page.get("PageTitle") or "(untitled)"
+    detail = Detail(f"{name} (ID: {page['Id']})")
+    if routes:
+        shown = ", ".join("/" + r["Route"] for r in routes)
+        detail.field("Routes", shown + (", ..." if routes_capped else ""))
+    detail.field("Layout ID", page.get("LayoutId"))
+
+    zones = detail.section("Blocks", blocks, blocks_capped, hint=CHILD_HINT)
+    current_zone = None
+    for b in blocks:
+        zone = b.get("Zone", "Main")
+        if zone != current_zone:
+            current_zone = zone
+            zones.add(f"Zone: {zone}")
+        bt_name = b.get("BlockType", {}).get("Name", "?")
+        zones.add(f"{b['Name'] or bt_name} [{bt_name}]", depth=1)
+    return detail
 
 
 def cmd_search(args, client):
@@ -554,46 +682,40 @@ def _check_sms(action, activity, settings, issues):
         issues.append(f"{prefix}: SendSms has no message body")
 
 
-def _print_audit(wf, issues, warnings):
-    active = "Active" if wf.get("IsActive") else "Inactive"
-    print(f"Audit: {wf['Name']} (ID: {wf['Id']})")
-    print(f"Status: {active}")
-    print()
+def _audit_report(wf, issues, warnings):
+    """What the audit found, as the tree and the two lists an operator reads."""
+    lines = [f"Audit: {wf['Name']} (ID: {wf['Id']})",
+             f"Status: {'Active' if wf.get('IsActive') else 'Inactive'}", ""]
 
     activities = sorted(wf.get("ActivityTypes", []), key=lambda a: a.get("Order", 0))
     if activities:
-        print("Structure:")
+        lines.append("Structure:")
         if wf.get("ActivityTypesCapped"):
-            print(f"  (only the first {CHILD_LIMIT} activities are shown)")
+            lines.append(f"  (only the first {CHILD_LIMIT} activities are shown)")
         for i, act in enumerate(activities):
             is_last = i == len(activities) - 1
             prefix = "  └─" if is_last else "  ├─"
             activated = " (activated)" if act.get("IsActivatedWithWorkflow") else ""
             actions = sorted(act.get("ActionTypes", []), key=lambda a: a.get("Order", 0))
             count = tally(actions, act.get("ActionTypesCapped"), hint=CHILD_HINT)
-            print(f"{prefix} {act['Name']}{activated} [{count} actions]")
+            lines.append(f"{prefix} {act['Name']}{activated} [{count} actions]")
             for j, action in enumerate(actions):
-                is_last_action = j == len(actions) - 1
                 branch = "     " if is_last else "  │  "
-                ap = "└─" if is_last_action else "├─"
+                ap = "└─" if j == len(actions) - 1 else "├─"
                 entity_name = (action.get("EntityType") or {}).get("FriendlyName", "?")
-                print(f"{branch} {ap} {action['Name']} [{entity_name}]")
-        print()
+                lines.append(f"{branch} {ap} {action['Name']} [{entity_name}]")
+        lines.append("")
 
-    if issues:
-        print(f"Issues ({len(issues)}):")
-        for issue in issues:
-            print(f"  ✗ {issue}")
-        print()
-
-    if warnings:
-        print(f"Warnings ({len(warnings)}):")
-        for w in warnings:
-            print(f"  ! {w}")
-        print()
+    for title, marker, found in (("Issues", "✗", issues),
+                                 ("Warnings", "!", warnings)):
+        if found:
+            lines.append(f"{title} ({len(found)}):")
+            lines.extend(f"  {marker} {item}" for item in found)
+            lines.append("")
 
     if not issues and not warnings:
-        print("✓ No issues found")
+        lines.append("✓ No issues found")
+    return Text("\n".join(lines).rstrip("\n"))
 
 
 def cmd_audit(args, client):
@@ -615,8 +737,7 @@ def cmd_audit(args, client):
 
     if not activities:
         issues.append("Workflow has no activities")
-        _print_audit(wf, issues, warnings)
-        return
+        return _audit_report(wf, issues, warnings)
 
     if not activities[0].get("IsActivatedWithWorkflow"):
         issues.append(f"First activity '{activities[0]['Name']}' is not activated with workflow")
@@ -681,7 +802,7 @@ def cmd_audit(args, client):
         if str(act["Id"]) not in reachable and not act.get("IsActivatedWithWorkflow"):
             warnings.append(f"Activity '{act['Name']}' (ID: {act['Id']}) may be unreachable")
 
-    _print_audit(wf, issues, warnings)
+    return _audit_report(wf, issues, warnings)
 
 
 def cmd_actions(args, client):
@@ -689,34 +810,35 @@ def cmd_actions(args, client):
 
     act = client.get(f"WorkflowActivityTypes/{act_id}")
     if not act:
-        print(f"Activity {act_id} not found")
-        return
+        return Text(f"Activity {act_id} not found")
 
     actions, actions_capped = get_capped(client, "WorkflowActionTypes", {
         "$filter": f"ActivityTypeId eq {act_id}",
         "$orderby": "Order",
     }, CHILD_LIMIT)
     _enrich_actions_entity_types(actions, client)
-    print(f"Activity: {act['Name']} (ID: {act['Id']})")
-    print(f"  Activated with workflow: {act.get('IsActivatedWithWorkflow', False)}")
-    print(f"  Actions: {tally(actions, actions_capped, hint=CHILD_HINT)}")
-    print()
+
+    detail = Detail(f"Activity: {act['Name']} (ID: {act['Id']})")
+    detail.field("Activated with workflow",
+                 act.get("IsActivatedWithWorkflow", False))
+    detail.field("Actions", tally(actions, actions_capped, hint=CHILD_HINT))
 
     for action in actions:
         entity = action.get("EntityType") or {}
-        entity_name = entity.get("FriendlyName", "?")
-        print(f"  [{action.get('Order', '?')}] {action['Name']} (ID: {action['Id']})")
-        print(f"      Type: {entity_name}")
-        print(f"      Completes action: {action.get('IsActionCompletedOnSuccess', False)}")
-        print(f"      Completes activity: {action.get('IsActivityCompletedOnSuccess', False)}")
-
+        detail.line(f"[{action.get('Order', '?')}] {action['Name']} "
+                    f"(ID: {action['Id']})")
+        detail.line(f"Type: {entity.get('FriendlyName', '?')}", depth=1)
+        detail.line(f"Completes action: "
+                    f"{action.get('IsActionCompletedOnSuccess', False)}", depth=1)
+        detail.line(f"Completes activity: "
+                    f"{action.get('IsActivityCompletedOnSuccess', False)}", depth=1)
         settings = _get_action_settings(client, action["Id"])
         if settings:
-            print("      Settings:")
+            detail.line("Settings:", depth=1)
             for k, v in settings.items():
                 val = str(v)[:120] + ("..." if len(str(v)) > 120 else "")
-                print(f"        {k}: {val}")
-        print()
+                detail.line(f"{k}: {val}", depth=2)
+    return detail
 
 
 def cmd_attributes(args, client):
@@ -731,22 +853,22 @@ def cmd_attributes(args, client):
     }, CHILD_LIMIT)
 
     if not attrs:
-        print(f"No attributes on '{wf['Name']}' (ID: {wf['Id']})")
-        return
+        return Text(f"No attributes on '{wf['Name']}' (ID: {wf['Id']})")
 
     # Resolve field type names
     ft_ids = {a.get("FieldTypeId") for a in attrs if a.get("FieldTypeId")}
     ft_names = {fid: _resolve_name(client, "FieldTypes", fid) for fid in ft_ids}
 
-    print(f"Attributes on '{wf['Name']}' "
-          f"(ID: {wf['Id']}, {tally(attrs, attrs_capped, hint=CHILD_HINT)}):\n")
+    detail = Detail(f"Attributes on '{wf['Name']}' (ID: {wf['Id']}, "
+                    f"{tally(attrs, attrs_capped, hint=CHILD_HINT)}):")
     for attr in attrs:
         ft = ft_names.get(attr.get("FieldTypeId"), "?")
         req = " [required]" if attr.get("IsRequired") else ""
         grid = " [grid]" if attr.get("IsGridColumn") else ""
-        print(f"  {attr.get('Order', '?'):3}  {attr['Key']} ({ft}){req}{grid}")
-        if attr.get("Description"):
-            print(f"       {attr['Description'][:100]}")
+        detail.line(f"{attr.get('Order', '?'):3}  {attr['Key']} ({ft}){req}{grid}")
+        # Two steps in, so a description cannot be misread as the next attribute.
+        detail.line((attr.get("Description") or "")[:100], depth=2)
+    return detail
 
 
 def cmd_dataviews(args, client):
@@ -806,40 +928,38 @@ def cmd_dataview(args, client):
         return
 
     if args.json:
-        print(json.dumps(dv, indent=2))
-        return
+        return Raw(dv)
 
-    print(f"{dv['Name']} (ID: {dv['Id']})")
-    if dv.get("Description"):
-        print(f"  {dv['Description'][:200]}")
-
-    entity_name = _resolve_name(client, "EntityTypes", dv.get("EntityTypeId"),
-                                field="FriendlyName")
-    print(f"  Entity: {entity_name}")
-
+    detail = Detail(f"{dv['Name']} (ID: {dv['Id']})")
+    detail.line((dv.get("Description") or "")[:200])
+    detail.field("Entity", _resolve_name(client, "EntityTypes",
+                                        dv.get("EntityTypeId"),
+                                        field="FriendlyName"))
     if dv.get("TransformEntityTypeId"):
-        print(f"  Transform: " + _resolve_name(
+        detail.field("Transform", _resolve_name(
             client, "EntityTypes", dv["TransformEntityTypeId"],
             field="FriendlyName"))
-
     if dv.get("CategoryId"):
         cat_name = _resolve_name(client, "Categories", dv["CategoryId"])
         if cat_name != "?":
-            print(f"  Category: {cat_name}")
+            detail.field("Category", cat_name)
 
     persisted = dv.get("PersistedScheduleIntervalMinutes")
     if persisted:
-        print(f"  Persisted: every {persisted} min (last: {dv.get('PersistedLastRefreshDateTime', 'never')})")
-    print(f"  Last run: {dv.get('LastRunDateTime', 'never')} ({dv.get('TimeToRunDurationMilliseconds', 0)}ms)")
+        detail.field("Persisted", f"every {persisted} min (last: "
+                                  f"{dv.get('PersistedLastRefreshDateTime', 'never')})")
+    detail.field("Last run", f"{dv.get('LastRunDateTime', 'never')} "
+                             f"({dv.get('TimeToRunDurationMilliseconds', 0)}ms)")
 
     filter_id = dv.get("DataViewFilterId")
     if filter_id:
-        print(f"\n  Filters:")
-        lines = _load_filter_tree(client, filter_id, depth=2)
-        if lines:
-            for line in lines:
-                print(line)
-    print()
+        # The tree indents itself from zero and the section indents it once, so
+        # the root filter lands where a section line lands and each child sits
+        # one step further in.
+        filters = detail.section("Filters")
+        for line in _load_filter_tree(client, filter_id) or []:
+            filters.add(line)
+    return detail
 
 
 def cmd_person(args, client):
@@ -850,8 +970,7 @@ def cmd_person(args, client):
         pid = int(identifier)
         person = client.get(f"People/{pid}")
         if person:
-            _print_person(person, client)
-            return
+            return _person_detail(person, client)
     except (ValueError, RockNotFound):
         pass
 
@@ -860,82 +979,82 @@ def cmd_person(args, client):
                                SEARCH_LIMIT)
 
     if not results:
-        print(f"No person found matching '{identifier}'")
-        return
+        return Text(f"No person found matching '{identifier}'")
 
     if len(results) == 1:
-        _print_person(results[0], client)
-    else:
-        print(f"People matching '{identifier}':\n")
-        campus_cache = {}
-        for p in results:
-            email = f" ({p.get('Email', '')})" if p.get("Email") else ""
-            campus = ""
-            if p.get("PrimaryCampusId"):
-                cid = p["PrimaryCampusId"]
-                if cid not in campus_cache:
-                    campus_cache[cid] = _resolve_name(client, "Campuses", cid)
-                if campus_cache[cid] != "?":
-                    campus = f" [{campus_cache[cid]}]"
-            print(row(p["Id"],
-                      f"{p.get('FirstName', '')} {p.get('LastName', '')}"
-                      f"{email}{campus}"))
-        if more:
-            print(more_note(identifier))
+        return _person_detail(results[0], client)
+
+    # More than one match is a chooser, so it is a listing like any other. The
+    # count is new: this branch printed a header with no number in it, and a
+    # dropped candidate reads as a person who does not exist.
+    listing = Listing(f"People matching '{identifier}'", more,
+                      hint="narrow it, or pass the ID")
+    campus_cache = {}
+    for p in results:
+        email = f" ({p.get('Email', '')})" if p.get("Email") else ""
+        campus = ""
+        if p.get("PrimaryCampusId"):
+            cid = p["PrimaryCampusId"]
+            if cid not in campus_cache:
+                campus_cache[cid] = _resolve_name(client, "Campuses", cid)
+            if campus_cache[cid] != "?":
+                campus = f" [{campus_cache[cid]}]"
+        listing.add(p["Id"], f"{p.get('FirstName', '')} {p.get('LastName', '')}"
+                             f"{email}{campus}")
+    return listing
 
 
-def _print_person(person, client):
-    print(f"{person.get('FirstName', '')} {person.get('LastName', '')} (ID: {person['Id']})")
-    if person.get("Email"):
-        print(f"  Email: {person['Email']}")
-    if person.get("Gender") and person["Gender"] != 0:
-        print(f"  Gender: {GENDERS.get(person['Gender'], 'Unknown')}")
+def _person_detail(person, client):
+    """One person: their own fields, their family, and who they are tied to."""
+    detail = Detail(f"{person.get('FirstName', '')} {person.get('LastName', '')} "
+                    f"(ID: {person['Id']})")
+    detail.field("Email", person.get("Email"))
+    if person.get("Gender"):
+        detail.field("Gender", GENDERS.get(person["Gender"], "Unknown"))
     if person.get("BirthDate"):
-        print(f"  DOB: {person['BirthDate'][:10]}")
-    if person.get("ConnectionStatusValueId"):
-        val = _resolve_name(client, "DefinedValues", person["ConnectionStatusValueId"], field="Value")
-        if val != "?":
-            print(f"  Connection Status: {val}")
-    if person.get("RecordStatusValueId"):
-        val = _resolve_name(client, "DefinedValues", person["RecordStatusValueId"], field="Value")
-        if val != "?":
-            print(f"  Record Status: {val}")
-    if person.get("PrimaryCampusId"):
-        campus = _resolve_name(client, "Campuses", person["PrimaryCampusId"])
-        if campus != "?":
-            print(f"  Campus: {campus}")
+        detail.field("DOB", person["BirthDate"][:10])
 
-    # Family
+    # Three fields Rock stores as an id somewhere else. Each was its own block
+    # of lookup, compare against "?", print -- the same block three times.
+    for label, key, endpoint, name_field in (
+            ("Connection Status", "ConnectionStatusValueId", "DefinedValues", "Value"),
+            ("Record Status", "RecordStatusValueId", "DefinedValues", "Value"),
+            ("Campus", "PrimaryCampusId", "Campuses", "Name")):
+        if person.get(key):
+            resolved = _resolve_name(client, endpoint, person[key], field=name_field)
+            if resolved != "?":
+                detail.field(label, resolved)
+
     role_cache = {}
     try:
         families = client.get(f"Groups/GetFamilies/{person['Id']}")
-        if families:
-            for fam in families:
-                members, members_capped = get_capped(client, "GroupMembers", {
-                    "$filter": f"GroupId eq {fam['Id']}",
-                    "$select": "PersonId,GroupRoleId",
-                }, CHILD_LIMIT)
-                roles = {}
-                for m in members:
-                    rid = m["GroupRoleId"]
-                    if rid not in role_cache:
-                        role_cache[rid] = _resolve_name(client, "GroupTypeRoles", rid)
-                    roles[m["PersonId"]] = role_cache[rid]
-                capped = f" (first {CHILD_LIMIT})" if members_capped else ""
-                print(f"  Family: {fam['Name']} (ID: {fam['Id']}){capped}")
-                for m in members:
-                    if m["PersonId"] == person["Id"]:
-                        continue
-                    try:
-                        p = client.get(f"People/{m['PersonId']}", params={"$select": "FirstName,LastName"})
-                        if p:
-                            print(f"    {roles.get(m['PersonId'], '?'):10s} {p['FirstName']} {p['LastName']}")
-                    except Exception as _e:
-                        log.debug("lookup failed: %s", _e)
+        for fam in families or []:
+            members, members_capped = get_capped(client, "GroupMembers", {
+                "$filter": f"GroupId eq {fam['Id']}",
+                "$select": "PersonId,GroupRoleId",
+            }, CHILD_LIMIT)
+            roles = {}
+            for m in members:
+                rid = m["GroupRoleId"]
+                if rid not in role_cache:
+                    role_cache[rid] = _resolve_name(client, "GroupTypeRoles", rid)
+                roles[m["PersonId"]] = role_cache[rid]
+            capped = f" (first {CHILD_LIMIT})" if members_capped else ""
+            detail.field("Family", f"{fam['Name']} (ID: {fam['Id']}){capped}")
+            for m in members:
+                if m["PersonId"] == person["Id"]:
+                    continue
+                try:
+                    p = client.get(f"People/{m['PersonId']}",
+                                   params={"$select": "FirstName,LastName"})
+                    if p:
+                        detail.line(f"{roles.get(m['PersonId'], '?'):10s} "
+                                    f"{p['FirstName']} {p['LastName']}", depth=1)
+                except Exception as _e:
+                    log.debug("lookup failed: %s", _e)
     except Exception as _e:
         log.debug("lookup failed: %s", _e)
 
-    # Known relationships
     try:
         rel_group = first(client, "Groups", {
             "$filter": f"GroupTypeId eq {KNOWN_RELATIONSHIPS_GROUP_TYPE_ID} and Members/any(m: m/PersonId eq {person['Id']})",
@@ -946,21 +1065,23 @@ def _print_person(person, client):
                 "$filter": f"GroupId eq {rel_group['Id']} and PersonId ne {person['Id']}",
                 "$select": "PersonId,GroupRoleId",
             }, CHILD_LIMIT)
-            if members:
-                capped = f" (first {CHILD_LIMIT})" if members_capped else ""
-                print(f"  Known Relationships:{capped}")
-                for m in members:
-                    try:
-                        p = client.get(f"People/{m['PersonId']}", params={"$select": "FirstName,LastName"})
-                        pname = f"{p['FirstName']} {p['LastName']}" if p else f"Person:{m['PersonId']}"
-                        rid = m["GroupRoleId"]
-                        if rid not in role_cache:
-                            role_cache[rid] = _resolve_name(client, "GroupTypeRoles", rid)
-                        print(f"    {role_cache[rid]:20s} {pname}")
-                    except Exception as _e:
-                        log.debug("lookup failed: %s", _e)
+            related = detail.section("Known Relationships", members,
+                                     members_capped, hint=CHILD_HINT)
+            for m in members:
+                try:
+                    p = client.get(f"People/{m['PersonId']}",
+                                   params={"$select": "FirstName,LastName"})
+                    pname = f"{p['FirstName']} {p['LastName']}" if p else f"Person:{m['PersonId']}"
+                    rid = m["GroupRoleId"]
+                    if rid not in role_cache:
+                        role_cache[rid] = _resolve_name(client, "GroupTypeRoles", rid)
+                    related.add(f"{role_cache[rid]:20s} {pname}")
+                except Exception as _e:
+                    log.debug("lookup failed: %s", _e)
     except Exception as _e:
         log.debug("lookup failed: %s", _e)
+
+    return detail
 
 
 def cmd_group(args, client):
@@ -969,49 +1090,42 @@ def cmd_group(args, client):
         return
 
     if args.json:
-        print(json.dumps(group, indent=2))
-        return
+        return Raw(group)
 
-    print(f"{group['Name']} (ID: {group['Id']})")
-    if group.get("Description"):
-        print(f"  {group['Description'][:200]}")
-
-    # Group type
+    detail = Detail(f"{group['Name']} (ID: {group['Id']})")
+    detail.line((group.get("Description") or "")[:200])
     if group.get("GroupTypeId"):
         gt_name = _resolve_name(client, "GroupTypes", group["GroupTypeId"])
         if gt_name != "?":
-            print(f"  Type: {gt_name}")
+            detail.field("Type", gt_name)
+    detail.field("Active", group.get("IsActive", False))
+    for label, key, endpoint in (("Campus", "CampusId", "Campuses"),
+                                 ("Schedule", "ScheduleId", "Schedules")):
+        if group.get(key):
+            resolved = _resolve_name(client, endpoint, group[key])
+            if resolved != "?":
+                detail.field(label, resolved)
 
-    print(f"  Active: {group.get('IsActive', False)}")
-    if group.get("CampusId"):
-        campus_name = _resolve_name(client, "Campuses", group["CampusId"])
-        if campus_name != "?":
-            print(f"  Campus: {campus_name}")
-    if group.get("ScheduleId"):
-        sched_name = _resolve_name(client, "Schedules", group["ScheduleId"])
-        if sched_name != "?":
-            print(f"  Schedule: {sched_name}")
-
-    # Members
     members, mem_more = get_capped(client, "GroupMembers", {
         "$filter": f"GroupId eq {group['Id']}",
         "$select": "PersonId,GroupRoleId,GroupMemberStatus",
     }, args.limit)
-    if members:
-        role_cache = {}
-        print(f"  Members ({tally(members, mem_more)}):")
-        for m in members:
-            rid = m.get("GroupRoleId")
-            if rid not in role_cache:
-                role_cache[rid] = _resolve_name(client, "GroupTypeRoles", rid)
-            try:
-                p = client.get(f"People/{m['PersonId']}", params={"$select": "FirstName,LastName"})
-                pname = f"{p['FirstName']} {p['LastName']}" if p else f"ID:{m['PersonId']}"
-            except Exception as _e:
-                log.debug("person lookup failed: %s", _e)
-                pname = f"ID:{m['PersonId']}"
-            status = GROUP_MEMBER_STATUSES.get(m.get("GroupMemberStatus"), "?")
-            print(f"    {pname:30s} {role_cache[rid]:15s} [{status}]")
+    roster = detail.section("Members", members, mem_more)
+    role_cache = {}
+    for m in members:
+        rid = m.get("GroupRoleId")
+        if rid not in role_cache:
+            role_cache[rid] = _resolve_name(client, "GroupTypeRoles", rid)
+        try:
+            p = client.get(f"People/{m['PersonId']}",
+                           params={"$select": "FirstName,LastName"})
+            pname = f"{p['FirstName']} {p['LastName']}" if p else f"ID:{m['PersonId']}"
+        except Exception as _e:
+            log.debug("person lookup failed: %s", _e)
+            pname = f"ID:{m['PersonId']}"
+        status = GROUP_MEMBER_STATUSES.get(m.get("GroupMemberStatus"), "?")
+        roster.add(f"{pname:30s} {role_cache[rid]:15s} [{status}]")
+    return detail
 
 
 def cmd_report(args, client):
@@ -1020,35 +1134,37 @@ def cmd_report(args, client):
         return
 
     if args.json:
-        print(json.dumps(report, indent=2))
-        return
+        return Raw(report)
 
-    print(f"{report['Name']} (ID: {report['Id']})")
-    if report.get("Description"):
-        print(f"  {report['Description'][:200]}")
+    detail = Detail(f"{report['Name']} (ID: {report['Id']})")
+    detail.line((report.get("Description") or "")[:200])
 
     if report.get("DataViewId"):
         dv_name = _resolve_name(client, "DataViews", report["DataViewId"])
         if dv_name != "?":
-            print(f"  Data View: {dv_name} (ID: {report['DataViewId']})")
+            detail.field("Data View", f"{dv_name} (ID: {report['DataViewId']})")
         else:
-            print(f"  Data View ID: {report['DataViewId']}")
+            detail.field("Data View ID", report["DataViewId"])
 
     if report.get("CategoryId"):
         cat_name = _resolve_name(client, "Categories", report["CategoryId"])
         if cat_name != "?":
-            print(f"  Category: {cat_name}")
+            detail.field("Category", cat_name)
 
-    # Report fields
     fields, fields_capped = get_capped(client, "ReportFields", {
         "$filter": f"ReportId eq {report['Id']}",
         "$select": "ReportFieldType,ShowInGrid,ColumnOrder,ColumnHeaderText,DataSelectComponentEntityTypeId",
     }, CHILD_LIMIT)
-    if fields:
-        print(f"  Fields ({tally(fields, fields_capped, hint=CHILD_HINT)}):")
-        for f in sorted(fields, key=lambda x: x.get("ColumnOrder", 0)):
-            header = f.get("ColumnHeaderText", "") or "(no header)"
-            print(f"    {f.get('ColumnOrder', '?'):3}  {header}")
+    columns = detail.section("Fields", fields, fields_capped, hint=CHILD_HINT)
+    for f in sorted(fields, key=lambda x: x.get("ColumnOrder", 0)):
+        header = f.get("ColumnHeaderText", "") or "(no header)"
+        columns.add(f"{f.get('ColumnOrder', '?'):3}  {header}")
+    return detail
+
+
+def _short_type(exception_type):
+    """`System.NullReferenceException` reads as `NullReferenceException`."""
+    return exception_type.split(".")[-1] if "." in exception_type else exception_type
 
 
 def cmd_exceptions(args, client):
@@ -1060,33 +1176,28 @@ def cmd_exceptions(args, client):
 
     if args.summary:
         if not exceptions:
-            print("No exceptions found.")
-            return None
-        # Group by ExceptionType and count
+            return Text("No exceptions found.")
         counts = {}
         for ex in exceptions:
-            et = ex.get("ExceptionType", "Unknown")
-            short = et.split(".")[-1] if "." in et else et
+            short = _short_type(ex.get("ExceptionType", "Unknown"))
             counts[short] = counts.get(short, 0) + 1
         # The counts below are over the rows fetched, not over the log. Saying
         # "last 50" made that sound deliberate; it was the cap.
         window = f"{len(exceptions)} most recent" + (" of more" if more else "")
-        print(f"Exception summary ({window}):\n")
+        summary = Detail(f"Exception summary ({window}):")
         for etype, count in sorted(counts.items(), key=lambda x: -x[1]):
-            print(f"  {count:4d}  {etype}")
-        return None
+            summary.line(f"{count:4d}  {etype}")
+        return summary
 
     listing = Listing("Exceptions", more, spaced=True)
     for ex in exceptions:
         dt = (ex.get("CreatedDateTime") or "")[:19]
-        etype = ex.get("ExceptionType", "Unknown")
-        short_type = etype.split(".")[-1] if "." in etype else etype
         desc = (ex.get("Description") or "")[:120]
         url = ex.get("PageUrl", "")
         trace = ex["StackTrace"].split("\n")[:5] if (
             args.verbose and ex.get("StackTrace")) else []
-        listing.add(ex["Id"], f"[{dt}] {short_type}", desc,
-                    f"URL: {url}" if url else "",
+        listing.add(ex["Id"], f"[{dt}] {_short_type(ex.get('ExceptionType', 'Unknown'))}",
+                    desc, f"URL: {url}" if url else "",
                     *(line.strip() for line in trace))
     return listing
 
@@ -1094,36 +1205,32 @@ def cmd_exceptions(args, client):
 def cmd_exception(args, client):
     ex = client.get(f"ExceptionLogs/{args.id}")
     if not ex:
-        print(f"Exception {args.id} not found")
-        return
+        return Text(f"Exception {args.id} not found")
 
     if args.json:
-        print(json.dumps(ex, indent=2))
-        return
+        return Raw(ex)
 
     dt = (ex.get("CreatedDateTime") or "")[:19]
-    print(f"Exception {ex['Id']} ({dt})")
-    print(f"  Type: {ex.get('ExceptionType', 'Unknown')}")
-    if ex.get("StatusCode"):
-        print(f"  HTTP Status: {ex['StatusCode']}")
-    if ex.get("Source"):
-        print(f"  Source: {ex['Source']}")
-    if ex.get("Description"):
-        print(f"  Description: {ex['Description']}")
-    if ex.get("PageUrl"):
-        print(f"  URL: {ex['PageUrl']}")
+    detail = Detail(f"Exception {ex['Id']} ({dt})")
+    detail.field("Type", ex.get("ExceptionType", "Unknown"))
+    detail.field("HTTP Status", ex.get("StatusCode"))
+    detail.field("Source", ex.get("Source"))
+    detail.field("Description", ex.get("Description"))
+    detail.field("URL", ex.get("PageUrl"))
+
     if ex.get("StackTrace"):
-        print(f"  Stack Trace:")
+        trace = detail.section("Stack Trace")
         for line in ex["StackTrace"].split("\n")[:15]:
-            print(f"    {line.strip()}")
+            trace.add(line.strip())
+
     if ex.get("HasInnerException") and ex.get("Id"):
         inner = first(client, "ExceptionLogs", {
             "$filter": f"ParentId eq {ex['Id']}",
         })
         if inner:
-            print(f"  Inner Exception: {inner.get('ExceptionType', '?')}")
-            if inner.get("Description"):
-                print(f"    {inner['Description'][:200]}")
+            detail.field("Inner Exception", inner.get("ExceptionType", "?"))
+            detail.line((inner.get("Description") or "")[:200], depth=1)
+    return detail
 
 
 def cmd_schedules(args, client):
@@ -1143,7 +1250,7 @@ def cmd_schedules(args, client):
 
     listing = Listing("Schedules", more)
     for s in schedules:
-        active = "" if s.get("IsActive") else " [inactive]"
+        active = _inactive(s)
         listing.add(s["Id"], f"{s['Name']}{active}")
     return listing
 
@@ -1154,23 +1261,23 @@ def cmd_schedule(args, client):
         return
 
     if args.json:
-        print(json.dumps(schedule, indent=2))
-        return
+        return Raw(schedule)
 
-    print(f"{schedule['Name']} (ID: {schedule['Id']})")
-    print(f"  Active: {schedule.get('IsActive', False)}")
-    if schedule.get("Description"):
-        print(f"  Description: {schedule['Description'][:200]}")
-    if schedule.get("EffectiveStartDate"):
-        print(f"  Start: {schedule['EffectiveStartDate'][:10]}")
-    if schedule.get("EffectiveEndDate"):
-        print(f"  End: {schedule['EffectiveEndDate'][:10]}")
+    detail = Detail(f"{schedule['Name']} (ID: {schedule['Id']})")
+    detail.field("Active", schedule.get("IsActive", False))
+    detail.field("Description", (schedule.get("Description") or "")[:200])
+    for label, key in (("Start", "EffectiveStartDate"), ("End", "EffectiveEndDate")):
+        if schedule.get(key):
+            detail.field(label, schedule[key][:10])
     if schedule.get("CheckInStartOffsetMinutes"):
-        print(f"  Check-in window: -{schedule['CheckInStartOffsetMinutes']}min to +{schedule.get('CheckInEndOffsetMinutes', 0)}min")
+        detail.field("Check-in window",
+                     f"-{schedule['CheckInStartOffsetMinutes']}min to "
+                     f"+{schedule.get('CheckInEndOffsetMinutes', 0)}min")
     if schedule.get("CategoryId"):
         cat_name = _resolve_name(client, "Categories", schedule["CategoryId"])
         if cat_name != "?":
-            print(f"  Category: {cat_name}")
+            detail.field("Category", cat_name)
+    return detail
 
 
 def cmd_registrations(args, client):
@@ -1190,7 +1297,7 @@ def cmd_registrations(args, client):
 
     listing = Listing("Registration Instances", more)
     for r in regs:
-        active = "" if r.get("IsActive") else " [inactive]"
+        active = _inactive(r)
         start = (r.get("StartDateTime") or "")[:10]
         end = (r.get("EndDateTime") or "")[:10]
         date_range = f" ({start} to {end})" if start else ""
@@ -1205,38 +1312,36 @@ def cmd_registration(args, client):
         return
 
     if args.json:
-        print(json.dumps(reg, indent=2))
-        return
+        return Raw(reg)
 
-    print(f"{reg['Name']} (ID: {reg['Id']})")
-    print(f"  Active: {reg.get('IsActive', False)}")
-    if reg.get("StartDateTime"):
-        print(f"  Start: {reg['StartDateTime'][:19]}")
-    if reg.get("EndDateTime"):
-        print(f"  End: {reg['EndDateTime'][:19]}")
-    if reg.get("MaxAttendees"):
-        print(f"  Max Attendees: {reg['MaxAttendees']}")
+    detail = Detail(f"{reg['Name']} (ID: {reg['Id']})")
+    detail.field("Active", reg.get("IsActive", False))
+    for label, key in (("Start", "StartDateTime"), ("End", "EndDateTime")):
+        if reg.get(key):
+            detail.field(label, reg[key][:19])
+    detail.field("Max Attendees", reg.get("MaxAttendees"))
     if reg.get("Cost"):
-        print(f"  Cost: ${reg['Cost']}")
-    if reg.get("ContactEmail"):
-        print(f"  Contact: {reg['ContactEmail']}")
+        detail.field("Cost", f"${reg['Cost']}")
+    detail.field("Contact", reg.get("ContactEmail"))
 
-    # Registration template
     if reg.get("RegistrationTemplateId"):
-        tmpl_name = _resolve_name(client, "RegistrationTemplates", reg["RegistrationTemplateId"])
+        tmpl_name = _resolve_name(client, "RegistrationTemplates",
+                                  reg["RegistrationTemplateId"])
         if tmpl_name != "?":
-            print(f"  Template: {tmpl_name} (ID: {reg['RegistrationTemplateId']})")
+            detail.field("Template",
+                         f"{tmpl_name} (ID: {reg['RegistrationTemplateId']})")
         else:
-            print(f"  Template ID: {reg['RegistrationTemplateId']}")
+            detail.field("Template ID", reg["RegistrationTemplateId"])
 
-    # Linked workflow
     if reg.get("RegistrationWorkflowTypeId"):
-        wf_name = _resolve_name(client, "WorkflowTypes", reg["RegistrationWorkflowTypeId"])
+        wf_name = _resolve_name(client, "WorkflowTypes",
+                               reg["RegistrationWorkflowTypeId"])
         if wf_name != "?":
-            print(f"  Workflow: {wf_name} (ID: {reg['RegistrationWorkflowTypeId']})")
+            detail.field("Workflow",
+                         f"{wf_name} (ID: {reg['RegistrationWorkflowTypeId']})")
 
-    if reg.get("Details"):
-        print(f"  Details: {reg['Details'][:200]}")
+    detail.field("Details", (reg.get("Details") or "")[:200])
+    return detail
 
 
 def cmd_connections(args, client):
@@ -1284,37 +1389,31 @@ def cmd_block(args, client):
     block_id = int(args.id)
     block = client.get(f"Blocks/{block_id}", params={"loadAttributes": "simple"})
     if not block:
-        print(f"Block {block_id} not found")
-        return
+        return Text(f"Block {block_id} not found")
 
     if args.json:
-        print(json.dumps(block, indent=2))
-        return
+        return Raw(block)
 
-    print(f"{block.get('Name', '(unnamed)')} (ID: {block['Id']})")
+    detail = Detail(f"{block.get('Name', '(unnamed)')} (ID: {block['Id']})")
     if block.get("BlockTypeId"):
         bt_name = _resolve_name(client, "BlockTypes", block["BlockTypeId"])
         if bt_name != "?":
-            print(f"  Block Type: {bt_name}")
-    print(f"  Zone: {block.get('Zone', '?')}")
-    print(f"  Order: {block.get('Order', '?')}")
-    if block.get("PageId"):
-        print(f"  Page ID: {block['PageId']}")
+            detail.field("Block Type", bt_name)
+    detail.field("Zone", block.get("Zone", "?"))
+    detail.field("Order", block.get("Order", "?"))
+    detail.field("Page ID", block.get("PageId"))
 
     avs = block.get("AttributeValues", {})
-    if avs:
-        print(f"  Attributes ({len(avs)}):")
-        for key, val in avs.items():
-            if isinstance(val, dict):
-                v = val.get("Value", "")
-            else:
-                v = str(val) if val else ""
-            if not v:
-                continue
-            # Truncate long values but show more for HTML/Lava
-            max_len = 300 if key.lower() in ("query", "formattedoutput", "template", "lavatemplate") else 150
-            display = v[:max_len] + ("..." if len(v) > max_len else "")
-            print(f"    {key}: {display}")
+    settings = detail.section("Attributes", avs)
+    for key, val in avs.items():
+        v = val.get("Value", "") if isinstance(val, dict) else (str(val) if val else "")
+        if not v:
+            continue
+        # Truncate long values but show more for HTML/Lava
+        max_len = 300 if key.lower() in ("query", "formattedoutput", "template",
+                                         "lavatemplate") else 150
+        settings.add(f"{key}: {v[:max_len]}" + ("..." if len(v) > max_len else ""))
+    return detail
 
 
 def cmd_bgc(args, client):
@@ -1366,6 +1465,54 @@ def cmd_bgc(args, client):
     return listing
 
 
+def _checkin_area(args, client, checkin_group_types):
+    """One check-in area, with the locations and sub-areas under it.
+
+    The group type restriction belongs in the query rather than after it.
+    Filtering afterwards spent the cap on rows that were about to be discarded:
+    a common word can match hundreds of groups of every type, and if no check-in
+    group landed in the first ten the command answered "No check-in area found"
+    for areas that plainly exist.
+    """
+    checkin_type_ids = sorted(gt["Id"] for gt in checkin_group_types)
+
+    def among_checkin_types(odata_filter, limit):
+        if not checkin_type_ids:
+            return get_capped(client, "Groups", {"$filter": odata_filter,
+                                                 "$select": "Id,Name"}, limit)
+        return groups_of_types(client, odata_filter, checkin_type_ids, limit)
+
+    group = _find_entity(client, "Groups", args.area, label="check-in area",
+                         search=among_checkin_types)
+    if not group:
+        return
+
+    detail = Detail(f"{group['Name']} (ID: {group['Id']})")
+    detail.field("Active", group.get("IsActive", False))
+
+    group_locs, locs_capped = get_capped(client, "GroupLocations", {
+        "$filter": f"GroupId eq {group['Id']}",
+        "$select": "LocationId",
+    }, CHILD_LIMIT)
+    places = detail.section("Locations", group_locs, locs_capped, hint=CHILD_HINT)
+    for gl in group_locs:
+        loc_name = _resolve_name(client, "Locations", gl["LocationId"])
+        if loc_name != "?":
+            places.add(f"{loc_name} (ID: {gl['LocationId']})")
+        else:
+            places.add(f"Location ID: {gl['LocationId']}")
+
+    children, children_capped = get_capped(client, "Groups", {
+        "$filter": f"ParentGroupId eq {group['Id']}",
+        "$select": "Id,Name,IsActive",
+        "$orderby": "Order",
+    }, CHILD_LIMIT)
+    sub = detail.section("Sub-areas", children, children_capped, hint=CHILD_HINT)
+    for child in children:
+        sub.row(child["Id"], f"{child['Name']}{_inactive(child)}")
+    return detail
+
+
 def cmd_checkin(args, client):
     # Check-in areas are GroupTypes with a specific purpose.
     # A production instance matched half again as many types as the 20 that used
@@ -1379,88 +1526,41 @@ def cmd_checkin(args, client):
     }, CHILD_LIMIT)
 
     if args.area:
-        # Show specific check-in area (group) with locations and schedules
-        # Restrict by group type in the query rather than after it. Filtering
-        # afterwards spent the cap on rows that were about to be discarded: a
-        # common word can match hundreds of groups of every type, and if no
-        # check-in group landed in the first ten the command answered "No
-        # check-in area found" for areas that plainly exist.
-        checkin_type_ids = sorted(gt["Id"] for gt in checkin_group_types)
+        return _checkin_area(args, client, checkin_group_types)
 
-        def among_checkin_types(odata_filter, limit):
-            if not checkin_type_ids:
-                return get_capped(client, "Groups", {"$filter": odata_filter,
-                                                     "$select": "Id,Name"}, limit)
-            return groups_of_types(client, odata_filter, checkin_type_ids, limit)
-
-        group = _find_entity(client, "Groups", args.area, label="check-in area",
-                             search=among_checkin_types)
-        if not group:
-            return
-
-        print(f"{group['Name']} (ID: {group['Id']})")
-        print(f"  Active: {group.get('IsActive', False)}")
-
-        # Locations
-        group_locs, locs_capped = get_capped(client, "GroupLocations", {
-            "$filter": f"GroupId eq {group['Id']}",
-            "$select": "LocationId",
-        }, CHILD_LIMIT)
-        if group_locs:
-            print(f"  Locations ({tally(group_locs, locs_capped, hint=CHILD_HINT)}):")
-            for gl in group_locs:
-                loc_name = _resolve_name(client, "Locations", gl["LocationId"])
-                if loc_name != "?":
-                    print(f"    {loc_name} (ID: {gl['LocationId']})")
-                else:
-                    print(f"    Location ID: {gl['LocationId']}")
-
-        # Child groups (sub-areas)
-        children, children_capped = get_capped(client, "Groups", {
-            "$filter": f"ParentGroupId eq {group['Id']}",
-            "$select": "Id,Name,IsActive",
-            "$orderby": "Order",
-        }, CHILD_LIMIT)
-        if children:
-            print(f"  Sub-areas ({tally(children, children_capped, hint=CHILD_HINT)}):")
-            for child in children:
-                active = "" if child.get("IsActive") else " [inactive]"
-                print(row(child["Id"], f"{child['Name']}{active}", indent=4))
-        return
-
-    # Default: show check-in group type hierarchy
     if not checkin_group_types:
-        print("No check-in group types found.")
-        return
+        return Text("No check-in group types found.")
 
-    print("Check-in Configuration:\n")
+    # The hierarchy is three levels deep with a cap note possible at each, which
+    # is a tree rather than a heading with fields under it. It builds its lines
+    # and returns them, the way the workflow tree and the audit do.
+    lines = ["Check-in Configuration:", ""]
     if types_capped:
-        print(f"  (only the first {CHILD_LIMIT} check-in group types are shown)\n")
+        lines.append(f"  (only the first {CHILD_LIMIT} check-in group types are shown)")
+        lines.append("")
     for gt in checkin_group_types:
-        print(f"  Group Type: {gt['Name']} (ID: {gt['Id']})")
-        # Top-level groups of this type
+        lines.append(f"  Group Type: {gt['Name']} (ID: {gt['Id']})")
         top_groups, top_capped = get_capped(client, "Groups", {
             "$filter": f"GroupTypeId eq {gt['Id']} and ParentGroupId eq null",
             "$select": "Id,Name,IsActive",
             "$orderby": "Order",
         }, CHILD_LIMIT)
         if top_capped:
-            print(f"    (only the first {CHILD_LIMIT} are shown)")
+            lines.append(f"    (only the first {CHILD_LIMIT} are shown)")
         for g in top_groups:
-            active = "" if g.get("IsActive") else " [inactive]"
-            print(row(g["Id"], f"{g['Name']}{active}", indent=4))
-            # First level children
+            lines.append(row(g["Id"], f"{g['Name']}{_inactive(g)}", indent=4))
             children, children_capped = get_capped(client, "Groups", {
                 "$filter": f"ParentGroupId eq {g['Id']}",
                 "$select": "Id,Name,IsActive",
                 "$orderby": "Order",
             }, CHILD_LIMIT)
             if children_capped:
-                print(f"      (only the first {CHILD_LIMIT} are shown)")
+                lines.append(f"      (only the first {CHILD_LIMIT} are shown)")
             for child in children:
-                ca = "" if child.get("IsActive") else " [inactive]"
-                print(row(child["Id"], f"{child['Name']}{ca}", indent=6))
-        print()
+                lines.append(row(child["Id"],
+                                 f"{child['Name']}{_inactive(child)}", indent=6))
+        lines.append("")
+    return Text("\n".join(lines).rstrip("\n"))
 
 
 def cmd_attendance(args, client):
@@ -1508,28 +1608,27 @@ def cmd_attendance(args, client):
 def cmd_occurrence(args, client):
     occ = client.get(f"AttendanceOccurrences/{args.id}")
     if not occ:
-        print(f"Occurrence {args.id} not found")
-        return
+        return Text(f"Occurrence {args.id} not found")
 
     if args.json:
-        print(json.dumps(occ, indent=2))
-        return
+        return Raw(occ)
 
     occ_date = (occ.get("OccurrenceDate") or "")[:10]
-    print(f"Occurrence {occ['Id']} ({occ_date})")
+    detail = Detail(f"Occurrence {occ['Id']} ({occ_date})")
 
-    for label, endpoint, key in [("Group", "Groups", "GroupId"), ("Location", "Locations", "LocationId"), ("Schedule", "Schedules", "ScheduleId")]:
+    for label, endpoint, key in (("Group", "Groups", "GroupId"),
+                                 ("Location", "Locations", "LocationId"),
+                                 ("Schedule", "Schedules", "ScheduleId")):
         if occ.get(key):
             name = _resolve_name(client, endpoint, occ[key])
             if name != "?":
-                print(f"  {label}: {name} (ID: {occ[key]})")
+                detail.field(label, f"{name} (ID: {occ[key]})")
             else:
-                print(f"  {label} ID: {occ[key]}")
+                detail.field(f"{label} ID", occ[key])
 
     if occ.get("DidNotOccur"):
-        print("  Status: DID NOT OCCUR")
+        detail.field("Status", "DID NOT OCCUR")
 
-    # Attendees
     attendees, att_more = get_capped(client, "Attendances", {
         "$filter": f"OccurrenceId eq {occ['Id']}",
         "$select": "PersonAliasId,DidAttend,StartDateTime,RSVP",
@@ -1540,15 +1639,17 @@ def cmd_occurrence(args, client):
         # not just the list length, so say plainly when the roll is cut short.
         did_attend = sum(1 for a in attendees if a.get("DidAttend"))
         cut = " — more exist, raise --limit" if att_more else ""
-        print(f"  Attendees: {did_attend} attended / {len(attendees)} total{cut}")
+        detail.field("Attendees",
+                     f"{did_attend} attended / {len(attendees)} total{cut}")
         if args.names:
             person_cache = {}
             for a in attendees:
-                aid = a.get("PersonAliasId")
-                pname = _resolve_person_name(client, aid, person_cache)
+                pname = _resolve_person_name(client, a.get("PersonAliasId"),
+                                             person_cache)
                 attended = "Y" if a.get("DidAttend") else "N"
                 rsvp = f" RSVP:{a['RSVP']}" if a.get("RSVP") else ""
-                print(f"    {pname:30s} [{attended}]{rsvp}")
+                detail.line(f"{pname:30s} [{attended}]{rsvp}", depth=1)
+    return detail
 
 
 def cmd_block_set(args, client):

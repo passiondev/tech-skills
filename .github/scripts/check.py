@@ -1031,6 +1031,91 @@ def _rock_listing_rows():
              f"chosen for every listing")
 
 
+# A write command reports each step as it lands, so somebody watching one run
+# reads the steps in order rather than in a block at the end. `cmd_search` walks
+# eight entity types and says which one it is on.
+_ROCK_COMMANDS_THAT_PRINT = {
+    "cmd_block_set", "cmd_person_create", "cmd_person_update",
+    "cmd_exception_clear", "cmd_search",
+}
+
+
+def _reaches_stdout(node):
+    """A call that puts text on stdout: `print(...)` or `sys.stdout.write(...)`.
+
+    `print(..., file=sys.stderr)` does not. A read command stays free to warn --
+    a warning is not the answer, and nothing reading the answer sees it.
+    """
+    if not isinstance(node, ast.Call):
+        return False
+    if isinstance(node.func, ast.Name) and node.func.id == "print":
+        for keyword in node.keywords:
+            if keyword.arg == "file":
+                return ast.unparse(keyword.value) == "sys.stdout"
+        return True
+    return (isinstance(node.func, ast.Attribute)
+            and ast.unparse(node.func).startswith("sys.stdout."))
+
+
+@check("rock-read-views")
+def _rock_read_views():
+    """A read command returns its answer. One function prints it.
+
+    Twenty-one views in `rock_query.py` printed for themselves, so a test of any
+    one of them had to run the command, capture stdout, and match formatted
+    text. None of them answered its caller with anything. Each returns a
+    `Listing`, a `Detail`, a `Raw` or a `Text` now, and `render` at the boundary
+    prints it, which makes the return value the test surface.
+
+    The next view somebody adds is what undoes that, so this fails on a read
+    command that reaches stdout. The allow-list holds the write commands, each
+    of which reports a step that has already landed, plus the search that says
+    which entity type it is walking.
+
+    Every name on the list has to exist, so renaming a command means visiting
+    the list rather than leaving a dead entry to cover a future namesake.
+    `render` is exempt by name, and so is each renderable's `render` method,
+    because a renderer that prints is the whole arrangement.
+    """
+    rel = "plugins/rock/runtime/scripts/rock_query.py"
+    path = ROOT / rel
+
+    if not path.exists():
+        fail(rel, "is missing — this check guards it by path, so a move has to "
+                  "update the path here as well")
+        return
+
+    tree = ast.parse(path.read_text())
+    defined = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    if "render" not in defined:
+        fail(rel, "render() is gone. It is the one place this check lets the "
+                  "read side print, so removing it silently stops the guard "
+                  "from guarding")
+    for name in sorted(_ROCK_COMMANDS_THAT_PRINT - defined):
+        fail(rel, f"{name}() is on this check's allow-list and no longer exists. "
+                  f"Drop it from the list, so the next command to take that name "
+                  f"does not inherit the exemption")
+
+    for command in tree.body:
+        if not isinstance(command, ast.FunctionDef):
+            continue
+        if not command.name.startswith("cmd_"):
+            continue
+        if command.name in _ROCK_COMMANDS_THAT_PRINT:
+            continue
+        # The whole body, nested definitions included. `_by_function` tags a
+        # node with the innermost function around it, so a `def emit(): print`
+        # inside a view would come back tagged `emit` and slip past.
+        for node in ast.walk(command):
+            if not _reaches_stdout(node):
+                continue
+            fail(f"{rel}:{node.lineno}",
+                 f"{command.name}() prints its own answer. Build a Listing, a "
+                 f"Detail, a Raw or a Text and return it — render() is the only "
+                 f"place a read view reaches stdout, and a command that prints "
+                 f"answers its caller with nothing")
+
+
 @check("no-repo-writes")
 def _no_repo_writes():
     """Nothing may write into a repository — attachments, screenshots, plans (ADR 0001)."""

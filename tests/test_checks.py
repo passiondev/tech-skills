@@ -179,6 +179,143 @@ def cmd_things(client):
         self.assertEqual(found, [])
 
 
+class TestTheReadViewCheckCatchesACommandThatPrints(CheckTestCase):
+    """rock-read-views — a read command returns its answer, `render` prints it."""
+
+    BASE = '''
+import sys
+
+
+def render(report):
+    print(report)
+
+
+def cmd_block_set(args, client):
+    print("  set")
+
+
+def cmd_person_create(args, client):
+    print("  created")
+
+
+def cmd_person_update(args, client):
+    print("  updated")
+
+
+def cmd_exception_clear(args, client):
+    print("  cleared")
+
+
+def cmd_search(args, client):
+    print("Searching Groups...")
+'''
+
+    def views(self, added=""):
+        return self.run_check(checks._rock_read_views,
+                              {str(QUERY_PATH): self.BASE + added})
+
+    def test_the_writers_that_report_as_they_go_are_clean(self):
+        self.assertEqual(self.views(), [])
+
+    def test_a_read_view_that_prints_is_caught(self):
+        found = self.views('''
+def cmd_group(args, client):
+    print(client.get("Groups/1")["Name"])
+''')
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("cmd_group", found[0])
+        self.assertIn("render()", found[0])
+
+    def test_a_read_view_that_returns_a_renderable_is_clean(self):
+        self.assertEqual(self.views('''
+def cmd_group(args, client):
+    detail = Detail("Ushers (ID: 7)")
+    detail.field("Campus", "Downtown")
+    return detail
+'''), [])
+
+    def test_a_print_hidden_in_a_nested_helper_is_caught(self):
+        """The dodge, and the accident: a `def` inside the view that prints.
+
+        `_by_function` tags a node with the innermost function around it, so a
+        nested one would come back tagged with its own name and pass.
+        """
+        found = self.views('''
+def cmd_group(args, client):
+    def emit(line):
+        print(line)
+    emit("Ushers")
+''')
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("cmd_group", found[0])
+
+    def test_writing_to_stdout_by_hand_is_the_same_offence(self):
+        found = self.views('''
+def cmd_group(args, client):
+    sys.stdout.write("Ushers")
+''')
+        self.assertEqual(len(found), 1, found)
+
+    def test_a_print_aimed_at_stdout_by_name_is_still_a_print(self):
+        found = self.views('''
+def cmd_group(args, client):
+    print("Ushers", file=sys.stdout)
+''')
+        self.assertEqual(len(found), 1, found)
+
+    def test_a_warning_on_stderr_is_not_the_answer(self):
+        """Nothing reading the answer sees stderr, so a view may still warn."""
+        self.assertEqual(self.views('''
+def cmd_group(args, client):
+    print("Warning: settings unreadable", file=sys.stderr)
+    return Detail("Ushers (ID: 7)")
+'''), [])
+
+    def test_a_helper_a_view_calls_is_out_of_this_checks_reach(self):
+        """`_find_entity` asks which of several matches was meant, on stdout.
+
+        This reads command bodies, so a helper they call sits outside it. Worth
+        a test rather than a docstring line, because a check read as broader
+        than it is, is worse than one that admits its edge.
+        """
+        self.assertEqual(self.views('''
+def _find_entity(client, entity, identifier):
+    print("Multiple matches:")
+'''), [])
+
+    def test_deleting_the_renderer_fails_rather_than_disarming_the_check(self):
+        found = self.run_check(
+            checks._rock_read_views,
+            {str(QUERY_PATH): "def cmd_group(args, client):\n    pass\n"})
+        self.assertTrue(any("render()" in f for f in found), found)
+
+    def test_an_allow_list_entry_that_no_longer_exists_is_caught(self):
+        """A renamed write command has to be renamed here too.
+
+        Left alone, the entry sits there covering whatever takes the name next.
+        """
+        source = self.BASE.replace("def cmd_person_update", "def cmd_person_edit")
+        found = self.run_check(checks._rock_read_views, {str(QUERY_PATH): source})
+        self.assertEqual(len(found), 2, found)
+        self.assertIn("allow-list", found[0])
+        self.assertIn("cmd_person_update", found[0])
+        # The rename lands the write command outside the list, so it is reported
+        # as a view that prints. Both halves are the same message: the list and
+        # the commands have to be renamed together.
+        self.assertIn("cmd_person_edit", found[1])
+
+    def test_moving_the_file_fails_rather_than_passing_vacuously(self):
+        found = self.run_check(checks._rock_read_views, {})
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("missing", found[0])
+
+    def test_the_repository_itself_passes(self):
+        found = self.run_check(
+            checks._rock_read_views,
+            {str(QUERY_PATH): (ROOT / QUERY_PATH).read_text()})
+        self.assertEqual(found, [])
+
+
 class TestTheListingCheckCatchesADriftingColumn(CheckTestCase):
     """rock-listing-rows — the id column is decided in one function."""
 
