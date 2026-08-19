@@ -258,14 +258,18 @@ def resolve_layout(catalog, name, site_id=None):
     return None
 
 
-def _first_id(client, endpoint, filter_str):
-    """The Id of the first match, or None. The shape every lookup here shares."""
+def _first_id(client, endpoint, filter_str, column="Id"):
+    """The first match's `column`, or None. The shape every lookup here shares.
+
+    `column` is almost always the row's own Id. A page route is the exception:
+    what a plan means by one is the page it reaches.
+    """
     found = client.get(endpoint, params={
         "$filter": filter_str,
-        "$select": "Id",
+        "$select": column,
         "$top": 1,
     })
-    return found[0]["Id"] if found else None
+    return found[0][column] if found else None
 
 
 def _named(client, endpoint, name):
@@ -309,6 +313,43 @@ def resolve_member_role(client, member_id, role_name):
 def resolve_data_view(client, name):
     """Find a DataView ID by name."""
     return _named(client, "DataViews", name)
+
+
+def resolve_page_route(client, route):
+    """Find the page a route path reaches, or None.
+
+    `create_page` wrote this filter inline, and left the route unescaped: an
+    apostrophe in a path closed the OData string early and Rock answered 400.
+    """
+    return _first_id(client, "PageRoutes",
+                     f"Route eq '{odata_str(route.lstrip('/'))}'", "PageId")
+
+
+def resolve_ref(source, id_key, name_key, resolve, *lookup_args):
+    """The id a plan gave under `id_key`, or the one `name_key` resolves to.
+
+    Nine sites climbed this ladder by hand -- take the id, else resolve the
+    name, else fail -- and they had drifted four ways. One read its name key
+    without checking it was there, so a block with no type at all raised
+    `KeyError` where a named failure belongs, and the page it sat on had already
+    been created. Three worded the same failure three ways, none of them naming
+    both keys a plan could have used. One resolved a page route through an OData
+    filter it wrote itself, without escaping the value.
+
+    The raise is a `PlanError`, so a caller inside `step` records it against the
+    entity it was building and stops the plan there with everything that landed
+    before it. Every resolver above takes the value it resolves last, which is
+    what `*lookup_args` relies on -- a test asserts that.
+    """
+    if source.get(id_key):
+        return source[id_key]
+    value = source.get(name_key)
+    if not value:
+        raise PlanError(f"give {id_key!r} or {name_key!r}")
+    found = resolve(*lookup_args, value)
+    if not found:
+        raise PlanError(f"no {name_key!r} matches {value!r}")
+    return found
 
 
 # Rock.Model.GroupMemberStatus. Sending nothing means 0 — Inactive — so every
@@ -602,24 +643,10 @@ def create_page(plan, client, catalog):
     result = BuildResult()
     pg = plan["page"]
 
-    # Resolve layout
-    layout_id = pg.get("layout_id")
-    if not layout_id and "layout" in pg:
-        layout_id = resolve_layout(catalog, pg["layout"])
-    if not layout_id:
-        result.fail("Page", pg["name"], "Could not resolve layout")
-        return result
-
-    # Resolve parent page
-    parent_id = pg.get("parent_page_id")
-    if not parent_id and "parent_page" in pg:
-        routes = client.get("PageRoutes", params={
-            "$filter": f"Route eq '{pg['parent_page'].lstrip('/')}'",
-            "$select": "PageId",
-            "$top": 1,
-        })
-        if routes:
-            parent_id = routes[0]["PageId"]
+    with step(result, "Page", pg["name"]):
+        layout_id = resolve_ref(pg, "layout_id", "layout", resolve_layout, catalog)
+        parent_id = resolve_ref(pg, "parent_page_id", "parent_page",
+                                resolve_page_route, client)
 
     # 1. Create Page
     page_data = {
@@ -627,10 +654,9 @@ def create_page(plan, client, catalog):
         "PageTitle": pg.get("title", pg["name"]),
         "LayoutId": layout_id,
         "DisplayInNavWhen": pg.get("display_in_nav", 2),  # 2 = When Allowed
+        "ParentPageId": parent_id,
         "IsSystem": False,
     }
-    if parent_id:
-        page_data["ParentPageId"] = parent_id
 
     with step(result, "Page", pg["name"]):
         page_id = client.post("Pages", page_data)
@@ -648,13 +674,11 @@ def create_page(plan, client, catalog):
 
     # 3. Create blocks
     for block_order, block_def in enumerate(pg.get("blocks", [])):
-        block_type_id = block_def.get("block_type_id")
-        if not block_type_id:
-            block_type_id = resolve_block_type(catalog, block_def["block_type"])
-        if not block_type_id:
-            result.fail("Block", block_def.get("name", "unknown"),
-                        f"Unknown block type: {block_def.get('block_type')}")
-            return result
+        label = block_def.get("name", f"block-{block_order}")
+
+        with step(result, "Block", label):
+            block_type_id = resolve_ref(block_def, "block_type_id", "block_type",
+                                        resolve_block_type, catalog)
 
         block_data = {
             "PageId": page_id,
@@ -665,12 +689,11 @@ def create_page(plan, client, catalog):
             "IsSystem": False,
         }
 
-        with step(result, "Block", block_def.get("name", f"block-{block_order}")):
+        with step(result, "Block", label):
             block_id = client.post("Blocks", block_data)
-            result.add("Block", block_def.get("name", f"block-{block_order}"), block_id)
+            result.add("Block", label, block_id)
 
-        apply_settings(result, client, "Blocks", block_id,
-                       block_def.get("name", f"block-{block_order}"),
+        apply_settings(result, client, "Blocks", block_id, label,
                        block_def.get("settings", {}))
 
     return result
@@ -716,14 +739,11 @@ def add_page_block(plan, client, catalog):
     mod = plan["modification"]
     page_id = mod["page_id"]
     block_def = mod["block"]
+    label = block_def.get("name", "new block")
 
-    block_type_id = block_def.get("block_type_id")
-    if not block_type_id:
-        block_type_id = resolve_block_type(catalog, block_def["block_type"])
-    if not block_type_id:
-        result.fail("Block", block_def.get("name", "unknown"),
-                     f"Unknown block type: {block_def.get('block_type')}")
-        return result
+    with step(result, "Block", label):
+        block_type_id = resolve_ref(block_def, "block_type_id", "block_type",
+                                    resolve_block_type, catalog)
 
     zone = block_def.get("zone", "Main")
     next_order = _next_order(client, "Blocks", f"PageId eq {page_id} and Zone eq '{odata_str(zone)}'")
@@ -926,14 +946,9 @@ def create_checkin_area(plan, client):
     result = BuildResult()
     area = plan["checkin_area"]
 
-    # Resolve group type
-    group_type_id = area.get("group_type_id")
-    if not group_type_id and "group_type" in area:
-        group_type_id = resolve_group_type(client, area["group_type"])
-
-    if not group_type_id:
-        result.fail("Group", area["name"], "Could not resolve GroupType")
-        return result
+    with step(result, "Group", area["name"]):
+        group_type_id = resolve_ref(area, "group_type_id", "group_type",
+                                    resolve_group_type, client)
 
     # Create group
     group_data = {
@@ -1025,13 +1040,9 @@ def create_group(plan, client):
     result = BuildResult()
     grp = plan["group"]
 
-    group_type_id = grp.get("group_type_id")
-    if not group_type_id and grp.get("group_type"):
-        group_type_id = resolve_group_type(client, grp["group_type"])
-    if not group_type_id:
-        result.fail("Group", grp["name"],
-                    f"Could not resolve GroupType: {grp.get('group_type')}")
-        return result
+    with step(result, "Group", grp["name"]):
+        group_type_id = resolve_ref(grp, "group_type_id", "group_type",
+                                    resolve_group_type, client)
 
     data = {
         "Name": grp["name"],
@@ -1109,13 +1120,9 @@ def add_group_member(plan, client):
     person_id = mod["person_id"]
     label = f"person {person_id} in group {group_id}"
 
-    role_id = mod.get("group_role_id")
-    if not role_id and mod.get("role"):
-        role_id = resolve_group_role(client, group_id, mod["role"])
-    if not role_id:
-        result.fail("GroupMember", label,
-                    f"Could not resolve role {mod.get('role')!r} in group {group_id}")
-        return result
+    with step(result, "GroupMember", label):
+        role_id = resolve_ref(mod, "group_role_id", "role",
+                              resolve_group_role, client, group_id)
 
     status = member_status(mod.get("status", "active"))
     if status is None:
@@ -1252,21 +1259,11 @@ def create_group_sync(plan, client):
     group_id = mod["group_id"]
     label = f"sync on group {group_id}"
 
-    role_id = mod.get("group_type_role_id")
-    if not role_id and mod.get("role"):
-        role_id = resolve_group_role(client, group_id, mod["role"])
-    if not role_id:
-        result.fail("GroupSync", label,
-                    f"Could not resolve role {mod.get('role')!r} in group {group_id}")
-        return result
-
-    data_view_id = mod.get("sync_data_view_id")
-    if not data_view_id and mod.get("data_view"):
-        data_view_id = resolve_data_view(client, mod["data_view"])
-    if not data_view_id:
-        result.fail("GroupSync", label,
-                    f"Could not resolve data view {mod.get('data_view')!r}")
-        return result
+    with step(result, "GroupSync", label):
+        role_id = resolve_ref(mod, "group_type_role_id", "role",
+                              resolve_group_role, client, group_id)
+        data_view_id = resolve_ref(mod, "sync_data_view_id", "data_view",
+                                   resolve_data_view, client)
 
     data = {
         "GroupId": group_id,

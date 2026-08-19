@@ -54,6 +54,18 @@ class WriteTestCase(unittest.TestCase):
     def assertSucceeded(self, result):
         self.assertTrue(result.success, f"operation reported failure: {result.failures}")
 
+    def assertStopped(self, handler, *args):
+        """Run a handler whose plan cannot finish, and return what it did manage.
+
+        A failed step stops the plan by raising, carrying the result with it, so
+        `run_plan` can print the three entities that landed before the fourth
+        failed. A test calling a handler straight is on the other side of that
+        raise and has to catch it.
+        """
+        with self.assertRaises(rock_build.StepFailed) as caught:
+            handler(*args)
+        return caught.exception.result
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RockClient — the two verbs the partial-update fix needs
@@ -338,7 +350,8 @@ class TestGroupOperations(WriteTestCase):
 
     def test_create_group_fails_loudly_when_the_type_cannot_be_resolved(self):
         client = FakeClient()
-        result = rock_build.create_group(
+        result = self.assertStopped(
+            rock_build.create_group,
             {"group": {"name": "Guest Services", "group_type": "No Such Type"}},
             client)
         self.assertFalse(result.success)
@@ -511,7 +524,8 @@ class TestGroupOperations(WriteTestCase):
     def test_create_group_sync_needs_a_data_view(self):
         client = FakeClient(responses={"Groups/31": {"Id": 31, "GroupTypeId": 25},
                                        "GroupTypeRoles": [{"Id": 3}]})
-        result = rock_build.create_group_sync(
+        result = self.assertStopped(
+            rock_build.create_group_sync,
             {"modification": {"group_id": 31, "role": "Member",
                               "data_view": "No Such View"}}, client)
         self.assertFalse(result.success)
@@ -934,6 +948,95 @@ class TestFieldMapsAreClosed(WriteTestCase):
             lambda: client, CATALOG)
         self.assertSucceeded(result)
         self.assertEqual(client.only_write()["data"], {"GroupRoleId": 4})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# "Give me the id, or give me a name" — the one ladder every write side climbs
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestNameOrIdOnTheWriteSide(WriteTestCase):
+    """Nine sites read an id key, fell back to a name, and failed if neither held.
+
+    They had drifted four ways. One read its name key without checking it was
+    there, so a block with no type at all was a `KeyError` rather than a named
+    failure — and the page it was on had already been created, which the report
+    then denied. Three worded the same failure three ways. One resolved a page
+    route through an OData filter it wrote itself, without escaping the value.
+    """
+
+    def test_an_id_is_taken_without_a_lookup(self):
+        def refuse(_client, _name):
+            self.fail("resolved a name when the plan gave an id")
+
+        self.assertEqual(
+            rock_build.resolve_ref({"group_type_id": 25, "group_type": "Serving"},
+                                   "group_type_id", "group_type", refuse, None),
+            25)
+
+    def test_a_name_is_resolved_when_no_id_is_given(self):
+        self.assertEqual(
+            rock_build.resolve_ref({"group_type": "Serving"}, "group_type_id",
+                                   "group_type", lambda _c, name: len(name), None),
+            7)
+
+    def test_neither_key_names_both_of_them(self):
+        with self.assertRaises(rock_build.PlanError) as caught:
+            rock_build.resolve_ref({}, "group_type_id", "group_type",
+                                   lambda _c, _n: 1, None)
+        self.assertIn("group_type_id", str(caught.exception))
+        self.assertIn("group_type", str(caught.exception))
+
+    def test_a_name_that_resolves_to_nothing_names_the_name(self):
+        with self.assertRaises(rock_build.PlanError) as caught:
+            rock_build.resolve_ref({"group_type": "No Such Type"}, "group_type_id",
+                                   "group_type", lambda _c, _n: None, None)
+        self.assertIn("No Such Type", str(caught.exception))
+
+    def test_every_resolver_takes_the_value_last(self):
+        """`resolve_ref` calls `resolve(*lookup_args, value)`, so this binds."""
+        named = {"name", "role_name", "route"}
+        for attr in dir(rock_build):
+            if not attr.startswith("resolve_") or attr == "resolve_ref":
+                continue
+            with self.subTest(resolver=attr):
+                params = inspect.signature(getattr(rock_build, attr)).parameters
+                required = [p.name for p in params.values()
+                            if p.default is inspect.Parameter.empty]
+                self.assertIn(required[-1], named,
+                              f"{attr} must take the value it resolves last")
+
+    def test_a_page_route_resolves_to_the_page_it_reaches(self):
+        client = FakeClient(responses={"PageRoutes": [{"PageId": 42}]})
+        self.assertEqual(rock_build.resolve_page_route(client, "/serving/signup"), 42)
+        self.assertEqual(client.calls[0]["params"]["$filter"],
+                         "Route eq 'serving/signup'")
+
+    def test_a_page_route_escapes_an_apostrophe(self):
+        client = FakeClient()
+        rock_build.resolve_page_route(client, "kids/o'brien")
+        self.assertIn("o''brien", client.calls[0]["params"]["$filter"])
+
+    def test_a_block_with_no_type_at_all_still_reports_the_page(self):
+        os.environ["ROCK_ALLOW_WRITES"] = "1"
+        client = FakeClient(responses={"PageRoutes": [{"PageId": 42}]})
+        result = rock_build.run_plan({
+            "operation": "create_page",
+            "page": {"name": "Signup", "layout": "Full Width",
+                     "parent_page": "/serving", "blocks": [{"name": "roster"}]},
+        }, lambda: client, CATALOG)
+        self.assertFalse(result.success)
+        self.assertEqual([c["type"] for c in result.created], ["Page"])
+        self.assertIn("roster", result.failures[0]["name"])
+
+    def test_a_parent_route_that_matches_nothing_creates_no_page(self):
+        client = FakeClient()
+        result = self.assertStopped(
+            rock_build.create_page,
+            {"page": {"name": "Signup", "layout": "Full Width",
+                      "parent_page": "/gone"}}, client, CATALOG)
+        self.assertFalse(result.success)
+        self.assertEqual(client.writes, [],
+                         "a page whose parent is unknown must not become a root page")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
