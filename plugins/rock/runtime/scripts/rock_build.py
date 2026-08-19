@@ -16,6 +16,7 @@ body nulls the fields you left out, wipes the created-by audit, and gives the
 row a new Guid.
 """
 
+import inspect
 import json
 import os
 import sys
@@ -754,7 +755,7 @@ def add_page_block(plan, client, catalog):
     return result
 
 
-def update_workflow(plan, client, catalog):
+def update_workflow(plan, client):
     """Update properties on an existing workflow type."""
     result = BuildResult()
     mod = plan["modification"]
@@ -787,7 +788,7 @@ def update_workflow(plan, client, catalog):
     return result
 
 
-def update_activity(plan, client, catalog):
+def update_activity(plan, client):
     """Update properties on an existing workflow activity."""
     result = BuildResult()
     mod = plan["modification"]
@@ -854,7 +855,7 @@ def update_action(plan, client, catalog):
     return result
 
 
-def delete_action(plan, client, catalog):
+def delete_action(plan, client):
     """Delete a workflow action."""
     result = BuildResult()
     action_id = plan["modification"]["action_type_id"]
@@ -868,7 +869,7 @@ def delete_action(plan, client, catalog):
     return result
 
 
-def delete_activity(plan, client, catalog):
+def delete_activity(plan, client):
     """Delete a workflow activity and all its actions."""
     result = BuildResult()
     act_id = plan["modification"]["activity_type_id"]
@@ -895,7 +896,7 @@ def delete_activity(plan, client, catalog):
     return result
 
 
-def reorder_actions(plan, client, catalog):
+def reorder_actions(plan, client):
     """Set new ordering on actions within an activity."""
     result = BuildResult()
     mod = plan["modification"]
@@ -911,7 +912,7 @@ def reorder_actions(plan, client, catalog):
     return result
 
 
-def move_action(plan, client, catalog):
+def move_action(plan, client):
     """Move an action to a different activity."""
     result = BuildResult()
     mod = plan["modification"]
@@ -932,7 +933,7 @@ def move_action(plan, client, catalog):
     return result
 
 
-def create_checkin_area(plan, client, catalog):
+def create_checkin_area(plan, client):
     """Create a check-in area group with location and schedule links.
 
     Plan format:
@@ -1041,7 +1042,7 @@ GROUP_FIELDS = {
 }
 
 
-def create_group(plan, client, catalog):
+def create_group(plan, client):
     """Create a group.
 
     Plan format:
@@ -1095,7 +1096,7 @@ def create_group(plan, client, catalog):
     return result
 
 
-def update_group(plan, client, catalog):
+def update_group(plan, client):
     """Update properties on an existing group.
 
     Plan format:
@@ -1127,7 +1128,7 @@ def update_group(plan, client, catalog):
     return result
 
 
-def add_group_member(plan, client, catalog):
+def add_group_member(plan, client):
     """Add a person to a group.
 
     Plan format:
@@ -1199,7 +1200,7 @@ GROUP_MEMBER_FIELDS = {
 }
 
 
-def update_group_member(plan, client, catalog):
+def update_group_member(plan, client):
     """Update a group membership — its role, status, or note.
 
     Plan format:
@@ -1254,7 +1255,7 @@ def update_group_member(plan, client, catalog):
     return result
 
 
-def remove_group_member(plan, client, catalog):
+def remove_group_member(plan, client):
     """Delete a group membership.
 
     Plan format:
@@ -1279,7 +1280,7 @@ def remove_group_member(plan, client, catalog):
     return result
 
 
-def create_group_sync(plan, client, catalog):
+def create_group_sync(plan, client):
     """Point a group's role at a data view, so Rock keeps the roster in step.
 
     Plan format:
@@ -1345,7 +1346,7 @@ def create_group_sync(plan, client, catalog):
 API_METHODS = ("GET", "POST", "PATCH", "PUT", "DELETE")
 
 
-def api_request(plan, client, catalog):
+def api_request(plan, client):
     """Send one arbitrary request to the Rock API.
 
     Every named operation above encodes what Rock wants for one kind of change.
@@ -1513,9 +1514,13 @@ OPERATIONS = {
     "api_request": api_request,
 }
 
-# Operations that resolve a name through the catalog cache.
-NEEDS_CATALOG = {"create_workflow", "create_page", "add_action", "add_block",
-                 "update_action"}
+# The operations that resolve a name through the catalog cache -- read off the
+# handlers rather than listed beside them. A hand-kept second list is a list
+# that goes stale silently: the gate below would keep blocking an operation
+# that stopped resolving names, and would let one that started resolving them
+# run against no cache at all. Taking a `catalog` argument *is* the declaration.
+NEEDS_CATALOG = {name for name, handler in OPERATIONS.items()
+                 if "catalog" in inspect.signature(handler).parameters}
 
 
 def refused(kind, label, message):
@@ -1580,7 +1585,9 @@ def _apply_plan(plan, connect, catalog):
     log.info("build operation=%s", operation)
     client = connect()
     try:
-        return handler(plan, client, catalog or {})
+        if operation in NEEDS_CATALOG:
+            return handler(plan, client, catalog)
+        return handler(plan, client)
     except PlanError as exc:
         return refused("Plan", operation, str(exc))
     except KeyError as exc:

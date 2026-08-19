@@ -20,10 +20,13 @@ update, a test here fails and names the operation.
 Run:  python3 -m unittest discover -s tests
 """
 
+import ast
+import inspect
 import io
 import os
 import sys
 import tempfile
+import textwrap
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -408,7 +411,7 @@ class TestPartialUpdatesUsePatch(WriteTestCase):
         client = FakeClient()
         result = rock_build.update_workflow(
             {"modification": {"workflow_type_id": 12, "updates": {"description": "New"}}},
-            client, CATALOG)
+            client)
         self.assertSucceeded(result)
         self.assertNoPut(client)
         self.assertEqual(client.only_write(),
@@ -419,7 +422,7 @@ class TestPartialUpdatesUsePatch(WriteTestCase):
         client = FakeClient()
         result = rock_build.update_activity(
             {"modification": {"activity_type_id": 34, "updates": {"order": 2}}},
-            client, CATALOG)
+            client)
         self.assertSucceeded(result)
         self.assertNoPut(client)
         self.assertEqual(client.only_write()["endpoint"], "WorkflowActivityTypes/34")
@@ -438,7 +441,7 @@ class TestPartialUpdatesUsePatch(WriteTestCase):
     def test_reorder_actions(self):
         client = FakeClient()
         result = rock_build.reorder_actions(
-            {"modification": {"action_order": [7, 8]}}, client, CATALOG)
+            {"modification": {"action_order": [7, 8]}}, client)
         self.assertSucceeded(result)
         self.assertNoPut(client)
         self.assertEqual([(c["method"], c["endpoint"], c["data"]) for c in client.writes],
@@ -449,7 +452,7 @@ class TestPartialUpdatesUsePatch(WriteTestCase):
         client = FakeClient()
         result = rock_build.move_action(
             {"modification": {"action_type_id": 7, "target_activity_type_id": 34}},
-            client, CATALOG)
+            client)
         self.assertSucceeded(result)
         self.assertNoPut(client)
         call = client.only_write()
@@ -460,7 +463,7 @@ class TestPartialUpdatesUsePatch(WriteTestCase):
         client = FakeClient()
         result = rock_build.create_checkin_area(
             {"checkin_area": {"name": "Nursery", "group_type_id": 15, "schedules": [99]}},
-            client, CATALOG)
+            client)
         self.assertSucceeded(result)
         self.assertNoPut(client)
         schedule_call = client.writes[-1]
@@ -479,7 +482,7 @@ class TestGroupOperations(WriteTestCase):
             {"group": {"name": "Guest Services", "group_type_id": 25,
                        "parent_group_id": 8, "campus_id": 1,
                        "description": "Front door team"}},
-            client, CATALOG)
+            client)
         self.assertSucceeded(result)
         call = client.only_write()
         self.assertEqual(call["method"], "POST")
@@ -493,7 +496,7 @@ class TestGroupOperations(WriteTestCase):
         client = FakeClient(responses={"GroupTypes": [{"Id": 25}]})
         result = rock_build.create_group(
             {"group": {"name": "Guest Services", "group_type": "Serving Team"}},
-            client, CATALOG)
+            client)
         self.assertSucceeded(result)
         self.assertEqual(client.only_write()["data"]["GroupTypeId"], 25)
 
@@ -501,7 +504,7 @@ class TestGroupOperations(WriteTestCase):
         client = FakeClient()
         result = rock_build.create_group(
             {"group": {"name": "Guest Services", "group_type": "No Such Type"}},
-            client, CATALOG)
+            client)
         self.assertFalse(result.success)
         self.assertEqual(client.writes, [], "nothing should be created")
 
@@ -510,7 +513,7 @@ class TestGroupOperations(WriteTestCase):
         result = rock_build.create_group(
             {"group": {"name": "Team", "group_type_id": 25,
                        "settings": {"AllowGuests": "True"}}},
-            client, CATALOG)
+            client)
         self.assertSucceeded(result)
         self.assertEqual(client.writes[-1]["endpoint"], "Groups/AttributeValue/1001")
 
@@ -519,7 +522,7 @@ class TestGroupOperations(WriteTestCase):
         result = rock_build.update_group(
             {"modification": {"group_id": 31, "updates": {"name": "Renamed",
                                                           "is_active": False}}},
-            client, CATALOG)
+            client)
         self.assertSucceeded(result)
         self.assertNoPut(client)
         self.assertEqual(client.only_write(),
@@ -530,7 +533,7 @@ class TestGroupOperations(WriteTestCase):
         client = FakeClient()
         result = rock_build.add_group_member(
             {"modification": {"group_id": 31, "person_id": 42, "group_role_id": 3}},
-            client, CATALOG)
+            client)
         self.assertSucceeded(result)
         call = client.only_write()
         self.assertEqual(call["method"], "POST")
@@ -548,7 +551,7 @@ class TestGroupOperations(WriteTestCase):
         })
         result = rock_build.add_group_member(
             {"modification": {"group_id": 31, "person_id": 42, "role": "Leader"}},
-            client, CATALOG)
+            client)
         self.assertSucceeded(result)
         role_lookup = [c for c in client.calls if c["endpoint"] == "GroupTypeRoles"]
         self.assertTrue(role_lookup, "should look up GroupTypeRoles")
@@ -561,7 +564,7 @@ class TestGroupOperations(WriteTestCase):
             client.calls.clear()
             result = rock_build.add_group_member(
                 {"modification": {"group_id": 1, "person_id": 2, "group_role_id": 3,
-                                  "status": name}}, client, CATALOG)
+                                  "status": name}}, client)
             self.assertSucceeded(result)
             self.assertEqual(client.only_write()["data"]["GroupMemberStatus"], expected,
                              f"status {name!r}")
@@ -570,7 +573,7 @@ class TestGroupOperations(WriteTestCase):
         client = FakeClient()
         result = rock_build.add_group_member(
             {"modification": {"group_id": 1, "person_id": 2, "group_role_id": 3,
-                              "status": "probationary"}}, client, CATALOG)
+                              "status": "probationary"}}, client)
         self.assertFalse(result.success)
         self.assertEqual(client.writes, [])
 
@@ -579,7 +582,7 @@ class TestGroupOperations(WriteTestCase):
         result = rock_build.update_group_member(
             {"modification": {"group_member_id": 88, "updates": {"status": "inactive",
                                                                  "note": "moved away"}}},
-            client, CATALOG)
+            client)
         self.assertSucceeded(result)
         self.assertNoPut(client)
         self.assertEqual(client.only_write(),
@@ -597,7 +600,7 @@ class TestGroupOperations(WriteTestCase):
         })
         result = rock_build.update_group_member(
             {"modification": {"group_member_id": 88, "updates": {"role": "Leader"}}},
-            client, CATALOG)
+            client)
         self.assertSucceeded(result)
         self.assertEqual(client.only_write(),
                          {"method": "PATCH", "endpoint": "GroupMembers/88", "params": None,
@@ -613,7 +616,7 @@ class TestGroupOperations(WriteTestCase):
         })
         rock_build.update_group_member(
             {"modification": {"group_member_id": 88, "updates": {"role": "Leader"}}},
-            client, CATALOG)
+            client)
         reads = [c["endpoint"] for c in client.calls if c["method"] == "GET"]
         self.assertEqual(reads[:2], ["GroupMembers/88", "Groups/31"])
         role_query = [c for c in client.calls if c["endpoint"] == "GroupTypeRoles"][0]
@@ -627,7 +630,7 @@ class TestGroupOperations(WriteTestCase):
         })
         result = rock_build.update_group_member(
             {"modification": {"group_member_id": 88, "updates": {"role": "Hedgehog"}}},
-            client, CATALOG)
+            client)
         self.assertFalse(result.success)
         self.assertEqual(client.writes, [])
 
@@ -635,7 +638,7 @@ class TestGroupOperations(WriteTestCase):
         client = FakeClient()
         result = rock_build.update_group_member(
             {"modification": {"group_member_id": 88, "updates": {"group_role_id": 7}}},
-            client, CATALOG)
+            client)
         self.assertSucceeded(result)
         self.assertEqual(client.only_write()["data"], {"GroupRoleId": 7})
         self.assertEqual([c for c in client.calls if c["method"] == "GET"], [])
@@ -643,7 +646,7 @@ class TestGroupOperations(WriteTestCase):
     def test_remove_group_member_deletes(self):
         client = FakeClient()
         result = rock_build.remove_group_member(
-            {"modification": {"group_member_id": 88}}, client, CATALOG)
+            {"modification": {"group_member_id": 88}}, client)
         self.assertSucceeded(result)
         self.assertEqual(client.only_write(),
                          {"method": "DELETE", "endpoint": "GroupMembers/88",
@@ -660,7 +663,7 @@ class TestGroupOperations(WriteTestCase):
                               "data_view": "Active Adults",
                               "add_user_accounts": True,
                               "schedule_interval_minutes": 720}},
-            client, CATALOG)
+            client)
         self.assertSucceeded(result)
         call = client.only_write()
         self.assertEqual(call["method"], "POST")
@@ -674,7 +677,7 @@ class TestGroupOperations(WriteTestCase):
                                        "GroupTypeRoles": [{"Id": 3}]})
         result = rock_build.create_group_sync(
             {"modification": {"group_id": 31, "role": "Member",
-                              "data_view": "No Such View"}}, client, CATALOG)
+                              "data_view": "No Such View"}}, client)
         self.assertFalse(result.success)
         self.assertEqual(client.writes, [])
 
@@ -689,7 +692,7 @@ class TestApiRequest(WriteTestCase):
         result = rock_build.api_request(
             {"request": {"method": "POST", "endpoint": "GroupMemberRequirements",
                          "body": {"GroupMemberId": 88, "GroupRequirementId": 4}}},
-            client, CATALOG)
+            client)
         self.assertSucceeded(result)
         self.assertEqual(client.only_write(),
                          {"method": "POST", "endpoint": "GroupMemberRequirements",
@@ -701,7 +704,7 @@ class TestApiRequest(WriteTestCase):
         result = rock_build.api_request(
             {"request": {"method": "POST", "endpoint": "Groups/AttributeValue/31",
                          "params": {"attributeKey": "K", "attributeValue": "V"}}},
-            client, CATALOG)
+            client)
         self.assertSucceeded(result)
         self.assertEqual(client.only_write()["params"],
                          {"attributeKey": "K", "attributeValue": "V"})
@@ -710,7 +713,7 @@ class TestApiRequest(WriteTestCase):
         client = FakeClient()
         result = rock_build.api_request(
             {"request": {"method": "PATCH", "endpoint": "Groups/31",
-                         "body": {"Name": "Renamed"}}}, client, CATALOG)
+                         "body": {"Name": "Renamed"}}}, client)
         self.assertSucceeded(result)
         self.assertEqual(client.only_write()["method"], "PATCH")
 
@@ -720,7 +723,7 @@ class TestApiRequest(WriteTestCase):
         client = FakeClient()
         result = rock_build.api_request(
             {"request": {"method": "PUT", "endpoint": "Groups/31",
-                         "body": {"Name": "Renamed"}}}, client, CATALOG)
+                         "body": {"Name": "Renamed"}}}, client)
         self.assertFalse(result.success)
         self.assertEqual(client.writes, [])
         self.assertIn("full_replace", result.failures[0]["error"])
@@ -731,21 +734,21 @@ class TestApiRequest(WriteTestCase):
             {"request": {"method": "PUT", "endpoint": "Groups/31", "full_replace": True,
                          "body": {"Id": 31, "Name": "Renamed", "GroupTypeId": 25,
                                   "Guid": "0000", "CreatedDateTime": "2020-01-01"}}},
-            client, CATALOG)
+            client)
         self.assertSucceeded(result)
         self.assertEqual(client.only_write()["method"], "PUT")
 
     def test_a_delete_needs_no_body(self):
         client = FakeClient()
         result = rock_build.api_request(
-            {"request": {"method": "DELETE", "endpoint": "GroupSyncs/12"}}, client, CATALOG)
+            {"request": {"method": "DELETE", "endpoint": "GroupSyncs/12"}}, client)
         self.assertSucceeded(result)
         self.assertEqual(client.only_write()["method"], "DELETE")
 
     def test_an_unknown_method_is_refused(self):
         client = FakeClient()
         result = rock_build.api_request(
-            {"request": {"method": "TRACE", "endpoint": "Groups/31"}}, client, CATALOG)
+            {"request": {"method": "TRACE", "endpoint": "Groups/31"}}, client)
         self.assertFalse(result.success)
         self.assertEqual(client.calls, [])
 
@@ -755,7 +758,7 @@ class TestApiRequest(WriteTestCase):
                          "../../etc/passwd", "Groups/../../x"):
             result = rock_build.api_request(
                 {"request": {"method": "POST", "endpoint": endpoint, "body": {}}},
-                client, CATALOG)
+                client)
             self.assertFalse(result.success, endpoint)
         self.assertEqual(client.calls, [])
 
@@ -765,7 +768,7 @@ class TestApiRequest(WriteTestCase):
         for body in (None, {}):
             result = rock_build.api_request(
                 {"request": {"method": "PATCH", "endpoint": "Groups/31", "body": body}},
-                client, CATALOG)
+                client)
             self.assertFalse(result.success, repr(body))
         self.assertEqual(client.writes, [])
 
@@ -775,7 +778,7 @@ class TestApiRequest(WriteTestCase):
         client = FakeClient()
         result = rock_build.api_request(
             {"request": {"method": "PUT", "endpoint": "Groups/31", "full_replace": True}},
-            client, CATALOG)
+            client)
         self.assertFalse(result.success)
         self.assertEqual(client.writes, [])
 
@@ -785,7 +788,7 @@ class TestApiRequest(WriteTestCase):
         client = FakeClient()
         for endpoint in ("Groups/%2e%2e/%2e%2e/x", "Groups/..%2fx", "Groups/%2e%2e"):
             result = rock_build.api_request(
-                {"request": {"method": "DELETE", "endpoint": endpoint}}, client, CATALOG)
+                {"request": {"method": "DELETE", "endpoint": endpoint}}, client)
             self.assertFalse(result.success, endpoint)
         self.assertEqual(client.calls, [])
 
@@ -793,7 +796,7 @@ class TestApiRequest(WriteTestCase):
         client = FakeClient(responses={"Groups/31": {"Id": 31, "Name": "Before"}})
         result = rock_build.api_request(
             {"request": {"method": "PUT", "endpoint": "Groups/31", "full_replace": True,
-                         "body": {"Id": 31, "Name": "After"}}}, client, CATALOG)
+                         "body": {"Id": 31, "Name": "After"}}}, client)
         self.assertSucceeded(result)
         saved = sorted(rock_paths.SNAPSHOTS.glob("Groups-31-*.json"))
         self.assertTrue(saved, "a PUT must leave the previous entity on disk")
@@ -805,13 +808,13 @@ class TestApiRequest(WriteTestCase):
         client = FakeClient(fail_on={("GET", "Groups/31")})
         result = rock_build.api_request(
             {"request": {"method": "PUT", "endpoint": "Groups/31", "full_replace": True,
-                         "body": {"Id": 31, "Name": "After"}}}, client, CATALOG)
+                         "body": {"Id": 31, "Name": "After"}}}, client)
         self.assertFalse(result.success)
         self.assertEqual(client.writes, [])
 
     def test_a_missing_endpoint_is_refused(self):
         client = FakeClient()
-        result = rock_build.api_request({"request": {"method": "POST"}}, client, CATALOG)
+        result = rock_build.api_request({"request": {"method": "POST"}}, client)
         self.assertFalse(result.success)
 
 
@@ -952,6 +955,47 @@ class TestPlanContract(WriteTestCase):
         self.assertIn("modification.role", problems[0])
 
 
+class TestTheCatalogGate(WriteTestCase):
+    """Only the operations that resolve a name need the catalog cache.
+
+    Five of the nineteen do. All nineteen took a `catalog` argument, and the
+    five were also written out by hand beside the operation table, where the
+    list could disagree with the handlers in either direction: keep blocking an
+    operation that had stopped resolving names, or hand no cache to one that had
+    started."""
+
+    def setUp(self):
+        os.environ["ROCK_ALLOW_WRITES"] = "1"
+
+    def test_an_operation_that_resolves_nothing_runs_without_a_catalog(self):
+        client = FakeClient()
+        result = rock_build.run_plan(
+            {"operation": "update_group",
+             "modification": {"group_id": 312, "updates": {"name": "Ushers"}}},
+            lambda: client, None)
+        self.assertSucceeded(result)
+        self.assertEqual(client.only_write()["endpoint"], "Groups/312")
+
+    def test_an_operation_that_resolves_a_name_is_refused_without_one(self):
+        result = rock_build.run_plan(
+            {"operation": "add_action"},
+            lambda: self.fail("connected with no catalog to resolve against"), None)
+        self.assertFalse(result.success)
+        self.assertIn("no catalog", result.failures[0]["error"])
+
+    def test_no_handler_declares_a_catalog_it_never_reads(self):
+        """The signature is the declaration, so an unread argument widens the gate."""
+        for name, handler in rock_build.OPERATIONS.items():
+            if "catalog" not in inspect.signature(handler).parameters:
+                continue
+            tree = ast.parse(textwrap.dedent(inspect.getsource(handler)))
+            read = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+            with self.subTest(operation=name):
+                self.assertIn("catalog", read,
+                              f"{name} takes a catalog it never reads, so the gate "
+                              "asks for a cache it has no use for")
+
+
 class TestFieldMapsAreClosed(WriteTestCase):
     """An unrecognised field is refused, not forwarded to Rock verbatim.
 
@@ -1051,7 +1095,7 @@ class TestReportingHappensAtTheBoundary(WriteTestCase):
     def test_a_handler_called_directly_prints_nothing(self):
         buffer = io.StringIO()
         with redirect_stdout(buffer):
-            result = rock_build.update_group(self.UPDATE, FakeClient(), {})
+            result = rock_build.update_group(self.UPDATE, FakeClient())
         self.assertSucceeded(result)
         self.assertEqual(buffer.getvalue(), "",
                          "printing is the boundary's job, not the handler's")
