@@ -21,6 +21,7 @@ Run:  python3 -m unittest discover -s tests
 """
 
 import ast
+import copy
 import inspect
 import io
 import os
@@ -530,6 +531,483 @@ class TestGroupOperations(WriteTestCase):
                               "data_view": "No Such View"}}, client)
         self.assertFalse(result.success)
         self.assertEqual(client.writes, [])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The six operations nothing tested
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCreateWorkflow(WriteTestCase):
+    """The largest plan this runtime accepts, asserted request by request.
+
+    A workflow is six entity types deep -- type, attribute, activity, action,
+    form, form field -- and all but the first carry an id from the one above.
+    Nothing covered it, so nothing said which of those ids has to be right, and
+    the attribute-value route ADR 0022 found dead had been dead here longest.
+    """
+
+    PLAN = {"workflow": {
+        "name": "Facilities Request",
+        "description": "Ask the building team for something",
+        "attributes": [{"key": "RequestDetail", "name": "What is needed"}],
+        "activities": [{"name": "Intake", "actions": [{
+            "name": "Record the detail",
+            "action_type": "Set Attribute Value",
+            "settings": {"Value": "pending"},
+            "form": {"header": "Tell us", "attributes": ["RequestDetail"]},
+        }]}],
+    }}
+
+    def build(self, plan=None, **responses):
+        """Run the operation against a Rock that names its WorkflowType entity."""
+        canned = {"EntityTypes": [{"Id": 113}]}
+        canned.update(responses)
+        client = FakeClient(responses=canned)
+        return client, rock_build.create_workflow(plan or self.PLAN, client, CATALOG)
+
+    def variant(self):
+        """A copy of the plan a test may edit without editing the others'."""
+        return copy.deepcopy(self.PLAN)
+
+    def test_every_entity_in_the_plan_is_posted_in_dependency_order(self):
+        """Each POST needs the id of the one before it, so the order is the shape.
+
+        The ids are the fake's, counting from 1001, which is what makes the
+        attribute-value endpoint below readable: it names the action created two
+        requests earlier.
+        """
+        client, result = self.build()
+        self.assertSucceeded(result)
+        self.assertEqual([c["endpoint"] for c in client.writes], [
+            "WorkflowTypes",
+            "Attributes",
+            "WorkflowActivityTypes",
+            "WorkflowActionTypes",
+            "WorkflowActionTypes/AttributeValue/1004",
+            "WorkflowActionForms",
+            "WorkflowActionFormAttributes",
+        ])
+        self.assertNoPut(client)
+
+    def test_the_workflow_type_carries_the_defaults_a_plan_leaves_out(self):
+        client, result = self.build()
+        self.assertSucceeded(result)
+        self.assertEqual(client.writes[0]["data"], {
+            "Name": "Facilities Request",
+            "Description": "Ask the building team for something",
+            "IsActive": True,
+            "IsPersisted": True,
+            "WorkTerm": "Workflow",
+            "ProcessingIntervalSeconds": None,
+        })
+
+    def test_an_attribute_is_qualified_to_the_workflow_just_created(self):
+        """These two columns are the whole reason the attribute is on this type.
+
+        `EntityTypeQualifierValue` is a string column in Rock, so the id goes in
+        as text. The pair says: an Attribute of WorkflowType, where the
+        WorkflowTypeId is this one.
+        """
+        client, result = self.build()
+        self.assertSucceeded(result)
+        attribute = client.writes[1]["data"]
+        self.assertEqual(attribute["EntityTypeId"], 113)
+        self.assertEqual(attribute["EntityTypeQualifierColumn"], "WorkflowTypeId")
+        self.assertEqual(attribute["EntityTypeQualifierValue"], "1001")
+        self.assertEqual(attribute["FieldTypeId"], 1, "Text, out of the catalog")
+        self.assertEqual(attribute["Name"], "What is needed")
+
+    def test_an_attribute_with_no_name_is_named_by_its_key(self):
+        plan = self.variant()
+        plan["workflow"]["attributes"] = [{"key": "RequestDetail"}]
+        client, result = self.build(plan)
+        self.assertSucceeded(result)
+        self.assertEqual(client.writes[1]["data"]["Name"], "RequestDetail")
+
+    def test_the_first_activity_starts_with_the_workflow_and_the_next_does_not(self):
+        """A second activity activated with the workflow runs beside the first.
+
+        Rock starts every activity whose `IsActivatedWithWorkflow` is set, so a
+        plan listing three steps in order gets three steps at once. Only the
+        first is activated here; the rest wait to be activated by an action.
+        """
+        plan = self.variant()
+        plan["workflow"]["activities"].append({"name": "Approval"})
+        client, result = self.build(plan)
+        self.assertSucceeded(result)
+        activities = [c["data"] for c in client.writes
+                      if c["endpoint"] == "WorkflowActivityTypes"]
+        self.assertEqual([a["Name"] for a in activities], ["Intake", "Approval"])
+        self.assertEqual([a["IsActivatedWithWorkflow"] for a in activities],
+                         [True, False])
+        self.assertEqual([a["Order"] for a in activities], [0, 1])
+        self.assertEqual([a["WorkflowTypeId"] for a in activities], [1001, 1001])
+
+    def test_the_action_names_its_activity_and_its_component(self):
+        client, result = self.build()
+        self.assertSucceeded(result)
+        action = next(c["data"] for c in client.writes
+                      if c["endpoint"] == "WorkflowActionTypes")
+        self.assertEqual(action, {
+            "ActivityTypeId": 1003,
+            "Name": "Record the detail",
+            "EntityTypeId": 501,
+            "Order": 0,
+            "IsActionCompletedOnSuccess": True,
+            "IsActivityCompletedOnSuccess": False,
+        })
+
+    def test_action_settings_go_through_the_query_string_route(self):
+        """The write ADR 0022 found 404ing, asserted at the site it came from.
+
+        Every workflow this plugin built before that fix had unconfigured
+        actions, and the report said the workflow was created.
+        """
+        client, result = self.build()
+        self.assertSucceeded(result)
+        setting = next(c for c in client.writes if "AttributeValue" in c["endpoint"])
+        self.assertEqual(setting["method"], "POST")
+        self.assertEqual(setting["endpoint"], "WorkflowActionTypes/AttributeValue/1004")
+        self.assertEqual(setting["params"], {"attributeKey": "Value",
+                                            "attributeValue": "pending"})
+        self.assertIsNone(setting["data"],
+                          "a body makes Rock match the OData route and 404")
+
+    def test_a_form_field_points_at_the_attribute_the_plan_created(self):
+        """A form field is a join row, and both of its ids come from this plan."""
+        client, result = self.build()
+        self.assertSucceeded(result)
+        form = next(c["data"] for c in client.writes
+                    if c["endpoint"] == "WorkflowActionForms")
+        self.assertEqual(form["WorkflowActionTypeId"], 1004)
+        self.assertEqual(form["Header"], "Tell us")
+        field = client.writes[-1]["data"]
+        self.assertEqual(field["WorkflowActionFormId"], 1006)
+        self.assertEqual(field["AttributeId"], 1002)
+        self.assertEqual(field["Order"], 0)
+
+    def test_an_action_with_no_form_posts_no_form(self):
+        plan = self.variant()
+        del plan["workflow"]["activities"][0]["actions"][0]["form"]
+        client, result = self.build(plan)
+        self.assertSucceeded(result)
+        self.assertEqual([c for c in client.writes if "Form" in c["endpoint"]], [])
+
+    def test_a_category_name_is_resolved_into_the_workflow(self):
+        plan = self.variant()
+        plan["workflow"]["category"] = "Facilities"
+        client, result = self.build(plan, Categories=[{"Id": 9}])
+        self.assertSucceeded(result)
+        self.assertEqual(client.writes[0]["data"]["CategoryId"], 9)
+
+    def test_a_workflow_with_no_category_sends_no_category_column(self):
+        client, result = self.build()
+        self.assertSucceeded(result)
+        self.assertNotIn("CategoryId", client.writes[0]["data"])
+
+    def test_an_unknown_field_type_stops_before_the_attribute_is_posted(self):
+        plan = self.variant()
+        plan["workflow"]["attributes"][0]["field_type"] = "Interpretive Dance"
+        client, result = self.build(plan)
+        self.assertFalse(result.success)
+        self.assertEqual([c["endpoint"] for c in client.writes], ["WorkflowTypes"],
+                         "the workflow type landed; nothing under it did")
+        self.assertIn("Interpretive Dance", result.failures[0]["error"])
+
+    def test_an_unknown_action_type_stops_with_the_activity_already_there(self):
+        """What landed before the failure is in Rock, and the report says so.
+
+        This is the reason a handler records rather than raising its way out: the
+        activity exists now, and somebody has to be told which three things to go
+        and look at.
+        """
+        plan = self.variant()
+        plan["workflow"]["activities"][0]["actions"][0]["action_type"] = "Send Telegram"
+        client, result = self.build(plan)
+        self.assertFalse(result.success)
+        self.assertEqual([c["endpoint"] for c in client.writes],
+                         ["WorkflowTypes", "Attributes", "WorkflowActivityTypes"])
+        self.assertEqual([c["type"] for c in result.created],
+                         ["WorkflowType", "Attribute", "ActivityType"])
+
+    def test_a_setting_rock_refuses_stops_the_plan_at_the_action(self):
+        """An action that exists and is not configured does nothing in Rock."""
+        client = FakeClient(responses={"EntityTypes": [{"Id": 113}]},
+                            fail_on={"WorkflowActionTypes/AttributeValue/1004"})
+        result = self.assertStopped(
+            rock_build.create_workflow, self.PLAN, client, CATALOG)
+        self.assertFalse(result.success)
+        self.assertEqual(result.failures[0]["type"], "Settings")
+        self.assertEqual([c for c in client.writes if "Form" in c["endpoint"]], [],
+                         "the form is past the failure and must not be reached")
+
+
+class TestCreatePage(WriteTestCase):
+    """A page, the route that reaches it, and the blocks in its zones."""
+
+    PLAN = {"page": {
+        "name": "Facilities Requests",
+        "title": "Requests",
+        "layout": "Full Width",
+        "parent_page": "/admin",
+        "route": "/facilities/requests",
+        "blocks": [
+            {"name": "Request list", "block_type": "Group Detail",
+             "settings": {"EnableDebug": "false"}},
+            {"name": "Sidebar note", "block_type": "Group Detail",
+             "zone": "Sidebar1"},
+        ],
+    }}
+
+    def build(self, plan=None, **responses):
+        canned = {"PageRoutes": [{"PageId": 12}]}
+        canned.update(responses)
+        client = FakeClient(responses=canned)
+        return client, rock_build.create_page(plan or self.PLAN, client, CATALOG)
+
+    def variant(self):
+        return copy.deepcopy(self.PLAN)
+
+    def test_the_page_carries_the_layout_and_the_parent_it_resolved(self):
+        """The layout comes from the catalog and the parent from a route lookup.
+
+        Rock has no name lookup for a layout, which is why the catalog exists. A
+        parent named by its route is one GET, because a route is the thing a
+        person can actually see in a URL.
+        """
+        client, result = self.build()
+        self.assertSucceeded(result)
+        self.assertEqual(client.writes[0]["endpoint"], "Pages")
+        self.assertEqual(client.writes[0]["data"], {
+            "InternalName": "Facilities Requests",
+            "PageTitle": "Requests",
+            "LayoutId": 5,
+            "DisplayInNavWhen": 2,
+            "ParentPageId": 12,
+            "IsSystem": False,
+        })
+        self.assertNoPut(client)
+
+    def test_the_route_loses_the_leading_slash_rock_does_not_store(self):
+        client, result = self.build()
+        self.assertSucceeded(result)
+        route = next(c for c in client.writes if c["endpoint"] == "PageRoutes")
+        self.assertEqual(route["data"], {"PageId": 1001,
+                                         "Route": "facilities/requests"})
+
+    def test_a_page_with_no_route_posts_no_route(self):
+        plan = self.variant()
+        del plan["page"]["route"]
+        client, result = self.build(plan)
+        self.assertSucceeded(result)
+        self.assertEqual([c for c in client.writes
+                          if c["endpoint"] == "PageRoutes"], [])
+
+    def test_each_block_lands_in_its_zone_in_plan_order(self):
+        client, result = self.build()
+        self.assertSucceeded(result)
+        blocks = [c["data"] for c in client.writes if c["endpoint"] == "Blocks"]
+        self.assertEqual([b["Zone"] for b in blocks], ["Main", "Sidebar1"],
+                         "Main is the default zone")
+        self.assertEqual([b["Order"] for b in blocks], [0, 1])
+        self.assertEqual([b["PageId"] for b in blocks], [1001, 1001])
+        self.assertEqual([b["BlockTypeId"] for b in blocks], [77, 77])
+
+    def test_block_settings_are_applied_to_the_block_just_created(self):
+        client, result = self.build()
+        self.assertSucceeded(result)
+        self.assertEqual([c["endpoint"] for c in client.writes], [
+            "Pages", "PageRoutes", "Blocks", "Blocks/AttributeValue/1003", "Blocks"])
+
+    def test_a_block_type_that_does_not_resolve_stops_with_the_page_created(self):
+        plan = self.variant()
+        plan["page"]["blocks"][0]["block_type"] = "No Such Block"
+        client = FakeClient(responses={"PageRoutes": [{"PageId": 12}]})
+        result = self.assertStopped(rock_build.create_page, plan, client, CATALOG)
+        self.assertFalse(result.success)
+        self.assertEqual([c["endpoint"] for c in client.writes],
+                         ["Pages", "PageRoutes"])
+
+    def test_a_page_needs_a_parent_and_the_failure_names_both_ways_to_give_one(self):
+        """Rock hangs every page off another one, so this is a plan problem.
+
+        It is caught before the page is posted, which is the difference between
+        a plan to fix and an orphan page to go and find.
+        """
+        plan = self.variant()
+        del plan["page"]["parent_page"]
+        client = FakeClient()
+        result = self.assertStopped(rock_build.create_page, plan, client, CATALOG)
+        self.assertEqual(client.writes, [], "nothing should be created")
+        self.assertIn("parent_page_id", result.failures[0]["error"])
+        self.assertIn("parent_page", result.failures[0]["error"])
+
+
+class TestAddingToWhatIsAlreadyThere(WriteTestCase):
+    """`add_workflow_action` and `add_page_block` -- an Order Rock has to pick.
+
+    Both add one child to a parent that already has children, so neither can
+    count from zero. They read the highest Order in the collection they are
+    joining and take the next one, and the collection is the interesting part:
+    an action's is its activity, a block's is one zone of one page.
+    """
+
+    def action_plan(self, **over):
+        action = {"name": "Send the email", "action_type": "Set Attribute Value"}
+        action.update(over)
+        return {"modification": {"activity_type_id": 44, "action": action}}
+
+    def block_plan(self, **over):
+        block = {"name": "Notes", "block_type": "Group Detail"}
+        block.update(over)
+        return {"modification": {"page_id": 88, "block": block}}
+
+    def test_an_action_lands_after_the_last_one_in_its_activity(self):
+        client = FakeClient(responses={"WorkflowActionTypes": [{"Order": 4}]})
+        result = rock_build.add_workflow_action(self.action_plan(), client, CATALOG)
+        self.assertSucceeded(result)
+        lookup = client.calls[0]
+        self.assertEqual(lookup["params"]["$filter"], "ActivityTypeId eq 44")
+        self.assertEqual(lookup["params"]["$orderby"], "Order desc")
+        self.assertEqual(client.only_write()["data"], {
+            "ActivityTypeId": 44,
+            "Name": "Send the email",
+            "EntityTypeId": 501,
+            "Order": 5,
+            "IsActionCompletedOnSuccess": True,
+            "IsActivityCompletedOnSuccess": False,
+        })
+        self.assertNoPut(client)
+
+    def test_an_empty_activity_starts_at_zero(self):
+        client = FakeClient()
+        result = rock_build.add_workflow_action(self.action_plan(), client, CATALOG)
+        self.assertSucceeded(result)
+        self.assertEqual(client.only_write()["data"]["Order"], 0)
+
+    def test_an_order_the_plan_states_is_the_one_that_is_sent(self):
+        client = FakeClient(responses={"WorkflowActionTypes": [{"Order": 4}]})
+        result = rock_build.add_workflow_action(
+            self.action_plan(order=2), client, CATALOG)
+        self.assertSucceeded(result)
+        self.assertEqual(client.only_write()["data"]["Order"], 2)
+
+    def test_an_unknown_action_type_writes_nothing(self):
+        client = FakeClient()
+        result = rock_build.add_workflow_action(
+            self.action_plan(action_type="Send Telegram"), client, CATALOG)
+        self.assertFalse(result.success)
+        self.assertEqual(client.writes, [])
+
+    def test_a_new_actions_settings_are_applied_to_it(self):
+        client = FakeClient()
+        result = rock_build.add_workflow_action(
+            self.action_plan(settings={"Body": "hello"}), client, CATALOG)
+        self.assertSucceeded(result)
+        self.assertEqual([c["endpoint"] for c in client.writes],
+                         ["WorkflowActionTypes",
+                          "WorkflowActionTypes/AttributeValue/1001"])
+
+    def test_a_blocks_order_counts_only_that_page_and_that_zone(self):
+        """Zones are ordered separately, so the filter has to name both.
+
+        A block joining Sidebar1 on a page whose Main zone holds six blocks goes
+        second in Sidebar1, not seventh.
+        """
+        client = FakeClient(responses={"Blocks": [{"Order": 0}]})
+        result = rock_build.add_page_block(
+            self.block_plan(zone="Sidebar1"), client, CATALOG)
+        self.assertSucceeded(result)
+        self.assertEqual(client.calls[0]["params"]["$filter"],
+                         "PageId eq 88 and Zone eq 'Sidebar1'")
+        self.assertEqual(client.only_write()["data"], {
+            "PageId": 88,
+            "BlockTypeId": 77,
+            "Zone": "Sidebar1",
+            "Name": "Notes",
+            "Order": 1,
+            "IsSystem": False,
+        })
+        self.assertNoPut(client)
+
+    def test_an_apostrophe_in_a_zone_name_cannot_close_the_filter_early(self):
+        client = FakeClient()
+        result = rock_build.add_page_block(
+            self.block_plan(zone="Bob's Zone"), client, CATALOG)
+        self.assertSucceeded(result)
+        self.assertEqual(client.calls[0]["params"]["$filter"],
+                         "PageId eq 88 and Zone eq 'Bob''s Zone'")
+
+    def test_a_block_with_no_zone_joins_main(self):
+        client = FakeClient()
+        result = rock_build.add_page_block(self.block_plan(), client, CATALOG)
+        self.assertSucceeded(result)
+        self.assertEqual(client.only_write()["data"]["Zone"], "Main")
+
+    def test_an_unresolvable_block_type_writes_nothing(self):
+        client = FakeClient()
+        result = self.assertStopped(
+            rock_build.add_page_block,
+            self.block_plan(block_type="No Such Block"), client, CATALOG)
+        self.assertFalse(result.success)
+        self.assertEqual(client.writes, [])
+
+
+class TestDeletingWhatIsThere(WriteTestCase):
+    """The two deletes -- one action, or an activity and everything under it."""
+
+    def test_deleting_an_action_sends_one_delete(self):
+        client = FakeClient()
+        result = rock_build.delete_action(
+            {"modification": {"action_type_id": 51}}, client)
+        self.assertSucceeded(result)
+        self.assertEqual(client.only_write(),
+                         {"method": "DELETE", "endpoint": "WorkflowActionTypes/51",
+                          "params": None, "data": None})
+
+    def test_an_activity_loses_its_actions_before_itself(self):
+        """The order is not tidiness. Rock's foreign key refuses it reversed.
+
+        An action row points at its activity, so deleting the activity first is
+        a constraint violation, and the operator is left with an activity that
+        would not go and no idea which of its actions is holding it.
+        """
+        client = FakeClient(responses={"WorkflowActionTypes": [
+            {"Id": 51, "Name": "First"}, {"Id": 52, "Name": "Second"}]})
+        result = rock_build.delete_activity(
+            {"modification": {"activity_type_id": 7}}, client)
+        self.assertSucceeded(result)
+        self.assertEqual([c["endpoint"] for c in client.writes], [
+            "WorkflowActionTypes/51",
+            "WorkflowActionTypes/52",
+            "WorkflowActivityTypes/7",
+        ])
+        self.assertEqual({c["method"] for c in client.writes}, {"DELETE"})
+        self.assertEqual(client.calls[0]["params"]["$filter"], "ActivityTypeId eq 7")
+
+    def test_an_activity_holding_no_actions_still_goes(self):
+        client = FakeClient()
+        result = rock_build.delete_activity(
+            {"modification": {"activity_type_id": 7}}, client)
+        self.assertSucceeded(result)
+        self.assertEqual(client.only_write()["endpoint"], "WorkflowActivityTypes/7")
+
+    def test_an_action_that_will_not_delete_leaves_the_activity_alone(self):
+        """Deleting the activity anyway would fail on the row that stayed.
+
+        The report names the action by the name it has in Rock, which is the one
+        thing the operator can search for.
+        """
+        client = FakeClient(responses={"WorkflowActionTypes": [
+            {"Id": 51, "Name": "First"}, {"Id": 52, "Name": "Second"}]},
+            fail_on={"WorkflowActionTypes/51"})
+        result = self.assertStopped(
+            rock_build.delete_activity, {"modification": {"activity_type_id": 7}},
+            client)
+        self.assertFalse(result.success)
+        self.assertEqual(result.failures[0]["name"], "First")
+        self.assertEqual([c["endpoint"] for c in client.writes],
+                         ["WorkflowActionTypes/51"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
