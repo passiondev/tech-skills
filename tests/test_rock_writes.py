@@ -29,7 +29,6 @@ from types import ModuleType, SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 ROCK_SCRIPTS = ROOT / "plugins" / "rock" / "runtime" / "scripts"
-BUILD_SCRIPTS = ROOT / "plugins" / "rock-build" / "runtime" / "scripts"
 
 # The runtime logs to $ROCK_HOME on import. Keep that out of the developer's
 # real runtime directory.
@@ -122,9 +121,8 @@ def _session_factory():
 _stub("requests", Session=_session_factory)
 _stub("yaml", safe_load=lambda *a, **k: {})
 
-for _p in (str(ROCK_SCRIPTS), str(BUILD_SCRIPTS)):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+if str(ROCK_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(ROCK_SCRIPTS))
 
 import rock_build            # noqa: E402
 import rock_paths           # noqa: E402
@@ -717,7 +715,7 @@ class TestApiRequest(WriteTestCase):
 
 
 class TestWritePermission(unittest.TestCase):
-    """rock-build's entry point sets ROCK_ALLOW_WRITES; nothing else does."""
+    """rock.sh sets ROCK_ALLOW_WRITES; nothing else does."""
 
     def setUp(self):
         self._saved = os.environ.get("ROCK_ALLOW_WRITES")

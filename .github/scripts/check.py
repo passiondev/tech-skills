@@ -495,7 +495,7 @@ def _passion_env():
 
 @check("write-guard")
 def _write_guard():
-    """Every write in rock_query.py must be listed in WRITE_COMMANDS (ADR 0016)."""
+    """Every write in rock_query.py must be listed in WRITE_COMMANDS (ADRs 0016, 0023)."""
     src = (PLUGINS / "rock" / "runtime" / "scripts" / "rock_query.py").read_text()
 
     m = re.search(r"WRITE_COMMANDS = \{(.*?)\n\}", src, re.S)
@@ -522,7 +522,7 @@ def _write_guard():
     missing = writing_commands - guarded
     if missing:
         fail("rock_query.py", f"these subcommands write but are not in WRITE_COMMANDS: "
-                              f"{sorted(missing)} — a read-only install could reach them")
+                              f"{sorted(missing)} — running the script directly would reach them")
     stale = guarded - set(registered)
     if stale:
         fail("rock_query.py", f"WRITE_COMMANDS lists subcommands that no longer exist: {sorted(stale)}")
@@ -570,7 +570,7 @@ def _rock_write_shapes():
     route; both shapes that look plausible answer "The OData path is invalid."
     The real route binds from the query string.
     """
-    put_is_deliberate = {("plugins/rock-build/runtime/scripts/rock_build.py", "api_request")}
+    put_is_deliberate = {("plugins/rock/runtime/scripts/rock_build.py", "api_request")}
 
     for path in sorted(PLUGINS.rglob("*.py")):
         rel = path.relative_to(ROOT)

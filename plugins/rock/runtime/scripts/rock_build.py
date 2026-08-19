@@ -7,8 +7,8 @@ Usage:
   echo '{"operation": "create_workflow", ...}' | uv run scripts/rock_build.py
   uv run scripts/rock_build.py /tmp/build-plan.json
 
-Reached only through rock-build's rock.sh, which sets ROCK_ALLOW_WRITES; every
-operation here refuses without it (ADR 0016).
+Reached through rock.sh, which sets ROCK_ALLOW_WRITES; every operation here
+refuses without it (ADR 0023).
 
 Partial updates use PATCH, never PUT. RockClient.put explains why at length —
 the short version is that Rock's PUT replaces the whole entity, so a partial
@@ -889,7 +889,7 @@ def create_checkin_area(plan, client, catalog):
 # ─────────────────────────────────────────────────────────────────────────────
 # Groups
 #
-# Group work was the gap that sent people back to older tooling: rock-build
+# Group work was the gap that sent people back to older tooling: this script
 # could create a check-in area, which is a Group, and then had no way to touch
 # a group, its members, or its sync. These are the operations that were
 # missing, not a new abstraction over them.
@@ -1361,17 +1361,17 @@ def snapshot_entity(client, endpoint):
 def require_writes_enabled(operation):
     """Refuse to run unless ROCK_ALLOW_WRITES is set.
 
-    rock-build's rock.sh sets it and is the only documented way in. Nothing
-    else sets it — see ADR 0016. The check matters because both plugins install
-    into the same runtime directory, so this script sits on disk beside the
-    read-only ones and could otherwise be run by hand.
+    rock.sh sets it and is the only way in. Nothing else sets it — see ADR
+    0023. The check matters because the runtime is copied to a directory
+    outside the plugin, so this script sits on disk beside the read-only ones
+    and could otherwise be run by hand.
     """
     if os.environ.get("ROCK_ALLOW_WRITES") == "1":
         return
     print(
         f"Refusing to run '{operation}': everything in this script changes Rock, "
         f"and ROCK_ALLOW_WRITES is not set.\n"
-        f"Run it through the rock-build plugin's rock.sh, which sets it.",
+        f"Run it as `rock.sh build <plan.json>`, which sets it.",
         file=sys.stderr,
     )
     sys.exit(2)

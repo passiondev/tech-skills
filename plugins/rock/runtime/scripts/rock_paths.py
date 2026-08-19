@@ -3,9 +3,11 @@
 Everything mutable — the catalog cache, the log, screenshots, the virtualenv —
 lives under one fixed directory in the user's home. It cannot live beside the
 scripts: ``${CLAUDE_PLUGIN_ROOT}`` is replaced wholesale on every plugin update.
-It cannot live in ``${CLAUDE_PLUGIN_DATA}`` either, because ``rock`` and
-``rock-build`` are two plugins with two data directories that must share one
-virtualenv and one catalog. See ADR 0016.
+``${CLAUDE_PLUGIN_DATA}`` survives an update, and the runtime lived outside it
+originally because two Rock plugins had two of them and needed one virtualenv
+and one catalog between them. There is one plugin now (ADR 0023), and the path
+stays where it is: it is where every machine's virtualenv, catalog and log
+already sit. See ADRs 0016 and 0023.
 
 Override with ROCK_HOME when you need a second instance's state kept apart.
 """

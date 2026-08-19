@@ -32,6 +32,11 @@ manifest() {
 
 mkdir -p "$ROCK_HOME"
 
+# rock-build used to install rock_build.py separately and stamp it here. One
+# plugin ships the whole runtime now (ADR 0023), so the stamp is dead weight
+# that would outlive every upgrade if nothing removed it.
+rm -f "$ROCK_HOME/.installed-build"
+
 # Asking for the browser is sticky, and it has to be part of the stamp. The
 # manifest covers shipped files only, so ROCK_WITH_BROWSER=1 was invisible to
 # the comparison below and the documented opt-in no-opped on every machine that

@@ -10,7 +10,7 @@ analytics            general dev      rock       (plan added by 0018)
 service-and-support  general          rock
 ```
 
-*[0013](0013-rock-splits-into-read-and-write.md) later split `rock` in two, adding `rock-build` to `local-engineering` only. That is the one change to this table.*
+*[0013](0013-rock-splits-into-read-and-write.md) later split `rock` in two, adding `rock-build` to `local-engineering` only; [0023](0023-rock-is-one-plugin-with-one-skill.md) merged it back, so the table is again exactly as drawn. Its consequence is that Analytics and Local Engineering now install the same five plugins — write access to Rock was the only thing between them.*
 
 `general` depends on `jira`, so every department gets Jira without naming it.
 

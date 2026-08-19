@@ -358,7 +358,7 @@ has not been tested yet; the plugin count was already confirmed in step 3.
 
 - If they gave a project key, run `/jira:sprint` and show them their own queue.
 - If they did not, ask for any ticket key they can think of and fetch it.
-- For Rock departments, `/rock:status` checks the connection. The first Rock
+- For Rock departments, `/rock:rock` checks the connection. The first Rock
   command installs a small Python runtime into `~/.claude/passion-rock`, which
   takes a few seconds once and is silent afterwards. Say so before it happens.
 

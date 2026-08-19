@@ -1633,10 +1633,11 @@ def cmd_exception_clear(args, client):
     print(f"Deleted {deleted}/{len(exceptions)} exceptions." + (f" ({errors} errors)" if errors else ""))
 
 
-# This script is shipped by the read-only `rock` plugin, but four of its
-# subcommands write to Rock. The `rock-build` plugin sets ROCK_ALLOW_WRITES=1;
-# nothing else does, so a read-only install cannot reach them even though the
-# code is on disk. See ADR 0016.
+# Four of this script's subcommands write to Rock. `rock.sh` sets
+# ROCK_ALLOW_WRITES=1 and nothing else does, so the copy of this script sitting
+# in $ROCK_HOME cannot be run by hand into a write. The guard used to mark the
+# boundary between two plugins; there is one now, and what it marks is the
+# boundary between the entry point and everything else. See ADR 0023.
 WRITE_COMMANDS = {
     "person-create": "creates a person record",
     "person-update": "modifies a person record",
@@ -1649,9 +1650,10 @@ def _guard_writes(command):
     if command not in WRITE_COMMANDS or os.environ.get("ROCK_ALLOW_WRITES") == "1":
         return
     print(
-        f"Refusing to run '{command}': it {WRITE_COMMANDS[command]}, and this is the "
-        f"read-only Rock plugin.\n"
-        f"Changing Rock needs the 'rock-build' plugin, which your department may not have.",
+        f"Refusing to run '{command}': it {WRITE_COMMANDS[command]}, and it was not "
+        f"reached through rock.sh.\n"
+        f"Run it as `rock.sh query {command} ...` — the entry point is what logs the "
+        f"call and enables the write.",
         file=sys.stderr,
     )
     sys.exit(2)

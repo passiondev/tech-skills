@@ -1,5 +1,7 @@
 # The Rock runtime lives at a fixed path, and the read/write boundary is enforced in code
 
+> **The path stands; the boundary is superseded by [0023](0023-rock-is-one-plugin-with-one-skill.md).** `~/.claude/passion-rock` is still where the runtime lives, for the reasons below. But there is one Rock plugin now, so `ROCK_ALLOW_WRITES` no longer separates two plugins — it separates `rock.sh` from anything that runs the scripts directly. The guard and the CI check both survive with that smaller meaning.
+
 Both Rock plugins install their Python into `~/.claude/passion-rock`, overridable with `ROCK_HOME`. One virtualenv, one catalog, one log, one screenshots directory, shared by `rock` and `rock-build`. And `rock_query.py` refuses its four write subcommands unless `ROCK_ALLOW_WRITES=1`, which only `rock-build` sets.
 
 Two corrections to earlier decisions, both found while porting the code.
@@ -40,6 +42,6 @@ The four commands stay where they are — they are query-shaped, they share the 
 
 The guard is an environment variable, so anything that can set the environment can pass it. It stops accidents and casual asking, not a determined person, and [0013](0013-rock-splits-into-read-and-write.md) already notes that Rock's own credentials are one account with one permission set. The real limit on what someone can change in Rock is that account's permissions, not this.
 
-`ROCK_ALLOW_WRITES` has to be set by every `rock-build` skill that calls a guarded command, and nothing fails loudly if a new skill forgets — the command refuses, which reads as a bug rather than an omission. The four command names are listed in one dict at the top of `rock_query.py`; a fifth write command added to that script without being added to the dict is unguarded and silent. CI should compare that dict against the script's actual write calls.
+`ROCK_ALLOW_WRITES` has to be set by every `rock-build` skill that calls a guarded command, and nothing fails loudly if a new skill forgets — the command refuses, which reads as a bug rather than an omission. The four command names are listed in one dict at the top of `rock_query.py`; a fifth write command added to that script without being added to the dict is unguarded and silent. CI should compare that dict against the script's actual write calls. *It does — `write-guard` in `.github/scripts/check.py`. And the first half stopped being a risk with [0023](0023-rock-is-one-plugin-with-one-skill.md): one entry point sets the variable for every command, so no skill can forget to.*
 
 Two bootstraps run per Rock session in the worst case, one chaining into the other. Both are checksum-gated no-ops after the first run — 0.05s — so the cost is a subprocess, not an install.

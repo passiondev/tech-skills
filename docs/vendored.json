@@ -1,10 +1,10 @@
 {
-  "note": "Provenance for everything in this repo that came from somewhere else. `upstream` names where it originates; `via` is the commit it was taken from. `upstream_name` is the directory it occupies upstream when that differs from ours — the drift job resolves by it. `diverged` means our copy differs from upstream on purpose and says why — the weekly drift job flags a marker that no longer matches reality. `note` is history that is not a divergence. `authored_here` marks files written for this marketplace rather than copied. Refresh against upstream by diffing these paths. See ADR 0011.",
+  "note": "Provenance for everything in this repo that came from somewhere else. `upstream` names where it originates; `via` is the commit it was taken from. `upstream_name` is the directory it occupies upstream when that differs from ours \u2014 the drift job resolves by it. `diverged` means our copy differs from upstream on purpose and says why \u2014 the weekly drift job flags a marker that no longer matches reality. `note` is history that is not a divergence. `authored_here` marks files written for this marketplace rather than copied. Refresh against upstream by diffing these paths. See ADR 0011.",
   "upstream_mirror_baseline": "mattpocock/skills @ main (v1.2.0-dev), mirrored by justinpbarnett/ai@e36ec09. Most skills are still at that baseline; the `via` on each entry is authoritative where it differs. Upstream has since regrouped skills/<name> into skills/<category>/<name>, which is why resolution goes through directory name rather than path.",
   "excluded_skills": {
     "ask-matt": "Upstream skill about its own author. Not useful here. See ADR 0007.",
     "contribute": "Upstream OSS contribution flow; forks into ~/dev/. No department does this. See ADR 0014.",
-    "handoff": "Upstream skill for handing a session to another agent. Dropped 2026-08-06 — nothing references it and no department asked for it. See ADR 0018.",
+    "handoff": "Upstream skill for handing a session to another agent. Dropped 2026-08-06 \u2014 nothing references it and no department asked for it. See ADR 0018.",
     "writing-great-skills": "Upstream's guide to writing skills, since renamed writing-for-agents. Dropped 2026-08-06: it served contributors, and contributing is rare enough to read the file in the repo instead of carrying it in everyone's picker. See ADR 0018.",
     "setup-repo": "Upstream's setup-matt-pocock-skills, renamed by ADR 0014. ADR 0015 removed its issue-tracker section once Jira became a given; what remained was a label mapping whose two columns were identical and a doc layout domain-modeling creates lazily anyway. Dropped 2026-08-06. See ADR 0019."
   },
@@ -43,7 +43,7 @@
         "SKILL.md",
         "scripts/hitl-loop.template.sh"
       ],
-      "diverged": "Skill pointers namespaced to `/plugin:skill` — upstream is one flat directory where `/x` resolves; here it does not (CI check `cross-references`)."
+      "diverged": "Skill pointers namespaced to `/plugin:skill` \u2014 upstream is one flat directory where `/x` resolves; here it does not (CI check `cross-references`)."
     },
     "domain-modeling": {
       "plugin": "plan",
@@ -65,7 +65,7 @@
       "files": [
         "SKILL.md"
       ],
-      "diverged": "Skill pointers namespaced to `/plugin:skill` — upstream is one flat directory where `/x` resolves; here it does not (CI check `cross-references`)."
+      "diverged": "Skill pointers namespaced to `/plugin:skill` \u2014 upstream is one flat directory where `/x` resolves; here it does not (CI check `cross-references`)."
     },
     "grill-with-docs": {
       "plugin": "general",
@@ -75,7 +75,7 @@
       "files": [
         "SKILL.md"
       ],
-      "diverged": "Skill pointers namespaced to `/plugin:skill` — upstream is one flat directory where `/x` resolves; here it does not (CI check `cross-references`). The domain-modeling pointer is qualified: Analytics and Service and Support ship `general` without `plan`."
+      "diverged": "Skill pointers namespaced to `/plugin:skill` \u2014 upstream is one flat directory where `/x` resolves; here it does not (CI check `cross-references`). The domain-modeling pointer is qualified: Analytics and Service and Support ship `general` without `plan`."
     },
     "grilling": {
       "plugin": "general",
@@ -106,7 +106,7 @@
       "files": [
         "SKILL.md"
       ],
-      "diverged": "Skill pointers namespaced to `/plugin:skill` — upstream is one flat directory where `/x` resolves; here it does not (CI check `cross-references`)."
+      "diverged": "Skill pointers namespaced to `/plugin:skill` \u2014 upstream is one flat directory where `/x` resolves; here it does not (CI check `cross-references`)."
     },
     "improve-codebase-architecture": {
       "plugin": "dev",
@@ -117,7 +117,7 @@
         "HTML-REPORT.md",
         "SKILL.md"
       ],
-      "diverged": "Skill pointers namespaced to `/plugin:skill` — upstream is one flat directory where `/x` resolves; here it does not (CI check `cross-references`). The domain-modeling pointer is qualified: Analytics ships `dev` without `plan`."
+      "diverged": "Skill pointers namespaced to `/plugin:skill` \u2014 upstream is one flat directory where `/x` resolves; here it does not (CI check `cross-references`). The domain-modeling pointer is qualified: Analytics ships `dev` without `plan`."
     },
     "prototype": {
       "plugin": "dev",
@@ -129,7 +129,7 @@
         "SKILL.md",
         "UI.md"
       ],
-      "note": "Refreshed from upstream 2026-08-05. LOGIC.md now produces one self-contained HTML file with guided walkthroughs instead of a terminal TUI — the reason to take it here, since Ops, Analytics and Service and Support are the people a prototype has to reach."
+      "note": "Refreshed from upstream 2026-08-05. LOGIC.md now produces one self-contained HTML file with guided walkthroughs instead of a terminal TUI \u2014 the reason to take it here, since Ops, Analytics and Service and Support are the people a prototype has to reach."
     },
     "research": {
       "plugin": "general",
@@ -173,7 +173,7 @@
         "RESOURCES-FORMAT.md",
         "SKILL.md"
       ],
-      "diverged": "GLOSSARY-FORMAT.md is orphaned upstream — no pointer to it exists in upstream's SKILL.md. Added the pointer, gave all four pointers an explicit firing condition, and moved the learning-record write trigger from LEARNING-RECORD-FORMAT.md into SKILL.md, which upstream strands behind the pointer it gates."
+      "diverged": "GLOSSARY-FORMAT.md is orphaned upstream \u2014 no pointer to it exists in upstream's SKILL.md. Added the pointer, gave all four pointers an explicit firing condition, and moved the learning-record write trigger from LEARNING-RECORD-FORMAT.md into SKILL.md, which upstream strands behind the pointer it gates."
     },
     "to-spec": {
       "plugin": "plan",
@@ -183,7 +183,7 @@
       "files": [
         "SKILL.md"
       ],
-      "diverged": "Names Jira as the tracker and fetches ticket context with `/jira:ticket` (ADRs 0015, 0019 — the triage roles setup-repo used to hold are inline now). Skill pointers namespaced to `/plugin:skill` — upstream is one flat directory where `/x` resolves; here it does not (CI check `cross-references`). Delivery gated on `/general:to-ste` in flavored mode."
+      "diverged": "Names Jira as the tracker and fetches ticket context with `/jira:ticket` (ADRs 0015, 0019 \u2014 the triage roles setup-repo used to hold are inline now). Skill pointers namespaced to `/plugin:skill` \u2014 upstream is one flat directory where `/x` resolves; here it does not (CI check `cross-references`). Delivery gated on `/general:to-ste` in flavored mode."
     },
     "to-ste": {
       "plugin": "general",
@@ -203,7 +203,7 @@
       "files": [
         "SKILL.md"
       ],
-      "diverged": "Publishes to Jira; the tracker branch collapsed to Jira with a local-files escape (ADR 0015). Skill pointers namespaced to `/plugin:skill` — upstream is one flat directory where `/x` resolves; here it does not (CI check `cross-references`)."
+      "diverged": "Publishes to Jira; the tracker branch collapsed to Jira with a local-files escape (ADR 0015). Skill pointers namespaced to `/plugin:skill` \u2014 upstream is one flat directory where `/x` resolves; here it does not (CI check `cross-references`)."
     },
     "triage": {
       "plugin": "plan",
@@ -215,7 +215,7 @@
         "OUT-OF-SCOPE.md",
         "SKILL.md"
       ],
-      "diverged": "Names Jira; external PRs are out of scope by default, since Passion repos take no external contributors (ADR 0015). Skill pointers namespaced to `/plugin:skill` — upstream is one flat directory where `/x` resolves; here it does not (CI check `cross-references`)."
+      "diverged": "Names Jira; external PRs are out of scope by default, since Passion repos take no external contributors (ADR 0015). Skill pointers namespaced to `/plugin:skill` \u2014 upstream is one flat directory where `/x` resolves; here it does not (CI check `cross-references`)."
     },
     "wayfinder": {
       "plugin": "plan",
@@ -226,7 +226,7 @@
         "MAP-FORMAT.md",
         "SKILL.md"
       ],
-      "diverged": "The map, its children, and blocking edges are Jira issues and Jira issue links (ADR 0015). Skill pointers namespaced to `/plugin:skill` — upstream is one flat directory where `/x` resolves; here it does not (CI check `cross-references`). The prototype pointer is qualified: Ops ships `plan` without `dev`. The map and ticket body formats are disclosed to MAP-FORMAT.md; upstream is a single file."
+      "diverged": "The map, its children, and blocking edges are Jira issues and Jira issue links (ADR 0015). Skill pointers namespaced to `/plugin:skill` \u2014 upstream is one flat directory where `/x` resolves; here it does not (CI check `cross-references`). The prototype pointer is qualified: Ops ships `plan` without `dev`. The map and ticket body formats are disclosed to MAP-FORMAT.md; upstream is a single file."
     },
     "ticket": {
       "plugin": "jira",
@@ -254,105 +254,6 @@
       "diverged": true,
       "notes": "Replaces jira-pull.sh. Rewritten in Python: no jq dependency, no hardcoded project key."
     },
-    "find": {
-      "plugin": "rock",
-      "upstream": "passiondev/rock-tools",
-      "via": "passiondev/rock-tools@9736aa0",
-      "vendored_as": "find",
-      "files": [
-        "SKILL.md"
-      ],
-      "derived_from": ".claude/skills/rock/SKILL.md",
-      "authored_here": true,
-      "notes": "Listing and search commands."
-    },
-    "inspect": {
-      "plugin": "rock",
-      "upstream": "passiondev/rock-tools",
-      "via": "passiondev/rock-tools@9736aa0",
-      "vendored_as": "inspect",
-      "files": [
-        "SKILL.md"
-      ],
-      "derived_from": ".claude/skills/rock/SKILL.md",
-      "authored_here": true,
-      "notes": "Single-entity detail commands."
-    },
-    "data": {
-      "plugin": "rock",
-      "upstream": "passiondev/rock-tools",
-      "via": "passiondev/rock-tools@9736aa0",
-      "vendored_as": "data",
-      "files": [
-        "SKILL.md"
-      ],
-      "derived_from": ".claude/skills/rock/SKILL.md",
-      "authored_here": true,
-      "notes": "Data views, reports, attendance, background checks, check-in."
-    },
-    "lava": {
-      "plugin": "rock",
-      "upstream": "passiondev/rock-tools",
-      "via": "passiondev/rock-tools@9736aa0",
-      "vendored_as": "lava",
-      "files": [
-        "SKILL.md",
-        "references/action-types.md",
-        "references/block-types.md",
-        "references/lava-reference.md"
-      ],
-      "derived_from": ".claude/skills/rock/SKILL.md",
-      "authored_here": true,
-      "notes": "Lava guidance. action-types.md and block-types.md carried a stale repo-relative catalog path (`data/rock/catalog.json`) and now point at `~/.claude/passion-rock/catalog.json` (ADRs 0001, 0016); lava-reference.md is copied unchanged."
-    },
-    "status": {
-      "plugin": "rock",
-      "upstream": "passiondev/rock-tools",
-      "via": "passiondev/rock-tools@9736aa0",
-      "vendored_as": "status",
-      "files": [
-        "SKILL.md"
-      ],
-      "derived_from": ".claude/skills/rock/SKILL.md",
-      "authored_here": true,
-      "notes": "Connection, catalog, exceptions, setup. Absorbs the old setup.md, with the hostname removed and the auth note reframed (ADRs 0001, 0004)."
-    },
-    "audit": {
-      "plugin": "rock-build",
-      "upstream": "passiondev/rock-tools",
-      "via": "passiondev/rock-tools@9736aa0",
-      "vendored_as": "audit",
-      "files": [
-        "SKILL.md"
-      ],
-      "derived_from": ".claude/skills/rock/SKILL.md",
-      "authored_here": true,
-      "notes": "Audit operation, split out."
-    },
-    "fix": {
-      "plugin": "rock-build",
-      "upstream": "passiondev/rock-tools",
-      "via": "passiondev/rock-tools@9736aa0",
-      "vendored_as": "fix",
-      "files": [
-        "SKILL.md"
-      ],
-      "derived_from": ".claude/skills/rock/SKILL.md",
-      "authored_here": true,
-      "notes": "Repair operations, split out."
-    },
-    "create": {
-      "plugin": "rock-build",
-      "upstream": "passiondev/rock-tools",
-      "via": "passiondev/rock-tools@9736aa0",
-      "vendored_as": "create",
-      "files": [
-        "SKILL.md"
-      ],
-      "derived_from": ".claude/skills/rock/SKILL.md",
-      "authored_here": true,
-      "notes": "Create operations, split out."
-    },
     "onboard": {
       "plugin": "general",
       "upstream": "passion-original",
@@ -364,25 +265,32 @@
       "authored_here": true,
       "note": "Role-first introduction to the marketplace. Names skills across every plugin by design, so check.py exempts it from the reachability rule via CATALOGUE_FILES. Its recommendation table must be updated when skills are added or removed. See ADR 0018."
     },
-    "group": {
-      "plugin": "rock-build",
-      "upstream": null,
-      "via": null,
-      "vendored_as": "group",
+    "rock": {
+      "plugin": "rock",
+      "upstream": "passiondev/rock-tools",
+      "via": "passiondev/rock-tools@9736aa0",
+      "vendored_as": "rock",
       "files": [
-        "SKILL.md"
+        "SKILL.md",
+        "references/writing.md",
+        "references/connection.md",
+        "references/lava.md",
+        "references/lava-reference.md",
+        "references/action-types.md",
+        "references/block-types.md",
+        "references/coding-standards.md"
       ],
-      "derived_from": null,
+      "derived_from": ".claude/skills/rock/SKILL.md",
       "authored_here": true,
-      "notes": "Authored here, not vendored. Group, member, and sync operations were absent from rock-tools and from this marketplace, which is what sent people back to rock-tools and left anyone without it unable to change a roster at all. See ADR 0022."
+      "notes": "One skill for all of Rock. rock-tools shipped a single rock skill; ADR 0013 split it into nine across two plugins, and ADR 0023 merged it back to one on the report that nine commands was more than anyone could hold. Reads and the safety rules are in SKILL.md; references/writing.md holds the write loop and every operation; references/connection.md the setup, catalog, exception logs and browser opt-in; references/lava.md the template guidance. action-types.md and block-types.md carried a stale repo-relative catalog path (`data/rock/catalog.json`) and now point at `~/.claude/passion-rock/catalog.json` (ADRs 0001, 0016); lava-reference.md is copied unchanged. The group operations and api_request were authored here, not vendored \u2014 see ADR 0022."
     }
   },
   "runtime": {
-    "note": "Executable code ported from rock-tools. Unlike the skills, this is largely the original source with targeted patches. See ADRs 0003, 0004, 0016.",
+    "note": "Executable code ported from rock-tools. Unlike the skills, this is largely the original source with targeted patches. See ADRs 0003, 0004, 0016, 0023.",
     "upstream": "passiondev/rock-tools",
     "via": "passiondev/rock-tools@9736aa0",
     "files": {
-      "plugins/rock/runtime/scripts/rock_query.py": "patched: ROCK_ALLOW_WRITES guard on the four write subcommands (ADR 0016)",
+      "plugins/rock/runtime/scripts/rock_query.py": "patched: ROCK_ALLOW_WRITES guard on the four write subcommands (ADRs 0016, 0023); PATCH instead of PUT in person-update, and the query-string attribute route in block-set (ADR 0022)",
       "plugins/rock/runtime/scripts/rock_client.py": "patched: dotenv removed, credentials via passion_env (ADR 0005)",
       "plugins/rock/runtime/scripts/rock_catalog.py": "patched: catalog path via rock_paths",
       "plugins/rock/runtime/scripts/rock_log.py": "patched: log path via rock_paths",
@@ -393,9 +301,7 @@
       "plugins/rock/runtime/config.yaml": "unchanged",
       "plugins/rock/runtime/bootstrap.sh": "authored here",
       "plugins/rock/runtime/rock.sh": "authored here",
-      "plugins/rock-build/runtime/scripts/rock_build.py": "unchanged apart from a stale `just` message",
-      "plugins/rock-build/runtime/bootstrap.sh": "authored here",
-      "plugins/rock-build/runtime/rock.sh": "authored here"
+      "plugins/rock/runtime/scripts/rock_build.py": "patched: PATCH instead of PUT, the query-string attribute route, six group operations and a guarded api_request (ADR 0022). Moved here from plugins/rock-build (ADR 0023)"
     },
     "not_ported": {
       "justfile": "Recipes were one-line wrappers; rock.sh replaces them (ADR 0004).",
@@ -406,7 +312,7 @@
     }
   },
   "contaminated_skills": {
-    "note": "Claude Code's own built-ins, written into the source directory by the tool rather than chosen by anyone. Never shippable — see ADR 0007 and the CONTEXT.md definition. CI fails if any of these names appears under plugins/.",
+    "note": "Claude Code's own built-ins, written into the source directory by the tool rather than chosen by anyone. Never shippable \u2014 see ADR 0007 and the CONTEXT.md definition. CI fails if any of these names appears under plugins/.",
     "names": [
       "check-work",
       "create-skill",
@@ -417,5 +323,5 @@
       "xlsx"
     ]
   },
-  "refinement_pass": "2026-08 rubric pass: every one of the 31 skills was reviewed against the writing-great-skills rubric (no-ops, duplication, leading words, completion criteria, negation, progressive disclosure). Skills vendored from an upstream therefore diverge from it in wording throughout, beyond what any per-skill `diverged` marker names. Those markers record structural and behavioural divergence — new files, changed contracts, retargeted pointers — not prose. See ADR 0020."
+  "refinement_pass": "2026-08 rubric pass: every one of the 31 skills was reviewed against the writing-great-skills rubric (no-ops, duplication, leading words, completion criteria, negation, progressive disclosure). Skills vendored from an upstream therefore diverge from it in wording throughout, beyond what any per-skill `diverged` marker names. Those markers record structural and behavioural divergence \u2014 new files, changed contracts, retargeted pointers \u2014 not prose. See ADR 0020."
 }

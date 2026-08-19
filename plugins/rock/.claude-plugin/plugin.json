@@ -1,4 +1,4 @@
 {
   "name": "rock",
-  "description": "Read Rock RMS: find and inspect workflows, pages, blocks, people, groups, and data."
+  "description": "Rock RMS, read and write: find and inspect workflows, pages, groups and data; audit and repair; create; change a roster; write Lava."
 }

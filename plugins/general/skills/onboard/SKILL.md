@@ -41,7 +41,7 @@ and stop. Otherwise carry the installed plugin names into step 3.
 ## Step 3 — Name two or three, then stop
 
 Rank by what they said in step 1; filter to what step 2 listed as installed. A
-Local Engineer who spends their week in Rock should hear about `/rock:find`
+Local Engineer who spends their week in Rock should hear about `/rock:rock`
 before `/dev:tdd`.
 
 **Everyone, regardless of role** — lead with whichever of these two fits:
@@ -57,10 +57,8 @@ before `/dev:tdd`.
 | --- | --- | --- |
 | "I write code" | `/dev:tdd`, `/dev:code-review` | The two that change daily habit rather than adding a step |
 | "I debug things" | `/dev:diagnosing-bugs` | Follows the evidence instead of guessing at a fix |
-| "I look people up in Rock" | `/rock:find`, `/rock:inspect` | Search, then the full record |
-| "Rock workflows break" | `/rock:status`, `/rock-build:audit` | Check the connection, then find what is broken |
-| "I manage group rosters" | `/rock-build:group` | Members, roles, and sync from a data view |
-| "I pull reports and numbers" | `/rock:data` | Dataviews, reports, attendance |
+| "I work in Rock" | `/rock:rock` | One skill for all of it: look someone up, audit a broken workflow, change a roster, pull attendance |
+| "I pull reports and numbers" | `/rock:rock` | Dataviews, reports, attendance — with the boundaries of every figure |
 | "I write the spec / the ticket" | `/plan:to-spec`, `/plan:to-tickets` | Turns a conversation into something someone can pick up |
 | "I get vague requests" | `/plan:triage` | Verifies the claim before anyone builds |
 | "I have to decide something" | `/general:grill-me` | Questions them until the decision is actually made |
