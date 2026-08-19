@@ -142,9 +142,29 @@ def _resolve_person_name(client, alias_id, cache=None):
     return "?"
 
 
-def _find_entity(client, endpoint, identifier, name_field="Name", label=None):
-    """Find an entity by ID, exact name, or substring match."""
+def _find_entity(client, endpoint, identifier, name_field="Name", label=None,
+                 search=None):
+    """The one entity an operator meant, or None with the reason printed.
+
+    Every command that takes a name-or-ID argument climbs the same ladder: try
+    it as an ID, then as an exact name, then as a substring. Five commands used
+    to climb it themselves, and they had drifted -- one skipped the exact match,
+    so `attendance --group Ushers` could resolve to "Ushers Team"; one skipped
+    the ID fetch, so a group ID that does not exist reported no attendance
+    rather than no group; and the chooser was printed three times with the ID
+    column at three different widths.
+
+    `search` is the seam. It runs one OData filter and answers
+    `(rows, more)` -- the same pair `get_capped` returns -- so a caller that has
+    to restrict the search does that without a branch in here. `checkin` passes
+    one that chunks a group-type or-chain past Rock's filter-size ceiling; the
+    default asks `endpoint` directly.
+    """
     label = label or endpoint.rstrip("s").lower()
+    if search is None:
+        def search(odata_filter, limit):
+            return get_capped(client, endpoint, {"$filter": odata_filter}, limit)
+
     try:
         eid = int(identifier)
         result = client.get(f"{endpoint}/{eid}")
@@ -152,25 +172,42 @@ def _find_entity(client, endpoint, identifier, name_field="Name", label=None):
             return result
     except (ValueError, RockNotFound):
         pass
-    exact = first(client, endpoint, {
-        "$filter": f"{name_field} eq '{odata_str(identifier)}'",
-    })
+
+    exact, _more = search(f"{name_field} eq '{odata_str(identifier)}'", 1)
     if exact:
-        return exact
-    results, more = get_capped(client, endpoint, {
-        "$filter": f"substringof('{odata_str(identifier)}', {name_field}) eq true",
-    }, CHOOSER_LIMIT)
-    if results and len(results) == 1:
+        return exact[0]
+
+    results, more = search(
+        f"substringof('{odata_str(identifier)}', {name_field}) eq true",
+        CHOOSER_LIMIT)
+    if len(results) == 1:
         return results[0]
     if results:
         print(f"Multiple {label}s match '{identifier}':")
         for r in results:
-            print(f"  {r['Id']:5d}  {r.get(name_field, '?')}")
+            print(f"  {r['Id']:6d}  {r.get(name_field, '?')}")
         if more:
             print(more_note(identifier))
         return None
     print(f"No {label} found matching '{identifier}'")
     return None
+
+
+def _people_filter(identifier):
+    """The OData filter for whatever an operator typed to mean a person.
+
+    An address is matched exactly; two words are a first and a last name; one
+    word is a surname. `person` and `bgc --person` both accept the same
+    argument, and they had two copies of this -- disagreeing about what "Smith"
+    means is a difference nobody would have chosen.
+    """
+    if "@" in identifier:
+        return f"Email eq '{odata_str(identifier)}'"
+    parts = identifier.strip().split()
+    if len(parts) >= 2:
+        return (f"FirstName eq '{odata_str(parts[0])}' and "
+                f"LastName eq '{odata_str(parts[-1])}'")
+    return f"LastName eq '{odata_str(parts[0])}'"
 
 
 def _enrich_actions_entity_types(actions, client):
@@ -209,7 +246,7 @@ def format_workflow_tree(wf):
             is_last = j == len(actions) - 1
             branch = "   " if is_last_act else "│  "
             ap = "└─" if is_last else "├─"
-            entity_name = action.get("EntityType", {}).get("FriendlyName", "unknown")
+            entity_name = action.get("EntityType", {}).get("FriendlyName", "?")
             lines.append(f"  {branch} {ap} Action: {action['Name']} [{entity_name}]")
 
     return "\n".join(lines)
@@ -217,11 +254,6 @@ def format_workflow_tree(wf):
 
 def _by_order(items):
     return sorted(items, key=lambda a: a.get("Order", 0))
-
-
-def _find_workflow(identifier, client):
-    """Find a workflow by ID, exact name, or fuzzy search."""
-    return _find_entity(client, "WorkflowTypes", identifier, label="workflow")
 
 
 def _load_workflow_tree(wf, client):
@@ -293,7 +325,8 @@ def cmd_workflows(args, client):
 
 
 def cmd_workflow(args, client):
-    wf = _find_workflow(args.identifier, client)
+    wf = _find_entity(client, "WorkflowTypes", args.identifier,
+                      label="workflow")
     if not wf:
         return
     _load_workflow_tree(wf, client)
@@ -326,42 +359,23 @@ def cmd_pages(args, client):
 
 def cmd_page(args, client):
     identifier = args.identifier
+
+    # A route is the one thing a page answers to that no other entity has, so
+    # it is the one step the shared ladder cannot do. It goes first because a
+    # route is never a number and the ladder starts by trying one, so the two
+    # probes cannot shadow each other. A route pointing at a page that is gone
+    # falls through to the name search rather than out of the command.
     page = None
-
-    # Try as ID
-    try:
-        page_id = int(identifier)
-        page = client.get(f"Pages/{page_id}")
-    except (ValueError, RockNotFound):
-        pass
-
-    # Try as route
-    if not page:
+    if not identifier.lstrip("-").isdigit():
         route = first(client, "PageRoutes", {
             "$filter": f"Route eq '{odata_str(identifier.lstrip('/'))}'",
         })
         if route and route.get("PageId"):
             page = client.get(f"Pages/{route['PageId']}")
-
-    # Search by name
     if not page:
-        results, more = get_capped(client, "Pages", {
-            "$filter": f"substringof('{odata_str(identifier)}', InternalName) eq true",
-        }, CHOOSER_LIMIT)
-        if results:
-            if len(results) == 1:
-                page = results[0]
-            else:
-                print(f"Multiple pages match '{identifier}':")
-                for r in results:
-                    name = r.get("InternalName") or r.get("PageTitle") or "(untitled)"
-                    print(f"  {r['Id']:5d}  {name}")
-                if more:
-                    print(more_note(identifier))
-                return
-
+        page = _find_entity(client, "Pages", identifier,
+                            name_field="InternalName", label="page")
     if not page:
-        print(f"No page found matching '{identifier}'")
         return
 
     # Get blocks on this page
@@ -373,7 +387,7 @@ def cmd_page(args, client):
         bt_ids = {b.get("BlockTypeId") for b in blocks if b.get("BlockTypeId")}
         bt_names = {btid: _resolve_name(client, "BlockTypes", btid) for btid in bt_ids}
         for b in blocks:
-            b["BlockType"] = {"Name": bt_names.get(b.get("BlockTypeId"), "unknown")}
+            b["BlockType"] = {"Name": bt_names.get(b.get("BlockTypeId"), "?")}
 
     # Get routes
     routes, routes_capped = get_capped(client, "PageRoutes", {
@@ -400,7 +414,7 @@ def cmd_page(args, client):
                 if zone != current_zone:
                     current_zone = zone
                     print(f"    Zone: {zone}")
-                bt_name = b.get("BlockType", {}).get("Name", "unknown")
+                bt_name = b.get("BlockType", {}).get("Name", "?")
                 print(f"      {b['Name'] or bt_name} [{bt_name}]")
 
 
@@ -518,7 +532,8 @@ def _print_audit(wf, issues, warnings):
 
 
 def cmd_audit(args, client):
-    wf = _find_workflow(args.identifier, client)
+    wf = _find_entity(client, "WorkflowTypes", args.identifier,
+                      label="workflow")
     if not wf:
         return
     _load_workflow_tree(wf, client)
@@ -624,7 +639,7 @@ def cmd_actions(args, client):
 
     for action in actions:
         entity = action.get("EntityType") or {}
-        entity_name = entity.get("FriendlyName", "unknown")
+        entity_name = entity.get("FriendlyName", "?")
         print(f"  [{action.get('Order', '?')}] {action['Name']} (ID: {action['Id']})")
         print(f"      Type: {entity_name}")
         print(f"      Completes action: {action.get('IsActionCompletedOnSuccess', False)}")
@@ -640,7 +655,8 @@ def cmd_actions(args, client):
 
 
 def cmd_attributes(args, client):
-    wf = _find_workflow(args.identifier, client)
+    wf = _find_entity(client, "WorkflowTypes", args.identifier,
+                      label="workflow")
     if not wf:
         return
 
@@ -686,20 +702,14 @@ def cmd_dataviews(args, client):
         print(f"  {dv['Id']:5d}  {dv['Name']}")
 
 
-def _resolve_entity_type_name(client, entity_type_id):
-    if not entity_type_id:
-        return "unknown"
-    name = _resolve_name(client, "EntityTypes", entity_type_id, field="FriendlyName")
-    return "unknown" if name == "?" else name
-
-
 def _load_filter_tree(client, filter_id, depth=0):
     """Recursively load a data view filter and its children."""
     f = client.get(f"DataViewFilters/{filter_id}")
     if not f:
         return None
 
-    entity_name = _resolve_entity_type_name(client, f.get("EntityTypeId"))
+    entity_name = _resolve_name(client, "EntityTypes", f.get("EntityTypeId"),
+                                field="FriendlyName")
     prefix = "  " * depth
     expr = EXPRESSION_TYPES.get(f.get("ExpressionType", 0), f"Type:{f.get('ExpressionType')}")
 
@@ -740,12 +750,14 @@ def cmd_dataview(args, client):
     if dv.get("Description"):
         print(f"  {dv['Description'][:200]}")
 
-    entity_name = _resolve_entity_type_name(client, dv.get("EntityTypeId"))
+    entity_name = _resolve_name(client, "EntityTypes", dv.get("EntityTypeId"),
+                                field="FriendlyName")
     print(f"  Entity: {entity_name}")
 
-    transform_name = _resolve_entity_type_name(client, dv.get("TransformEntityTypeId"))
     if dv.get("TransformEntityTypeId"):
-        print(f"  Transform: {transform_name}")
+        print(f"  Transform: " + _resolve_name(
+            client, "EntityTypes", dv["TransformEntityTypeId"],
+            field="FriendlyName"))
 
     if dv.get("CategoryId"):
         cat_name = _resolve_name(client, "Categories", dv["CategoryId"])
@@ -780,21 +792,9 @@ def cmd_person(args, client):
     except (ValueError, RockNotFound):
         pass
 
-    # Search by email
-    if "@" in identifier:
-        results, more = get_capped(client, "People", {
-            "$filter": f"Email eq '{odata_str(identifier)}'",
-        }, CHOOSER_LIMIT)
-    else:
-        parts = identifier.strip().split()
-        if len(parts) >= 2:
-            results, more = get_capped(client, "People", {
-                "$filter": f"FirstName eq '{odata_str(parts[0])}' and LastName eq '{odata_str(parts[-1])}'",
-            }, SEARCH_LIMIT)
-        else:
-            results, more = get_capped(client, "People", {
-                "$filter": f"LastName eq '{odata_str(parts[0])}'",
-            }, SEARCH_LIMIT)
+    results, more = get_capped(client, "People",
+                               {"$filter": _people_filter(identifier)},
+                               SEARCH_LIMIT)
 
     if not results:
         print(f"No person found matching '{identifier}'")
@@ -1281,17 +1281,9 @@ def cmd_bgc(args, client):
             if alias:
                 filters.append(f"PersonAliasId eq {alias['Id']}")
         except (ValueError, RockNotFound):
-            parts = args.person.strip().split()
-            if len(parts) >= 2:
-                person = first(client, "People", {
-                    "$filter": f"FirstName eq '{odata_str(parts[0])}' and LastName eq '{odata_str(parts[-1])}'",
-                    "$select": "Id",
-                })
-            else:
-                person = first(client, "People", {
-                    "$filter": f"LastName eq '{odata_str(parts[0])}'",
-                    "$select": "Id",
-                })
+            person = first(client, "People", {
+                "$filter": _people_filter(args.person), "$select": "Id",
+            })
             if person:
                 alias = first(client, "PersonAlias", {
                     "$filter": f"PersonId eq {person['Id']}", "$select": "Id",
@@ -1336,39 +1328,22 @@ def cmd_checkin(args, client):
 
     if args.area:
         # Show specific check-in area (group) with locations and schedules
-        group = None
-        truncated = False
-        try:
-            gid = int(args.area)
-            group = client.get(f"Groups/{gid}")
-        except (ValueError, RockNotFound):
-            # Filter by group type in the query rather than after it. Filtering
-            # afterwards spent the cap on rows that were about to be discarded:
-            # a common word can match hundreds of groups of every type, and if
-            # no check-in group lands in the first ten the command answers "No
-            # check-in area found" for areas that plainly exist. Worse, the
-            # fetch carried no $orderby, so which ten came back differed
-            # between identical runs. Now the cap falls on check-in groups.
-            name_filter = f"substringof('{odata_str(args.area)}', Name) eq true"
-            checkin_type_ids = sorted(gt["Id"] for gt in (checkin_group_types or []))
-            if checkin_type_ids:
-                results, truncated = groups_of_types(
-                    client, name_filter, checkin_type_ids, SEARCH_LIMIT)
-            else:
-                results, truncated = get_capped(
-                    client, "Groups", {"$filter": name_filter, "$select": "Id,Name"}, SEARCH_LIMIT)
-            if results and len(results) == 1:
-                group = results[0]
-            elif results:
-                print(f"Multiple check-in groups match '{args.area}':")
-                for g in results:
-                    print(f"  {g['Id']:6d}  {g['Name']}")
-                if truncated:
-                    print(more_note(args.area))
-                return
+        # Restrict by group type in the query rather than after it. Filtering
+        # afterwards spent the cap on rows that were about to be discarded: a
+        # common word can match hundreds of groups of every type, and if no
+        # check-in group landed in the first ten the command answered "No
+        # check-in area found" for areas that plainly exist.
+        checkin_type_ids = sorted(gt["Id"] for gt in checkin_group_types)
 
+        def among_checkin_types(odata_filter, limit):
+            if not checkin_type_ids:
+                return get_capped(client, "Groups", {"$filter": odata_filter,
+                                                     "$select": "Id,Name"}, limit)
+            return groups_of_types(client, odata_filter, checkin_type_ids, limit)
+
+        group = _find_entity(client, "Groups", args.area, label="check-in area",
+                             search=among_checkin_types)
         if not group:
-            print(f"No check-in area found matching '{args.area}'")
             return
 
         print(f"{group['Name']} (ID: {group['Id']})")
@@ -1442,26 +1417,10 @@ def cmd_attendance(args, client):
     }
     filters = []
     if args.group:
-        try:
-            gid = int(args.group)
-            filters.append(f"GroupId eq {gid}")
-        except ValueError:
-            groups, more = get_capped(client, "Groups", {
-                "$filter": f"substringof('{odata_str(args.group)}', Name) eq true",
-                "$select": "Id,Name",
-            }, CHOOSER_LIMIT)
-            if groups and len(groups) == 1:
-                filters.append(f"GroupId eq {groups[0]['Id']}")
-            elif groups:
-                print(f"Multiple groups match '{args.group}':")
-                for g in groups:
-                    print(f"  {g['Id']:6d}  {g['Name']}")
-                if more:
-                    print(more_note(args.group))
-                return
-            else:
-                print(f"No group found matching '{args.group}'")
-                return
+        group = _find_entity(client, "Groups", args.group, label="group")
+        if not group:
+            return
+        filters.append(f"GroupId eq {group['Id']}")
     if args.date:
         filters.append(f"OccurrenceDate eq datetime'{args.date}'")
     if filters:

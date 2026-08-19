@@ -16,7 +16,9 @@ written.
 Run:  python3 -m unittest discover -s tests
 """
 
+import io
 import unittest
+from contextlib import redirect_stdout
 
 from rock_harness import FakeClient, rock_query
 
@@ -130,6 +132,105 @@ class TestGroupsFetchedByType(unittest.TestCase):
         rows, more = rock_query.groups_of_types(client, "x", [11], 5)
         self.assertEqual(len(rows), 5)
         self.assertTrue(more)
+
+
+class TestFindingOneEntity(unittest.TestCase):
+    """`_find_entity` — the ladder every "name or ID" argument climbs."""
+
+    def test_a_number_is_tried_as_an_id_first(self):
+        client = FakeClient(responses={"Groups/7": {"Id": 7, "Name": "Ushers"}})
+        found = rock_query._find_entity(client, "Groups", "7")
+        self.assertEqual(found["Id"], 7)
+        self.assertEqual(len(client.calls), 1, "a hit by ID asks Rock once")
+
+    def test_an_exact_name_beats_a_substring(self):
+        client = FakeClient(responses={"Groups": [{"Id": 3, "Name": "Ushers"}]})
+        found = rock_query._find_entity(client, "Groups", "Ushers")
+        self.assertEqual(found["Id"], 3)
+        self.assertIn("Name eq 'Ushers'", client.calls[0]["params"]["$filter"])
+
+    def test_a_single_substring_match_is_taken(self):
+        calls = []
+
+        def search(odata_filter, limit):
+            calls.append(odata_filter)
+            if "eq " in odata_filter and "substringof" not in odata_filter:
+                return [], False
+            return [{"Id": 9, "Name": "Ushers Team"}], False
+
+        found = rock_query._find_entity(FakeClient(), "Groups", "ush", search=search)
+        self.assertEqual(found["Id"], 9)
+
+    def test_several_matches_print_a_chooser_and_resolve_to_nothing(self):
+        rows = [{"Id": 1, "Name": "Ushers A"}, {"Id": 2, "Name": "Ushers B"}]
+        search = lambda flt, limit: (([], False) if "substringof" not in flt
+                                     else (rows, False))
+        out = io.StringIO()
+        with redirect_stdout(out):
+            found = rock_query._find_entity(FakeClient(), "Groups", "ush",
+                                           label="group", search=search)
+        self.assertIsNone(found, "an ambiguous reference must not pick for the operator")
+        self.assertIn("Multiple groups match 'ush'", out.getvalue())
+        self.assertIn("Ushers B", out.getvalue())
+
+    def test_a_capped_chooser_says_more_match(self):
+        rows = [{"Id": i, "Name": f"Ushers {i}"} for i in range(5)]
+        search = lambda flt, limit: (([], False) if "substringof" not in flt
+                                     else (rows, True))
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rock_query._find_entity(FakeClient(), "Groups", "ush", search=search)
+        self.assertIn("and more match", out.getvalue())
+
+    def test_nothing_found_says_so_and_names_the_kind(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            found = rock_query._find_entity(FakeClient(), "Groups", "nobody",
+                                            label="check-in area")
+        self.assertIsNone(found)
+        self.assertIn("No check-in area found matching 'nobody'", out.getvalue())
+
+    def test_the_label_defaults_to_the_endpoint(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rock_query._find_entity(FakeClient(), "Schedules", "nope")
+        self.assertIn("No schedule found", out.getvalue())
+
+    def test_a_caller_can_replace_the_search_without_editing_the_ladder(self):
+        """The seam `checkin` needs: a name search restricted to group types."""
+        asked = []
+
+        def only_checkin_types(odata_filter, limit):
+            asked.append(odata_filter)
+            return [{"Id": 4, "Name": "Nursery"}], False
+
+        found = rock_query._find_entity(FakeClient(), "Groups", "Nursery",
+                                        search=only_checkin_types)
+        self.assertEqual(found["Id"], 4)
+        self.assertTrue(asked, "the replacement search must be the one that runs")
+
+
+class TestWhatAnOperatorMeansByAPerson(unittest.TestCase):
+    """`_people_filter` — one reading of a typed name, shared by two commands."""
+
+    def test_an_address_is_matched_exactly(self):
+        self.assertEqual(rock_query._people_filter("a@b.org"),
+                         "Email eq 'a@b.org'")
+
+    def test_two_words_are_a_first_and_last_name(self):
+        self.assertEqual(rock_query._people_filter("Ada Lovelace"),
+                         "FirstName eq 'Ada' and LastName eq 'Lovelace'")
+
+    def test_a_middle_name_does_not_become_the_surname(self):
+        self.assertIn("LastName eq 'Lovelace'",
+                      rock_query._people_filter("Ada Byron Lovelace"))
+
+    def test_one_word_is_a_surname(self):
+        self.assertEqual(rock_query._people_filter("Lovelace"),
+                         "LastName eq 'Lovelace'")
+
+    def test_an_apostrophe_is_escaped_for_odata(self):
+        self.assertIn("O''Brien", rock_query._people_filter("O'Brien"))
 
 
 if __name__ == "__main__":
