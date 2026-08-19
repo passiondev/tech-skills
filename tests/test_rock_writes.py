@@ -20,10 +20,12 @@ update, a test here fails and names the operation.
 Run:  python3 -m unittest discover -s tests
 """
 
+import io
 import os
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -216,7 +218,7 @@ class WriteTestCase(unittest.TestCase):
             "PUT replaces the whole entity in Rock — a partial update must use PATCH")
 
     def assertSucceeded(self, result):
-        self.assertTrue(result.success, f"operation reported failure: {result.failed}")
+        self.assertTrue(result.success, f"operation reported failure: {result.failures}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -721,7 +723,7 @@ class TestApiRequest(WriteTestCase):
                          "body": {"Name": "Renamed"}}}, client, CATALOG)
         self.assertFalse(result.success)
         self.assertEqual(client.writes, [])
-        self.assertIn("full_replace", result.failed["error"])
+        self.assertIn("full_replace", result.failures[0]["error"])
 
     def test_put_is_allowed_with_an_acknowledgement(self):
         client = FakeClient()
@@ -881,7 +883,7 @@ class TestPlanContract(WriteTestCase):
         result = rock_build.run_plan({"operation": "delete_everything"},
                                      lambda: self.fail("connected anyway"))
         self.assertFalse(result.success)
-        self.assertIn("unknown operation", result.failed["error"])
+        self.assertIn("unknown operation", result.failures[0]["error"])
 
     def test_every_operation_reports_a_plan_problem_rather_than_dispatching(self):
         """A bare `{"operation": ...}` names something every operation needs."""
@@ -889,7 +891,7 @@ class TestPlanContract(WriteTestCase):
             with self.subTest(operation=operation):
                 result, client = self.run_plan({"operation": operation})
                 self.assertFalse(result.success)
-                self.assertNotIn("unknown operation", result.failed["error"])
+                self.assertNotIn("unknown operation", result.failures[0]["error"])
                 self.assertEqual(client.writes, [],
                                  "an incomplete plan must not send a request")
 
@@ -931,7 +933,7 @@ class TestPlanContract(WriteTestCase):
         result, client = self.run_plan({"operation": "update_group",
                                         "modification": {"updates": {"name": "X"}}})
         self.assertFalse(result.success)
-        self.assertIn("modification.group_id", result.failed["error"])
+        self.assertIn("modification.group_id", result.failures[0]["error"])
         self.assertEqual(client.writes, [])
 
     def test_either_the_id_or_the_name_satisfies_a_pair(self):
@@ -976,8 +978,8 @@ class TestFieldMapsAreClosed(WriteTestCase):
                     {"operation": operation, "modification": modification},
                     lambda: client, CATALOG)
                 self.assertFalse(result.success)
-                self.assertIn("unknown field", result.failed["error"])
-                self.assertIn("accepts:", result.failed["error"])
+                self.assertIn("unknown field", result.failures[0]["error"])
+                self.assertIn("accepts:", result.failures[0]["error"])
                 self.assertEqual(client.writes, [],
                                  "nothing may be forwarded to Rock")
 
@@ -1007,6 +1009,70 @@ class TestFieldMapsAreClosed(WriteTestCase):
 # ─────────────────────────────────────────────────────────────────────────────
 # rock_query's four guarded writes
 # ─────────────────────────────────────────────────────────────────────────────
+
+class TestReportingHappensAtTheBoundary(WriteTestCase):
+    """The handlers record what they did; `run_plan` prints it.
+
+    Sixty-three calls to `report` used to sit inside the handlers, one beside
+    all but six of the failure paths. Those six printed nothing themselves and
+    were correct only because `apply_settings` had printed for them, so the
+    answer to "which line produced this output" depended on which line failed."""
+
+    def setUp(self):
+        os.environ["ROCK_ALLOW_WRITES"] = "1"
+
+    UPDATE = {"operation": "update_group",
+              "modification": {"group_id": 312, "updates": {"name": "Ushers"}}}
+
+    def plan_output(self, plan, client=None):
+        client = client if client is not None else FakeClient()
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            result = rock_build.run_plan(plan, lambda: client, CATALOG)
+        return result, buffer.getvalue()
+
+    def test_a_successful_plan_prints_one_report(self):
+        result, output = self.plan_output(self.UPDATE)
+        self.assertSucceeded(result)
+        self.assertEqual(output.count("Build results:"), 1)
+
+    def test_a_failed_handler_prints_one_report(self):
+        result, output = self.plan_output(self.UPDATE,
+                                         FakeClient(fail_on={"Groups/312"}))
+        self.assertFalse(result.success)
+        self.assertEqual(output.count("Build results:"), 1)
+
+    def test_a_gate_refusal_prints_the_same_report(self):
+        result, output = self.plan_output({"operation": "delete_everything"})
+        self.assertFalse(result.success)
+        self.assertEqual(output.count("Build results:"), 1)
+        self.assertIn("Nothing was created.", output)
+
+    def test_a_handler_called_directly_prints_nothing(self):
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            result = rock_build.update_group(self.UPDATE, FakeClient(), {})
+        self.assertSucceeded(result)
+        self.assertEqual(buffer.getvalue(), "",
+                         "printing is the boundary's job, not the handler's")
+
+    def test_a_second_failure_does_not_overwrite_the_first(self):
+        result = rock_build.BuildResult()
+        result.fail("Block", "first", "400")
+        result.fail("Block", "second", "409")
+        self.assertEqual([f["name"] for f in result.failures], ["first", "second"])
+
+    def test_the_tally_counts_every_entity_the_plan_asked_for(self):
+        """`len(created) + 1` assumed a single failure. Two made the total lie."""
+        result = rock_build.BuildResult()
+        result.add("Group", "Ushers", 312)
+        result.fail("Block", "first", "400")
+        result.fail("Block", "second", "409")
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            result.report()
+        self.assertIn("1 of 3 entities created.", buffer.getvalue())
+
 
 class TestQueryWrites(WriteTestCase):
     def test_person_update_patches(self):

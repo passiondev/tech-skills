@@ -354,6 +354,10 @@ def apply_settings(result, client, endpoint, entity_id, label, settings):
     Returns False when a setting did not land. The caller must stop there: the
     entity exists but is not configured, and reporting success anyway is the
     failure mode this whole function exists to prevent.
+
+    Recording is all it does. The caller returns the result and `run_plan`
+    prints it, which is why the six `return result` statements that follow a
+    False from here no longer look like they forgot something.
     """
     if not settings:
         return True
@@ -362,36 +366,52 @@ def apply_settings(result, client, endpoint, entity_id, label, settings):
         return True
     except Exception as e:
         result.fail("Settings", label, e)
-        result.report()
         return False
 
 
 class BuildResult:
+    """What a plan did to Rock, in the order it happened.
+
+    A handler records here and prints nothing. `run_plan` prints once, at the
+    end, on whatever the handler returned.
+
+    That was sixty-three calls to `report` scattered through the handlers, one
+    beside all but six of the failure paths — and those six printed nothing
+    themselves, because `apply_settings` had already printed for them. So the
+    answer to "where does this output come from" depended on which line failed.
+    Now it comes from one place, and a handler that forgets to print is not a
+    thing that can happen.
+    """
+
     def __init__(self):
         self.created = []
-        self.failed = None
+        self.failures = []
 
     def add(self, entity_type, name, entity_id):
         self.created.append({"type": entity_type, "name": name, "id": entity_id})
         log.info("created %s: %s (id: %s)", entity_type, name, entity_id)
 
     def fail(self, entity_type, name, error):
-        self.failed = {"type": entity_type, "name": name, "error": str(error)}
+        self.failures.append({"type": entity_type, "name": name, "error": str(error)})
         log.error("failed %s: %s -- %s\n%s", entity_type, name, error, traceback.format_exc())
 
     def report(self):
         print("\nBuild results:")
         for item in self.created:
             print(f"  ✓ {item['type']}: {item['name']} (id: {item['id']})")
-        if self.failed:
-            print(f"  ✗ {self.failed['type']}: {self.failed['name']} -- {self.failed['error']}")
-            print(f"\n{len(self.created)} of {len(self.created) + 1} entities created.")
-        else:
+        for item in self.failures:
+            print(f"  ✗ {item['type']}: {item['name']} -- {item['error']}")
+        if not self.failures:
             print(f"\n{len(self.created)} entities created successfully.")
+        elif not self.created:
+            print("\nNothing was created.")
+        else:
+            attempted = len(self.created) + len(self.failures)
+            print(f"\n{len(self.created)} of {attempted} entities created.")
 
     @property
     def success(self):
-        return self.failed is None
+        return not self.failures
 
 
 def get_workflow_entity_type_id(client):
@@ -442,7 +462,6 @@ def create_workflow(plan, client, catalog):
         result.add("WorkflowType", wf["name"], wf_id)
     except Exception as e:
         result.fail("WorkflowType", wf["name"], e)
-        result.report()
         return result
 
     # 2. Create Attributes on the WorkflowType
@@ -453,7 +472,6 @@ def create_workflow(plan, client, catalog):
         field_type_id = resolve_field_type(catalog, attr_def.get("field_type", "Text"))
         if not field_type_id:
             result.fail("Attribute", attr_def["key"], f"Unknown field type: {attr_def.get('field_type')}")
-            result.report()
             return result
 
         attr_data = {
@@ -475,7 +493,6 @@ def create_workflow(plan, client, catalog):
             result.add("Attribute", attr_def["key"], attr_id)
         except Exception as e:
             result.fail("Attribute", attr_def["key"], e)
-            result.report()
             return result
 
     # 3. Create Activities and Actions
@@ -494,7 +511,6 @@ def create_workflow(plan, client, catalog):
             result.add("ActivityType", act_def["name"], act_id)
         except Exception as e:
             result.fail("ActivityType", act_def["name"], e)
-            result.report()
             return result
 
         # Actions within this activity
@@ -503,7 +519,6 @@ def create_workflow(plan, client, catalog):
             if not entity_type_id:
                 result.fail("ActionType", action_def["name"],
                             f"Unknown action type: {action_def['action_type']}")
-                result.report()
                 return result
 
             action_data = {
@@ -520,7 +535,6 @@ def create_workflow(plan, client, catalog):
                 result.add("ActionType", action_def["name"], action_id)
             except Exception as e:
                 result.fail("ActionType", action_def["name"], e)
-                result.report()
                 return result
 
             if not apply_settings(result, client, "WorkflowActionTypes", action_id,
@@ -542,7 +556,6 @@ def create_workflow(plan, client, catalog):
                     result.add("Form", f"form on {action_def['name']}", form_id)
                 except Exception as e:
                     result.fail("Form", f"form on {action_def['name']}", e)
-                    result.report()
                     return result
 
                 # Form attributes (fields shown on the form)
@@ -567,10 +580,8 @@ def create_workflow(plan, client, catalog):
                         result.add("FormAttribute", field_key, fa_id)
                     except Exception as e:
                         result.fail("FormAttribute", field_key, e)
-                        result.report()
                         return result
 
-    result.report()
     return result
 
 
@@ -585,7 +596,6 @@ def create_page(plan, client, catalog):
         layout_id = resolve_layout(catalog, pg["layout"])
     if not layout_id:
         result.fail("Page", pg["name"], "Could not resolve layout")
-        result.report()
         return result
 
     # Resolve parent page
@@ -615,7 +625,6 @@ def create_page(plan, client, catalog):
         result.add("Page", pg["name"], page_id)
     except Exception as e:
         result.fail("Page", pg["name"], e)
-        result.report()
         return result
 
     # 2. Create route
@@ -629,7 +638,6 @@ def create_page(plan, client, catalog):
             result.add("PageRoute", route, route_id)
         except Exception as e:
             result.fail("PageRoute", route, e)
-            result.report()
             return result
 
     # 3. Create blocks
@@ -640,7 +648,6 @@ def create_page(plan, client, catalog):
         if not block_type_id:
             result.fail("Block", block_def.get("name", "unknown"),
                         f"Unknown block type: {block_def.get('block_type')}")
-            result.report()
             return result
 
         block_data = {
@@ -657,7 +664,6 @@ def create_page(plan, client, catalog):
             result.add("Block", block_def.get("name", f"block-{block_order}"), block_id)
         except Exception as e:
             result.fail("Block", block_def.get("name", f"block-{block_order}"), e)
-            result.report()
             return result
 
         if not apply_settings(result, client, "Blocks", block_id,
@@ -665,7 +671,6 @@ def create_page(plan, client, catalog):
                               block_def.get("settings", {})):
             return result
 
-    result.report()
     return result
 
 
@@ -680,7 +685,6 @@ def add_workflow_action(plan, client, catalog):
     if not entity_type_id:
         result.fail("ActionType", action_def["name"],
                      f"Unknown action type: {action_def['action_type']}")
-        result.report()
         return result
 
     next_order = _next_order(client, "WorkflowActionTypes", f"ActivityTypeId eq {activity_id}")
@@ -699,14 +703,12 @@ def add_workflow_action(plan, client, catalog):
         result.add("ActionType", action_def["name"], action_id)
     except Exception as e:
         result.fail("ActionType", action_def["name"], e)
-        result.report()
         return result
 
     if not apply_settings(result, client, "WorkflowActionTypes", action_id,
                           action_def["name"], action_def.get("settings", {})):
         return result
 
-    result.report()
     return result
 
 
@@ -723,7 +725,6 @@ def add_page_block(plan, client, catalog):
     if not block_type_id:
         result.fail("Block", block_def.get("name", "unknown"),
                      f"Unknown block type: {block_def.get('block_type')}")
-        result.report()
         return result
 
     zone = block_def.get("zone", "Main")
@@ -743,7 +744,6 @@ def add_page_block(plan, client, catalog):
         result.add("Block", block_def.get("name", "new block"), block_id)
     except Exception as e:
         result.fail("Block", block_def.get("name", "new block"), e)
-        result.report()
         return result
 
     if not apply_settings(result, client, "Blocks", block_id,
@@ -751,7 +751,6 @@ def add_page_block(plan, client, catalog):
                           block_def.get("settings", {})):
         return result
 
-    result.report()
     return result
 
 
@@ -775,7 +774,6 @@ def update_workflow(plan, client, catalog):
                 data["CategoryId"] = cat_id
             else:
                 result.fail("WorkflowType", str(wf_id), f"Category not found: {value}")
-                result.report()
                 return result
         else:
             data[rock_field(field_map, key, ("category",))] = value
@@ -786,7 +784,6 @@ def update_workflow(plan, client, catalog):
     except Exception as e:
         result.fail("WorkflowType", str(wf_id), e)
 
-    result.report()
     return result
 
 
@@ -811,7 +808,6 @@ def update_activity(plan, client, catalog):
     except Exception as e:
         result.fail("ActivityType", str(act_id), e)
 
-    result.report()
     return result
 
 
@@ -837,7 +833,6 @@ def update_action(plan, client, catalog):
                     data["EntityTypeId"] = entity_type_id
                 else:
                     result.fail("ActionType", str(action_id), f"Unknown action type: {value}")
-                    result.report()
                     return result
             else:
                 data[rock_field(field_map, key, ("action_type",))] = value
@@ -847,7 +842,6 @@ def update_action(plan, client, catalog):
             result.add("ActionType", f"updated {action_id}", action_id)
         except Exception as e:
             result.fail("ActionType", str(action_id), e)
-            result.report()
             return result
 
     settings = mod.get("settings", {})
@@ -857,7 +851,6 @@ def update_action(plan, client, catalog):
             return result
         result.add("Settings", f"updated on {action_id}", action_id)
 
-    result.report()
     return result
 
 
@@ -872,7 +865,6 @@ def delete_action(plan, client, catalog):
     except Exception as e:
         result.fail("ActionType", str(action_id), e)
 
-    result.report()
     return result
 
 
@@ -892,7 +884,6 @@ def delete_activity(plan, client, catalog):
             result.add("ActionType", f"deleted {action['Name']}", action["Id"])
         except Exception as e:
             result.fail("ActionType", action.get("Name", str(action["Id"])), e)
-            result.report()
             return result
 
     try:
@@ -901,7 +892,6 @@ def delete_activity(plan, client, catalog):
     except Exception as e:
         result.fail("ActivityType", str(act_id), e)
 
-    result.report()
     return result
 
 
@@ -916,10 +906,8 @@ def reorder_actions(plan, client, catalog):
             result.add("ActionType", f"reordered {action_id} -> {i}", action_id)
         except Exception as e:
             result.fail("ActionType", str(action_id), e)
-            result.report()
             return result
 
-    result.report()
     return result
 
 
@@ -941,7 +929,6 @@ def move_action(plan, client, catalog):
     except Exception as e:
         result.fail("ActionType", str(action_id), e)
 
-    result.report()
     return result
 
 
@@ -972,7 +959,6 @@ def create_checkin_area(plan, client, catalog):
 
     if not group_type_id:
         result.fail("Group", area["name"], "Could not resolve GroupType")
-        result.report()
         return result
 
     # Create group
@@ -994,7 +980,6 @@ def create_checkin_area(plan, client, catalog):
         result.add("Group", area["name"], group_id)
     except Exception as e:
         result.fail("Group", area["name"], e)
-        result.report()
         return result
 
     # Link locations
@@ -1013,7 +998,6 @@ def create_checkin_area(plan, client, catalog):
                 result.add("GroupLocation", f"location {loc_id}", gl_id)
             except Exception as e:
                 result.fail("GroupLocation", str(loc_id), e)
-                result.report()
                 return result
 
     # Link schedules via group's ScheduleId (single) or GroupSchedules
@@ -1034,10 +1018,8 @@ def create_checkin_area(plan, client, catalog):
                 result.add("Schedule", f"schedule {sched_id} on group", group_id)
             except Exception as e:
                 result.fail("Schedule", str(sched_id), e)
-                result.report()
                 return result
 
-    result.report()
     return result
 
 
@@ -1084,7 +1066,6 @@ def create_group(plan, client, catalog):
     if not group_type_id:
         result.fail("Group", grp["name"],
                     f"Could not resolve GroupType: {grp.get('group_type')}")
-        result.report()
         return result
 
     data = {
@@ -1105,14 +1086,12 @@ def create_group(plan, client, catalog):
         result.add("Group", grp["name"], group_id)
     except Exception as e:
         result.fail("Group", grp["name"], e)
-        result.report()
         return result
 
     if not apply_settings(result, client, "Groups", group_id, grp["name"],
                           grp.get("settings", {})):
         return result
 
-    result.report()
     return result
 
 
@@ -1132,7 +1111,6 @@ def update_group(plan, client, catalog):
     data = {rock_field(GROUP_FIELDS, k): v for k, v in mod["updates"].items()}
     if not data:
         result.fail("Group", str(group_id), "No fields to update")
-        result.report()
         return result
 
     try:
@@ -1140,14 +1118,12 @@ def update_group(plan, client, catalog):
         result.add("Group", f"updated {group_id}", group_id)
     except Exception as e:
         result.fail("Group", str(group_id), e)
-        result.report()
         return result
 
     if not apply_settings(result, client, "Groups", group_id, str(group_id),
                           mod.get("settings", {})):
         return result
 
-    result.report()
     return result
 
 
@@ -1182,7 +1158,6 @@ def add_group_member(plan, client, catalog):
     if not role_id:
         result.fail("GroupMember", label,
                     f"Could not resolve role {mod.get('role')!r} in group {group_id}")
-        result.report()
         return result
 
     status = member_status(mod.get("status", "active"))
@@ -1190,7 +1165,6 @@ def add_group_member(plan, client, catalog):
         result.fail("GroupMember", label,
                     f"Unknown status {mod.get('status')!r} — "
                     f"expected one of {', '.join(MEMBER_STATUS)}")
-        result.report()
         return result
 
     data = {
@@ -1212,7 +1186,6 @@ def add_group_member(plan, client, catalog):
     except Exception as e:
         result.fail("GroupMember", label, e)
 
-    result.report()
     return result
 
 
@@ -1254,7 +1227,6 @@ def update_group_member(plan, client, catalog):
                 result.fail("GroupMember", str(member_id),
                             f"Unknown status {value!r} — "
                             f"expected one of {', '.join(MEMBER_STATUS)}")
-                result.report()
                 return result
             data["GroupMemberStatus"] = status
         elif key == "role":
@@ -1264,7 +1236,6 @@ def update_group_member(plan, client, catalog):
                             f"Could not resolve role {value!r} in this member's "
                             f"group. Role names belong to the group type — take it "
                             f"from the group's own roster.")
-                result.report()
                 return result
             data["GroupRoleId"] = role_id
         else:
@@ -1272,7 +1243,6 @@ def update_group_member(plan, client, catalog):
 
     if not data:
         result.fail("GroupMember", str(member_id), "No fields to update")
-        result.report()
         return result
 
     try:
@@ -1281,7 +1251,6 @@ def update_group_member(plan, client, catalog):
     except Exception as e:
         result.fail("GroupMember", str(member_id), e)
 
-    result.report()
     return result
 
 
@@ -1307,7 +1276,6 @@ def remove_group_member(plan, client, catalog):
     except Exception as e:
         result.fail("GroupMember", str(member_id), e)
 
-    result.report()
     return result
 
 
@@ -1339,7 +1307,6 @@ def create_group_sync(plan, client, catalog):
     if not role_id:
         result.fail("GroupSync", label,
                     f"Could not resolve role {mod.get('role')!r} in group {group_id}")
-        result.report()
         return result
 
     data_view_id = mod.get("sync_data_view_id")
@@ -1348,7 +1315,6 @@ def create_group_sync(plan, client, catalog):
     if not data_view_id:
         result.fail("GroupSync", label,
                     f"Could not resolve data view {mod.get('data_view')!r}")
-        result.report()
         return result
 
     data = {
@@ -1369,7 +1335,6 @@ def create_group_sync(plan, client, catalog):
     except Exception as e:
         result.fail("GroupSync", label, e)
 
-    result.report()
     return result
 
 
@@ -1418,12 +1383,10 @@ def api_request(plan, client, catalog):
     if method not in API_METHODS:
         result.fail("Request", label,
                     f"method must be one of {', '.join(API_METHODS)}, got {method!r}")
-        result.report()
         return result
 
     if not endpoint:
         result.fail("Request", label, "endpoint is required, e.g. \"GroupSyncs/12\"")
-        result.report()
         return result
 
     # An endpoint is a path under /api/, and nothing else. Anything that could
@@ -1437,7 +1400,6 @@ def api_request(plan, client, catalog):
             result.fail("Request", label,
                         "endpoint must be a path under /api/ — no scheme, no leading "
                         "slash, no '..', encoded or not")
-            result.report()
             return result
 
     params = req.get("params")
@@ -1451,7 +1413,6 @@ def api_request(plan, client, catalog):
                     f"{method} needs a non-empty \"body\" object holding the fields "
                     f"to send. Read the entity with a GET first if you need its "
                     f"field names.")
-        result.report()
         return result
 
     if method == "PUT" and req.get("full_replace") is not True:
@@ -1461,7 +1422,6 @@ def api_request(plan, client, catalog):
                     "row gets a new Guid. Use PATCH to change some fields. If you "
                     "really mean to replace the entity, read it first and send it "
                     "back whole with \"full_replace\": true.")
-        result.report()
         return result
 
     print(f"  {method} /api/{endpoint}" + (f"  params={params}" if params else ""))
@@ -1489,7 +1449,6 @@ def api_request(plan, client, catalog):
     except Exception as e:
         result.fail("Request", label, e)
 
-    result.report()
     return result
 
 
@@ -1560,19 +1519,31 @@ NEEDS_CATALOG = {"create_workflow", "create_page", "add_action", "add_block",
 
 
 def refused(kind, label, message):
-    """A plan that never reached Rock, reported the way a failed one is.
+    """A plan that never reached Rock, recorded the way a failed one is.
 
     A gate and a 400 are the same thing to the person reading the output: the
     write did not happen and here is why.
     """
     result = BuildResult()
     result.fail(kind, label, message)
-    result.report()
     return result
 
 
 def run_plan(plan, connect, catalog=None):
-    """Dispatch one plan to its handler and return the result.
+    """Dispatch one plan, print what happened, and return the result.
+
+    The printing is here because this is the only place every path passes
+    through — a gate refusal, a handler that failed on its first request, and
+    a handler that did everything asked of it all come back as a BuildResult
+    and get rendered the same way.
+    """
+    result = _apply_plan(plan, connect, catalog)
+    result.report()
+    return result
+
+
+def _apply_plan(plan, connect, catalog):
+    """Decide whether the plan may run, then run it.
 
     Everything deciding whether a write may happen is here rather than inside
     `main`: the operation table, the write guard, the catalog gate, and the plan
