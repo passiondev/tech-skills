@@ -19,6 +19,7 @@ Run:  python3 -m unittest discover -s tests
 import io
 import unittest
 from contextlib import redirect_stdout
+from types import SimpleNamespace
 
 from rock_harness import FakeClient, rock_query
 
@@ -235,3 +236,138 @@ class TestWhatAnOperatorMeansByAPerson(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAListingRendersItself(unittest.TestCase):
+    """`Listing` — the rows a command found, and the one place they print."""
+
+    def render(self, report):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rock_query.render(report)
+        return out.getvalue()
+
+    def test_the_id_column_is_one_width_whoever_asks(self):
+        listing = rock_query.Listing("Groups")
+        listing.add(1, "one").add(1900412, "seven digits")
+        lines = self.render(listing).splitlines()
+        self.assertEqual(lines[2], "       1  one")
+        self.assertEqual(lines[3], "  1900412  seven digits",
+                         "a wider id widens its own row rather than truncating")
+
+    def test_the_title_gives_the_count(self):
+        listing = rock_query.Listing("Data Views")
+        listing.add(7, "Active Adults")
+        self.assertIn("Data Views (1):", self.render(listing))
+
+    def test_a_capped_listing_says_so(self):
+        listing = rock_query.Listing("Data Views", more=True)
+        listing.add(7, "Active Adults")
+        self.assertIn("first 1 — more exist, raise --limit", self.render(listing))
+
+    def test_the_empty_line_comes_from_the_title(self):
+        self.assertEqual(self.render(rock_query.Listing("Data Views")),
+                         "No data views found.\n")
+
+    def test_an_empty_listing_can_be_asked_to_say_nothing(self):
+        self.assertEqual(self.render(rock_query.Listing("Pages", empty="")), "")
+
+    def test_a_continuation_starts_where_the_label_does(self):
+        listing = rock_query.Listing("Exceptions")
+        listing.add(77012, "NullReferenceException", "Object reference not set")
+        lines = self.render(listing).splitlines()
+        self.assertEqual(lines[2].index("NullReference"),
+                         lines[3].index("Object reference"))
+
+    def test_an_empty_continuation_is_dropped(self):
+        listing = rock_query.Listing("Exceptions")
+        listing.add(1, "boom", "", None, "kept")
+        self.assertEqual(len(self.render(listing).splitlines()), 4)
+
+    def test_several_listings_are_separated(self):
+        parts = [rock_query.Listing("Workflows"), rock_query.Listing("Groups")]
+        parts[0].add(1, "a")
+        parts[1].add(2, "b")
+        self.assertIn("a\n\nGroups", self.render(parts))
+
+    def test_a_command_that_printed_for_itself_renders_nothing(self):
+        self.assertEqual(self.render(None), "")
+
+
+class TestWhatAReadCommandReturns(unittest.TestCase):
+    """The return value is the test surface -- no stdout, no string matching."""
+
+    def test_workflows_carries_its_category_and_its_state(self):
+        client = FakeClient(responses={
+            "WorkflowTypes": [{"Id": 4821, "Name": "Serving Signup",
+                               "IsActive": True, "CategoryId": 3},
+                              {"Id": 91, "Name": "Old Flow", "IsActive": False}],
+            "Categories/3": {"Name": "Volunteers"}})
+        listing = rock_query.cmd_workflows(
+            SimpleNamespace(category=None, limit=100), client)
+        self.assertEqual([r[:2] for r in listing.rows],
+                         [(4821, "Serving Signup (Volunteers)"),
+                          (91, "Old Flow [inactive]")])
+
+    def test_workflows_finding_nothing_is_an_empty_listing_not_a_none(self):
+        listing = rock_query.cmd_workflows(
+            SimpleNamespace(category=None, limit=100), FakeClient())
+        self.assertEqual(listing.rows, [])
+
+    def test_a_capped_fetch_reaches_the_listing(self):
+        client = FakeClient(responses={
+            "Schedules": [{"Id": i, "Name": f"s{i}", "IsActive": True}
+                          for i in range(6)]})
+        listing = rock_query.cmd_schedules(
+            SimpleNamespace(active=False, query=None, limit=5), client)
+        self.assertEqual(len(listing.rows), 5)
+        self.assertTrue(listing.more)
+
+    def test_a_page_with_no_internal_name_falls_back(self):
+        client = FakeClient(responses={"Pages": [{"Id": 12, "PageTitle": "Give"},
+                                                 {"Id": 13}]})
+        listing = rock_query.cmd_pages(SimpleNamespace(site=None, limit=100), client)
+        self.assertEqual([r[1] for r in listing.rows], ["Give", "(untitled)"])
+
+    def test_search_returns_only_the_listings_that_held_something(self):
+        client = FakeClient(responses={
+            "WorkflowTypes": [{"Id": 4821, "Name": "Serving Signup"}],
+            "Groups": [{"Id": 312, "Name": "Serving Team"}]})
+        with redirect_stdout(io.StringIO()):
+            parts = rock_query.cmd_search(SimpleNamespace(query="serving"), client)
+        self.assertEqual([p.title for p in parts], ["Workflows", "Groups"])
+
+    def test_search_finding_nothing_says_so_once(self):
+        with redirect_stdout(io.StringIO()):
+            report = rock_query.cmd_search(SimpleNamespace(query="zzz"), FakeClient())
+        self.assertEqual(report.empty, "No results found.")
+
+    def test_a_background_check_continues_onto_a_second_line(self):
+        client = FakeClient(responses={"BackgroundChecks": [
+            {"Id": 640, "RequestDate": "2026-07-02T00:00:00", "ResponseDate": None,
+             "Status": "Pending"}]})
+        listing = rock_query.cmd_bgc(
+            SimpleNamespace(status=None, person=None, limit=50), client)
+        self.assertEqual(listing.rows[0][2],
+                         ["Requested: 2026-07-02  Responded: pending"])
+
+    def test_a_null_comment_is_not_a_continuation(self):
+        client = FakeClient(responses={"ConnectionRequests": [
+            {"Id": 5501, "ConnectionState": 0, "Comments": None}]})
+        listing = rock_query.cmd_connections(
+            SimpleNamespace(state=None, opportunity=None, limit=50), client)
+        self.assertEqual(len(listing.rows[0][2]), 1,
+                         "a present-but-null Comments is not a line")
+
+    def test_a_stack_trace_only_appears_when_it_was_asked_for(self):
+        rows = [{"Id": 77012, "ExceptionType": "System.Boom",
+                 "StackTrace": "at A()\nat B()"}]
+        args = dict(type=None, summary=False, limit=50)
+        quiet = rock_query.cmd_exceptions(
+            SimpleNamespace(verbose=False, **args),
+            FakeClient(responses={"ExceptionLogs": rows}))
+        loud = rock_query.cmd_exceptions(
+            SimpleNamespace(verbose=True, **args),
+            FakeClient(responses={"ExceptionLogs": rows}))
+        self.assertEqual(quiet.rows[0][2], [])
+        self.assertEqual(loud.rows[0][2], ["at A()", "at B()"])

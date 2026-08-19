@@ -711,6 +711,58 @@ def _rock_query_caps():
                  f"more matched, or first, which asks for one row on purpose")
 
 
+def _formatted_id(node):
+    """True if this f-string field pads an entity Id into a column.
+
+    `f"{wf['Id']:5d}"` is a listing's id column. `f"(ID: {gt['Id']})"` is prose
+    with an id in it and has no format spec at all, which is the line between
+    the two: a width is only ever chosen for a column.
+    """
+    if not (isinstance(node, ast.FormattedValue) and node.format_spec):
+        return False
+    return any(isinstance(n, ast.Constant) and n.value == "Id"
+               for n in ast.walk(node.value))
+
+
+@check("rock-listing-rows")
+def _rock_listing_rows():
+    """The read side's id column is decided in one function.
+
+    Eighteen loops in `rock_query.py` formatted a row of "id  label" by hand,
+    and the width had drifted to three: `:5d` at eight of them, `:6d` at eight,
+    `:8d` at one. Nothing was wrong with any single line, which is why it drifted
+    -- each loop picked a width and none of them could see the others.
+
+    `row()` picks it once. A padded Id anywhere else is a nineteenth loop, and
+    the drift starts again from there, so this fails on one.
+
+    An id in prose is untouched: `f"(ID: {gt['Id']})"` has no format spec, and a
+    width is only ever chosen for a column.
+    """
+    rel = "plugins/rock/runtime/scripts/rock_query.py"
+    path = ROOT / rel
+
+    if not path.exists():
+        fail(rel, "is missing — this check guards it by path, so a move has to "
+                  "update the path here as well")
+        return
+
+    tree = ast.parse(path.read_text())
+    if "row" not in {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}:
+        fail(rel, "row() is gone. It is the one place this check allows an id "
+                  "column to be formatted, so removing it silently stops the "
+                  "guard from guarding")
+
+    owner = _by_function(tree)
+    for node in ast.walk(tree):
+        if owner.get(id(node)) == "row" or not _formatted_id(node):
+            continue
+        fail(f"{rel}:{node.lineno}",
+             f"{owner.get(id(node)) or '<module>'}() pads an Id into a column of "
+             f"its own. Build the line with row(), which is where the width is "
+             f"chosen for every listing")
+
+
 @check("no-repo-writes")
 def _no_repo_writes():
     """Nothing may write into a repository — attachments, screenshots, plans (ADR 0001)."""

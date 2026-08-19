@@ -8,6 +8,10 @@ Usage:
   uv run scripts/rock_query.py page "/volunteers"            # get by route
   uv run scripts/rock_query.py page 456                      # get by ID
   uv run scripts/rock_query.py search "volunteer"            # search across entities
+
+A command that answers with a list of entities builds a `Listing` and returns
+it; `render` prints it at the boundary. The detail views still print for
+themselves, which is the part of this that is half done.
 """
 
 import argparse
@@ -108,6 +112,78 @@ def tally(rows, more, hint="raise --limit"):
     return f"first {len(rows)} — more exist, {hint}" if more else str(len(rows))
 
 
+ID_WIDTH = 6
+_LABEL_COLUMN = 2 + ID_WIDTH + 2
+
+
+def row(entity_id, label, indent=2):
+    """One line of a listing: the id column, two spaces, then the label.
+
+    Eighteen loops formatted this by hand and the width had drifted to three --
+    `:5d` at eight of them, `:6d` at eight, `:8d` at one -- because each loop
+    picked its own. A column chosen once lines up between commands as well as
+    inside one, and CI fails on an id formatted anywhere but here.
+    """
+    return f"{' ' * indent}{entity_id:{ID_WIDTH}d}  {label}"
+
+
+class Listing:
+    """Rows an operator asked for, and whether Rock had more of them.
+
+    A command builds one and returns it; the boundary renders it. Twenty-nine
+    commands returned nothing and spoke only through `print`, so a test of one
+    had to capture stdout and match formatted text. The return value is the
+    test surface now.
+
+    The count, the note that says it is a cap, the empty case and the column a
+    label starts in are each written once here instead of once per command. The
+    empty line derives from the title -- "Data Views" gives "No data views
+    found." -- which is what all eight of them already said.
+    """
+
+    def __init__(self, title, more=False, hint="raise --limit", empty=None,
+                 spaced=False):
+        self.title = title
+        self.more = more
+        self.hint = hint
+        self.empty = f"No {title.lower()} found." if empty is None else empty
+        self.spaced = spaced
+        self.rows = []
+
+    def add(self, entity_id, label, *continued):
+        """One row, plus any lines continuing it under the label column."""
+        self.rows.append((entity_id, label, [c for c in continued if c]))
+        return self
+
+    def render(self):
+        if not self.rows:
+            if self.empty:
+                print(self.empty)
+            return
+        print(f"{self.title} ({tally(self.rows, self.more, self.hint)}):\n")
+        for entity_id, label, continued in self.rows:
+            print(row(entity_id, label))
+            for line in continued:
+                print(f"{' ' * _LABEL_COLUMN}{line}")
+            if self.spaced:
+                print()
+
+
+def render(report):
+    """Print what a command returned, and say whether it found anything.
+
+    This is the only place a listing reaches stdout. A command that returns
+    nothing printed for itself, which is still true of the detail views.
+    """
+    if report is None:
+        return
+    parts = report if isinstance(report, list) else [report]
+    for index, part in enumerate(parts):
+        if index:
+            print()
+        part.render()
+
+
 def _resolve_name(client, endpoint, entity_id, field="Name"):
     """Look up a single entity's name field by ID. Returns '?' on failure."""
     if not entity_id:
@@ -185,7 +261,7 @@ def _find_entity(client, endpoint, identifier, name_field="Name", label=None,
     if results:
         print(f"Multiple {label}s match '{identifier}':")
         for r in results:
-            print(f"  {r['Id']:6d}  {r.get(name_field, '?')}")
+            print(row(r["Id"], r.get(name_field, "?")))
         if more:
             print(more_note(identifier))
         return None
@@ -308,20 +384,18 @@ def cmd_workflows(args, client):
         params["$filter"] = f"Category/Name eq '{odata_str(args.category)}'"
 
     workflows, more = get_capped(client, "WorkflowTypes", params, args.limit)
-    if not workflows:
-        print("No workflows found.")
-        return
 
     # Build category ID-to-name map for display
     cat_ids = {wf["CategoryId"] for wf in workflows if wf.get("CategoryId")}
     cat_names = {cid: _resolve_name(client, "Categories", cid) for cid in cat_ids}
 
-    print(f"Workflows ({tally(workflows, more)}):\n")
+    listing = Listing("Workflows", more)
     for wf in workflows:
         active = "" if wf.get("IsActive") else " [inactive]"
         cat_name = cat_names.get(wf.get("CategoryId"), "")
         cat_str = f" ({cat_name})" if cat_name else ""
-        print(f"  {wf['Id']:5d}  {wf['Name']}{cat_str}{active}")
+        listing.add(wf["Id"], f"{wf['Name']}{cat_str}{active}")
+    return listing
 
 
 def cmd_workflow(args, client):
@@ -346,15 +420,13 @@ def cmd_pages(args, client):
         params["$filter"] = f"Layout/SiteId eq {args.site}"
 
     pages, more = get_capped(client, "Pages", params, args.limit)
-    if not pages:
-        print("No pages found.")
-        return
 
-    print(f"Pages ({tally(pages, more)}):\n")
+    listing = Listing("Pages", more)
     for p in pages:
         name = p.get("InternalName") or p.get("PageTitle") or "(untitled)"
         system = " [system]" if p.get("IsSystem") else ""
-        print(f"  {p['Id']:5d}  {name}{system}")
+        listing.add(p["Id"], f"{name}{system}")
+    return listing
 
 
 def cmd_page(args, client):
@@ -427,48 +499,41 @@ def cmd_search(args, client):
         "$filter": f"substringof('{odata_str(query)}', Name) eq true or substringof('{odata_str(query)}', Description) eq true",
         "$select": "Id,Name,IsActive",
     }, SEARCH_LIMIT)
-    if workflows:
-        print(f"Workflows ({tally(workflows, wf_more, WIDEN)}):")
-        for wf in workflows:
-            print(f"  {wf['Id']:5d}  {wf['Name']}")
-        print()
+    wf_listing = Listing("Workflows", wf_more, WIDEN, empty="")
+    for wf in workflows:
+        wf_listing.add(wf["Id"], wf["Name"])
 
     # Search pages
     pages, pg_more = get_capped(client, "Pages", {
         "$filter": f"substringof('{odata_str(query)}', InternalName) eq true or substringof('{odata_str(query)}', PageTitle) eq true",
         "$select": "Id,InternalName,PageTitle",
     }, SEARCH_LIMIT)
-    if pages:
-        print(f"Pages ({tally(pages, pg_more, WIDEN)}):")
-        for p in pages:
-            name = p.get("InternalName") or p.get("PageTitle") or "(untitled)"
-            print(f"  {p['Id']:5d}  {name}")
-        print()
+    pg_listing = Listing("Pages", pg_more, WIDEN, empty="")
+    for p in pages:
+        name = p.get("InternalName") or p.get("PageTitle") or "(untitled)"
+        pg_listing.add(p["Id"], name)
 
     # Search data views
     dvs, dv_more = get_capped(client, "DataViews", {
         "$filter": f"substringof('{odata_str(query)}', Name) eq true",
         "$select": "Id,Name",
     }, SEARCH_LIMIT)
-    if dvs:
-        print(f"Data Views ({tally(dvs, dv_more, WIDEN)}):")
-        for dv in dvs:
-            print(f"  {dv['Id']:5d}  {dv['Name']}")
-        print()
+    dv_listing = Listing("Data Views", dv_more, WIDEN, empty="")
+    for dv in dvs:
+        dv_listing.add(dv["Id"], dv["Name"])
 
     # Search groups
     groups, gp_more = get_capped(client, "Groups", {
         "$filter": f"substringof('{odata_str(query)}', Name) eq true and GroupTypeId ne {FAMILY_GROUP_TYPE_ID} and GroupTypeId ne {KNOWN_RELATIONSHIPS_GROUP_TYPE_ID}",
         "$select": "Id,Name",
     }, SEARCH_LIMIT)
-    if groups:
-        print(f"Groups ({tally(groups, gp_more, WIDEN)}):")
-        for g in groups:
-            print(f"  {g['Id']:5d}  {g['Name']}")
-        print()
+    gp_listing = Listing("Groups", gp_more, WIDEN, empty="")
+    for g in groups:
+        gp_listing.add(g["Id"], g["Name"])
 
-    if not workflows and not pages and not dvs and not groups:
-        print("No results found.")
+    found = [part for part in (wf_listing, pg_listing, dv_listing, gp_listing)
+             if part.rows]
+    return found or Listing("Results", empty="No results found.")
 
 
 def _check_email(action, activity, settings, issues):
@@ -679,7 +744,7 @@ def cmd_attributes(args, client):
         ft = ft_names.get(attr.get("FieldTypeId"), "?")
         req = " [required]" if attr.get("IsRequired") else ""
         grid = " [grid]" if attr.get("IsGridColumn") else ""
-        print(f"  {attr.get('Order', '?'):3d}  {attr['Key']} ({ft}){req}{grid}")
+        print(f"  {attr.get('Order', '?'):3}  {attr['Key']} ({ft}){req}{grid}")
         if attr.get("Description"):
             print(f"       {attr['Description'][:100]}")
 
@@ -693,13 +758,11 @@ def cmd_dataviews(args, client):
         params["$filter"] = f"substringof('{odata_str(args.category)}', Name) eq true"
 
     dvs, more = get_capped(client, "DataViews", params, args.limit)
-    if not dvs:
-        print("No data views found.")
-        return
 
-    print(f"Data Views ({tally(dvs, more)}):\n")
+    listing = Listing("Data Views", more)
     for dv in dvs:
-        print(f"  {dv['Id']:5d}  {dv['Name']}")
+        listing.add(dv["Id"], dv["Name"])
+    return listing
 
 
 def _load_filter_tree(client, filter_id, depth=0):
@@ -814,7 +877,9 @@ def cmd_person(args, client):
                     campus_cache[cid] = _resolve_name(client, "Campuses", cid)
                 if campus_cache[cid] != "?":
                     campus = f" [{campus_cache[cid]}]"
-            print(f"  {p['Id']:6d}  {p.get('FirstName', '')} {p.get('LastName', '')}{email}{campus}")
+            print(row(p["Id"],
+                      f"{p.get('FirstName', '')} {p.get('LastName', '')}"
+                      f"{email}{campus}"))
         if more:
             print(more_note(identifier))
 
@@ -992,11 +1057,11 @@ def cmd_exceptions(args, client):
         params["$filter"] = f"substringof('{odata_str(args.type)}', ExceptionType) eq true"
 
     exceptions, more = get_capped(client, "ExceptionLogs", params, args.limit)
-    if not exceptions:
-        print("No exceptions found.")
-        return
 
     if args.summary:
+        if not exceptions:
+            print("No exceptions found.")
+            return None
         # Group by ExceptionType and count
         counts = {}
         for ex in exceptions:
@@ -1009,25 +1074,21 @@ def cmd_exceptions(args, client):
         print(f"Exception summary ({window}):\n")
         for etype, count in sorted(counts.items(), key=lambda x: -x[1]):
             print(f"  {count:4d}  {etype}")
-        return
+        return None
 
-    print(f"Exceptions ({tally(exceptions, more)}):\n")
+    listing = Listing("Exceptions", more, spaced=True)
     for ex in exceptions:
         dt = (ex.get("CreatedDateTime") or "")[:19]
         etype = ex.get("ExceptionType", "Unknown")
         short_type = etype.split(".")[-1] if "." in etype else etype
         desc = (ex.get("Description") or "")[:120]
         url = ex.get("PageUrl", "")
-        print(f"  {ex['Id']:6d}  [{dt}] {short_type}")
-        if desc:
-            print(f"    {desc}")
-        if url:
-            print(f"    URL: {url}")
-        if args.verbose and ex.get("StackTrace"):
-            trace_lines = ex["StackTrace"].split("\n")[:5]
-            for line in trace_lines:
-                print(f"    {line.strip()}")
-        print()
+        trace = ex["StackTrace"].split("\n")[:5] if (
+            args.verbose and ex.get("StackTrace")) else []
+        listing.add(ex["Id"], f"[{dt}] {short_type}", desc,
+                    f"URL: {url}" if url else "",
+                    *(line.strip() for line in trace))
+    return listing
 
 
 def cmd_exception(args, client):
@@ -1079,14 +1140,12 @@ def cmd_schedules(args, client):
         params["$filter"] = " and ".join(filters)
 
     schedules, more = get_capped(client, "Schedules", params, args.limit)
-    if not schedules:
-        print("No schedules found.")
-        return
 
-    print(f"Schedules ({tally(schedules, more)}):\n")
+    listing = Listing("Schedules", more)
     for s in schedules:
         active = "" if s.get("IsActive") else " [inactive]"
-        print(f"  {s['Id']:5d}  {s['Name']}{active}")
+        listing.add(s["Id"], f"{s['Name']}{active}")
+    return listing
 
 
 def cmd_schedule(args, client):
@@ -1128,18 +1187,16 @@ def cmd_registrations(args, client):
         params["$filter"] = " and ".join(filters)
 
     regs, more = get_capped(client, "RegistrationInstances", params, args.limit)
-    if not regs:
-        print("No registration instances found.")
-        return
 
-    print(f"Registration Instances ({tally(regs, more)}):\n")
+    listing = Listing("Registration Instances", more)
     for r in regs:
         active = "" if r.get("IsActive") else " [inactive]"
         start = (r.get("StartDateTime") or "")[:10]
         end = (r.get("EndDateTime") or "")[:10]
         date_range = f" ({start} to {end})" if start else ""
         max_att = f" [max: {r['MaxAttendees']}]" if r.get("MaxAttendees") else ""
-        print(f"  {r['Id']:5d}  {r['Name']}{active}{date_range}{max_att}")
+        listing.add(r["Id"], f"{r['Name']}{active}{date_range}{max_att}")
+    return listing
 
 
 def cmd_registration(args, client):
@@ -1195,15 +1252,12 @@ def cmd_connections(args, client):
         params["$filter"] = " and ".join(filters)
 
     requests, more = get_capped(client, "ConnectionRequests", params, args.limit)
-    if not requests:
-        print("No connection requests found.")
-        return
 
     opp_cache = {}
     status_cache = {}
     person_cache = {}
 
-    print(f"Connection Requests ({tally(requests, more)}):\n")
+    listing = Listing("Connection Requests", more, spaced=True)
     for cr in requests:
         dt = (cr.get("CreatedDateTime") or "")[:10]
         person = _resolve_person_name(client, cr.get("PersonAliasId"), person_cache)
@@ -1220,11 +1274,10 @@ def cmd_connections(args, client):
             status_cache[status_id] = _resolve_name(client, "ConnectionStatuses", status_id)
         status_name = status_cache.get(status_id, "?")
 
-        print(f"  {cr['Id']:6d}  [{state:9s}] {person:25s} -> {connector}")
-        print(f"          {opp_name} | {status_name} | {dt}")
-        if cr.get("Comments"):
-            print(f"          {cr['Comments'][:100]}")
-        print()
+        listing.add(cr["Id"], f"[{state:9s}] {person:25s} -> {connector}",
+                    f"{opp_name} | {status_name} | {dt}",
+                    (cr.get("Comments") or "")[:100])
+    return listing
 
 
 def cmd_block(args, client):
@@ -1294,13 +1347,10 @@ def cmd_bgc(args, client):
         params["$filter"] = " and ".join(filters)
 
     checks, more = get_capped(client, "BackgroundChecks", params, args.limit)
-    if not checks:
-        print("No background checks found.")
-        return
 
     person_cache = {}
 
-    print(f"Background Checks ({tally(checks, more)}):\n")
+    listing = Listing("Background Checks", more)
     for bc in checks:
         req_date = (bc.get("RequestDate") or "")[:10]
         resp_date = (bc.get("ResponseDate") or "")[:10]
@@ -1310,8 +1360,10 @@ def cmd_bgc(args, client):
         pkg = bc.get("PackageName", "")
         pkg_str = f" ({pkg})" if pkg else ""
 
-        print(f"  {bc['Id']:6d}  {person:25s} [{status}]{found}{pkg_str}")
-        print(f"          Requested: {req_date}  Responded: {resp_date or 'pending'}")
+        listing.add(bc["Id"], f"{person:25s} [{status}]{found}{pkg_str}",
+                    f"Requested: {req_date}  "
+                    f"Responded: {resp_date or 'pending'}")
+    return listing
 
 
 def cmd_checkin(args, client):
@@ -1373,7 +1425,7 @@ def cmd_checkin(args, client):
             print(f"  Sub-areas ({tally(children, children_capped, hint=CHILD_HINT)}):")
             for child in children:
                 active = "" if child.get("IsActive") else " [inactive]"
-                print(f"    {child['Id']:6d}  {child['Name']}{active}")
+                print(row(child["Id"], f"{child['Name']}{active}", indent=4))
         return
 
     # Default: show check-in group type hierarchy
@@ -1396,7 +1448,7 @@ def cmd_checkin(args, client):
             print(f"    (only the first {CHILD_LIMIT} are shown)")
         for g in top_groups:
             active = "" if g.get("IsActive") else " [inactive]"
-            print(f"    {g['Id']:6d}  {g['Name']}{active}")
+            print(row(g["Id"], f"{g['Name']}{active}", indent=4))
             # First level children
             children, children_capped = get_capped(client, "Groups", {
                 "$filter": f"ParentGroupId eq {g['Id']}",
@@ -1407,7 +1459,7 @@ def cmd_checkin(args, client):
                 print(f"      (only the first {CHILD_LIMIT} are shown)")
             for child in children:
                 ca = "" if child.get("IsActive") else " [inactive]"
-                print(f"      {child['Id']:6d}  {child['Name']}{ca}")
+                print(row(child["Id"], f"{child['Name']}{ca}", indent=6))
         print()
 
 
@@ -1426,15 +1478,13 @@ def cmd_attendance(args, client):
     if filters:
         params["$filter"] = " and ".join(filters)
 
-    occurrences, more = get_capped(client, "AttendanceOccurrences", params, args.limit)
-    if not occurrences:
-        print("No attendance occurrences found.")
-        return
+    occurrences, more = get_capped(client, "AttendanceOccurrences", params,
+                                   args.limit)
 
     group_cache = {}
     location_cache = {}
 
-    print(f"Attendance Occurrences ({tally(occurrences, more)}):\n")
+    listing = Listing("Attendance Occurrences", more)
     for occ in occurrences:
         occ_date = (occ.get("OccurrenceDate") or "")[:10]
 
@@ -1451,7 +1501,8 @@ def cmd_attendance(args, client):
         did_not = " [DID NOT OCCUR]" if occ.get("DidNotOccur") else ""
         loc_str = f" @ {loc_name}" if loc_name else ""
 
-        print(f"  {occ['Id']:8d}  {occ_date}  {group_name}{loc_str}{did_not}")
+        listing.add(occ["Id"], f"{occ_date}  {group_name}{loc_str}{did_not}")
+    return listing
 
 
 def cmd_occurrence(args, client):
@@ -1817,7 +1868,7 @@ def main():
     with api_errors_reported():
         client = RockClient()
         try:
-            parsed.func(parsed, client)
+            render(parsed.func(parsed, client))
             log.info("cmd=%s ok", parsed.command)
         except Exception:
             log.error("cmd=%s failed\n%s", parsed.command, traceback.format_exc())

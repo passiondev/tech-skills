@@ -152,5 +152,62 @@ def cmd_things(client):
         self.assertEqual(found, [])
 
 
+class TestTheListingCheckCatchesADriftingColumn(CheckTestCase):
+    """rock-listing-rows — the id column is decided in one function."""
+
+    ROW = '''
+ID_WIDTH = 6
+
+
+def row(entity_id, label, indent=2):
+    return f"{' ' * indent}{entity_id:{ID_WIDTH}d}  {label}"
+'''
+
+    def rows(self, added=""):
+        return self.run_check(checks._rock_listing_rows,
+                              {str(QUERY_PATH): self.ROW + added})
+
+    def test_the_one_formatter_alone_is_clean(self):
+        self.assertEqual(self.rows(), [])
+
+    def test_a_hand_padded_id_is_caught(self):
+        found = self.rows('''
+def cmd_things(rows):
+    for r in rows:
+        print(f"  {r['Id']:5d}  {r['Name']}")
+''')
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("cmd_things", found[0])
+
+    def test_an_id_in_prose_is_left_alone(self):
+        self.assertEqual(self.rows('''
+def cmd_thing(gt):
+    print(f"  Group Type: {gt['Name']} (ID: {gt['Id']})")
+'''), [])
+
+    def test_another_padded_column_is_not_an_id(self):
+        self.assertEqual(self.rows('''
+def cmd_summary(counts):
+    for etype, count in counts.items():
+        print(f"  {count:4d}  {etype}")
+'''), [])
+
+    def test_deleting_the_formatter_fails_rather_than_disarming_the_check(self):
+        found = self.run_check(checks._rock_listing_rows,
+                               {str(QUERY_PATH): "x = 1\n"})
+        self.assertTrue(any("row()" in f for f in found), found)
+
+    def test_moving_the_file_fails_rather_than_passing_vacuously(self):
+        found = self.run_check(checks._rock_listing_rows, {})
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("missing", found[0])
+
+    def test_the_repository_itself_passes(self):
+        found = self.run_check(
+            checks._rock_listing_rows,
+            {str(QUERY_PATH): (ROOT / QUERY_PATH).read_text()})
+        self.assertEqual(found, [])
+
+
 if __name__ == "__main__":
     unittest.main()
