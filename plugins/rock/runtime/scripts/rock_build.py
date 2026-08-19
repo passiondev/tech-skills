@@ -510,12 +510,15 @@ def create_workflow(plan, client, catalog):
     result = BuildResult()
     wf = plan["workflow"]
 
-    # Resolve category
+    # A plan that named a category and did not get one is a plan that did not
+    # happen: nothing in Rock says where the workflow was meant to be filed, so
+    # whoever goes looking for it there finds nothing. This was a `Warning:`
+    # line, a workflow filed nowhere, and a report saying it was created.
     category_id = None
-    if "category" in wf:
-        category_id = resolve_category(client, wf["category"])
-        if not category_id:
-            print(f"  Warning: category '{wf['category']}' not found, creating without category")
+    if wf.get("category") or wf.get("category_id"):
+        with step(result, "WorkflowType", wf["name"]):
+            category_id = resolve_ref(wf, "category_id", "category",
+                                      resolve_category, client)
 
     # 1. Create WorkflowType
     wf_data = {
@@ -534,8 +537,20 @@ def create_workflow(plan, client, catalog):
         result.add("WorkflowType", wf["name"], wf_id)
 
     # 2. Create Attributes on the WorkflowType
-    wf_entity_type_id = get_workflow_entity_type_id(client)
+    #
+    # The EntityType every attribute below is qualified against. It is two
+    # requests that answer nothing for a workflow declaring no attributes, so
+    # one does not send them; and where Rock names no EntityType at all, every
+    # Attribute below would post a null EntityTypeId and 400 one at a time.
     attr_ids = {}
+    wf_entity_type_id = None
+    if wf.get("attributes"):
+        wf_entity_type_id = get_workflow_entity_type_id(client)
+        if not wf_entity_type_id:
+            result.fail("Attribute", wf["attributes"][0]["key"],
+                        "Rock names no EntityType for WorkflowType, so nothing "
+                        "can qualify an attribute to this workflow")
+            return result
 
     for attr_def in wf.get("attributes", []):
         field_type_id = resolve_field_type(catalog, attr_def.get("field_type", "Text"))
@@ -618,8 +633,14 @@ def create_workflow(plan, client, catalog):
                 for field_order, field_key in enumerate(form_def.get("attributes", [])):
                     attr_id = attr_ids.get(field_key)
                     if not attr_id:
-                        print(f"  Warning: form attribute '{field_key}' not found in workflow attributes")
-                        continue
+                        # A form short of a field does not collect what the plan
+                        # says it collects, and the person filling it in has no
+                        # way to know. This was a `Warning:` line, a `continue`,
+                        # and a report saying the workflow was created.
+                        result.fail("FormAttribute", field_key,
+                                    f"no attribute {field_key!r} on this workflow. "
+                                    f"It defines: {', '.join(attr_ids) or 'none'}")
+                        return result
 
                     form_attr_data = {
                         "WorkflowActionFormId": form_id,

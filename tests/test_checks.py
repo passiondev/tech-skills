@@ -22,6 +22,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 QUERY_PATH = Path("plugins/rock/runtime/scripts/rock_query.py")
+BUILD_PATH = Path("plugins/rock/runtime/scripts/rock_build.py")
 
 
 def _load_checks():
@@ -346,6 +347,114 @@ def cmd_group(args, client):
         found = self.run_check(
             checks._rock_read_views,
             {str(QUERY_PATH): (ROOT / QUERY_PATH).read_text()})
+        self.assertEqual(found, [])
+
+
+class TestTheBuildCheckCatchesAHandlerThatPrints(CheckTestCase):
+    """rock-build-reports -- a handler records what it did, `report` prints it.
+
+    The mechanics are the ones above: the same two helpers find the calls, so
+    stderr, a nested `def`, `sys.stdout.write` and a stale list entry all behave
+    the way the read side tests already assert. What is specific here is who
+    counts as the boundary, and it is not `render` -- a write reports what landed
+    and what did not, which is a different thing to say.
+    """
+
+    BASE = "\n".join([
+        "import sys",
+        "",
+        "",
+        "class BuildResult:",
+        "    def report(self):",
+        "        print('Build results:')",
+        "",
+        "",
+        "def api_request(plan, client):",
+        "    print('  POST Groups')",
+        "",
+        "",
+        "def require_writes_enabled(operation):",
+        "    print('Refusing: writes are not enabled')",
+        "",
+        "",
+        "def read_plan():",
+        "    print('Error: file not found')",
+        "",
+    ])
+
+    def handlers(self, added=""):
+        return self.run_check(checks._rock_build_reports,
+                              {str(BUILD_PATH): self.BASE + added})
+
+    def test_the_reporter_and_the_three_that_run_before_a_handler_are_clean(self):
+        self.assertEqual(self.handlers(), [])
+
+    def test_a_handler_that_prints_is_caught(self):
+        found = self.handlers("\n".join([
+            "",
+            "def create_group(plan, client):",
+            "    print('  Created group')",
+            "",
+        ]))
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("create_group", found[0])
+        self.assertIn("BuildResult", found[0])
+
+    def test_a_handler_that_records_what_it_did_is_clean(self):
+        self.assertEqual(self.handlers("\n".join([
+            "",
+            "def create_group(plan, client):",
+            "    result = BuildResult()",
+            "    result.add('Group', plan['group']['name'], 1001)",
+            "    return result",
+            "",
+        ])), [])
+
+    def test_the_two_warning_lines_this_check_was_written_for_are_caught(self):
+        """The shape `create_workflow` held: print, carry on, report created.
+
+        Both lines said the plan named something Rock does not have. A category
+        it could not resolve left the workflow filed nowhere; a form field
+        naming no attribute left the form collecting less than the plan said.
+        Both are recorded failures now, and this is the guard on that.
+        """
+        found = self.handlers("\n".join([
+            "",
+            "def create_workflow(plan, client, catalog):",
+            "    if not category_id:",
+            "        print('  Warning: category not found, creating without')",
+            "    if not attr_id:",
+            "        print('  Warning: form attribute not found')",
+            "",
+        ]))
+        self.assertEqual(len(found), 2, found)
+        self.assertTrue(all("create_workflow" in f for f in found), found)
+
+    def test_a_warning_on_stderr_is_still_available_to_a_handler(self):
+        self.assertEqual(self.handlers("\n".join([
+            "",
+            "def create_group(plan, client):",
+            "    print('slow lookup', file=sys.stderr)",
+            "",
+        ])), [])
+
+    def test_an_allow_list_entry_that_no_longer_exists_is_caught(self):
+        source = self.BASE.replace("def read_plan", "def load_plan")
+        found = self.run_check(checks._rock_build_reports, {str(BUILD_PATH): source})
+        self.assertEqual(len(found), 2, found)
+        self.assertIn("read_plan", found[0])
+        self.assertIn("no longer exists", found[0])
+        self.assertIn("load_plan", found[1])
+
+    def test_moving_the_file_fails_rather_than_passing_vacuously(self):
+        found = self.run_check(checks._rock_build_reports, {})
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("missing", found[0])
+
+    def test_the_repository_itself_passes(self):
+        found = self.run_check(
+            checks._rock_build_reports,
+            {str(BUILD_PATH): (ROOT / BUILD_PATH).read_text()})
         self.assertEqual(found, [])
 
 

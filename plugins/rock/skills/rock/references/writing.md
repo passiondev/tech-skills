@@ -372,12 +372,13 @@ and say what it is missing, so someone finishes or deletes it rather than findin
 it later and assuming it works. Then stop and hand it back — an inconsistent
 workflow someone knows about beats a "clean" one rebuilt from guesses.
 
-`Warning:` lines are a separate thing — an unresolved category, a form field
-naming an attribute that does not exist — and the entity really is created
-despite them, so read them and say what is missing.
+A plan naming something Rock does not have — a category that resolves to
+nothing, a form field with no attribute behind it — fails that entity rather
+than warning about it. There is no `Warning:` line to read: every line in the
+report is a ✓ or a ✗, and a ✗ means that part of the plan is not in Rock.
 
 Newly created workflows commonly audit dirty on the first pass: an activity
 nothing activates, an email with no body yet. Better to find that now.
 
-Done when the report accounts for every line of the plan, applied or not, every
-`Warning:` line, and quotes the re-query.
+Done when the report accounts for every line of the plan, applied or not, and
+quotes the re-query.

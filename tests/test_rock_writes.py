@@ -705,6 +705,69 @@ class TestCreateWorkflow(WriteTestCase):
         self.assertSucceeded(result)
         self.assertNotIn("CategoryId", client.writes[0]["data"])
 
+    def test_a_category_id_the_plan_states_needs_no_lookup(self):
+        plan = self.variant()
+        plan["workflow"]["category_id"] = 9
+        client, result = self.build(plan)
+        self.assertSucceeded(result)
+        self.assertEqual(client.writes[0]["data"]["CategoryId"], 9)
+        self.assertEqual([c for c in client.calls
+                          if c["endpoint"] == "Categories"], [])
+
+    def test_a_category_that_does_not_resolve_stops_before_anything_exists(self):
+        """The old shape printed `Warning:` and created the workflow anyway.
+
+        A workflow filed nowhere is one nobody finds by looking where the plan
+        said it would be, and the report called it created. Resolving happens
+        before the first POST, so failing here costs nothing.
+        """
+        plan = self.variant()
+        plan["workflow"]["category"] = "Faciltiies"
+        client = FakeClient(responses={"EntityTypes": [{"Id": 113}]})
+        result = self.assertStopped(
+            rock_build.create_workflow, plan, client, CATALOG)
+        self.assertFalse(result.success)
+        self.assertEqual(client.writes, [], "nothing should be created")
+        self.assertIn("Faciltiies", result.failures[0]["error"])
+
+    def test_a_form_field_naming_no_attribute_stops_the_plan(self):
+        """The other `Warning:` line, and the same reasoning.
+
+        A form short of a field collects less than the plan says it collects,
+        which is invisible from Rock and invisible to whoever fills it in. The
+        failure names the keys the workflow does have, because a typo is the
+        likely cause and the list is the answer to it.
+        """
+        plan = self.variant()
+        plan["workflow"]["activities"][0]["actions"][0]["form"]["attributes"] = [
+            "RequestDetail", "RequestDetial"]
+        client, result = self.build(plan)
+        self.assertFalse(result.success)
+        posted = [c["endpoint"] for c in client.writes]
+        self.assertEqual(posted.count("WorkflowActionFormAttributes"), 1,
+                         "the field it could place, and then it stops")
+        self.assertIn("RequestDetial", result.failures[0]["error"])
+        self.assertIn("RequestDetail", result.failures[0]["error"],
+                      "the failure lists the keys that do exist")
+
+    def test_a_workflow_declaring_no_attributes_looks_up_no_entity_type(self):
+        plan = self.variant()
+        del plan["workflow"]["attributes"]
+        plan["workflow"]["activities"][0]["actions"][0]["form"]["attributes"] = []
+        client, result = self.build(plan)
+        self.assertSucceeded(result)
+        self.assertEqual([c for c in client.calls
+                          if c["endpoint"] == "EntityTypes"], [],
+                         "two requests that would answer nothing")
+
+    def test_an_unnamed_entity_type_stops_before_the_attribute_is_posted(self):
+        """Every Attribute would carry a null EntityTypeId and 400 on its own."""
+        client = FakeClient()
+        result = rock_build.create_workflow(self.PLAN, client, CATALOG)
+        self.assertFalse(result.success)
+        self.assertEqual([c["endpoint"] for c in client.writes], ["WorkflowTypes"])
+        self.assertEqual(result.failures[0]["type"], "Attribute")
+
     def test_an_unknown_field_type_stops_before_the_attribute_is_posted(self):
         plan = self.variant()
         plan["workflow"]["attributes"][0]["field_type"] = "Interpretive Dance"

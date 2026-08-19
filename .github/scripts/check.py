@@ -1085,6 +1085,59 @@ def _stdout_callers(tree):
     return named, total
 
 
+# The only things in `rock_build.py` that may reach stdout. A handler records
+# what it did to Rock and answers with it, so one method renders every outcome:
+# a gate refusal, a first request that 400ed, and a plan that finished all read
+# the same way. The three exceptions are not handlers. `api_request` prints the
+# request it is about to send, which is the whole review step for the one
+# operation with no shape to check (ADR 0022). The write gate and the plan reader
+# print why they stopped, before any handler ran.
+_ROCK_BUILD_MAY_PRINT = {
+    "BuildResult.report", "api_request", "require_writes_enabled", "read_plan",
+}
+
+
+def _stdout_boundary(rel, allowed, remedy):
+    """Fail unless every stdout call in one module is on that module's list.
+
+    Both Rock runtime scripts carry the same rule and differ only in who prints.
+    The read side answers with a renderable and `render` prints it; the write
+    side records what it did and `BuildResult.report` prints that. So the file,
+    the list and the remedy are arguments, and the four ways the rule breaks are
+    written once.
+
+    Every name on a list has to exist, so renaming one means visiting the list
+    rather than leaving a dead entry to cover a future namesake.
+    """
+    path = ROOT / rel
+
+    if not path.exists():
+        fail(rel, "is missing — this check guards it by path, so a move has to "
+                  "update the path here as well")
+        return
+
+    tree = ast.parse(path.read_text())
+    defined = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
+    defined |= {f"{top.name}.{member.name}" for top in tree.body
+                if isinstance(top, ast.ClassDef) for member in top.body
+                if isinstance(member, ast.FunctionDef)}
+    for name in sorted(allowed - defined):
+        fail(rel, f"{name} may print, by this check's list, and no longer exists. "
+                  f"Drop it from the list, so the next definition to take that "
+                  f"name does not inherit the exemption")
+
+    named, total = _stdout_callers(tree)
+    if len(named) != total:
+        fail(rel, f"{total - len(named)} call(s) reach stdout from somewhere this "
+                  f"check does not look — module level, or a definition nested "
+                  f"inside a class inside something else. Move the printing into "
+                  f"a function, or teach _stdout_callers where to look")
+
+    for name, lineno in named:
+        if name not in allowed:
+            fail(f"{rel}:{lineno}", f"{name} prints. {remedy}")
+
+
 @check("rock-read-views")
 def _rock_read_views():
     """A command returns its answer. One function prints it.
@@ -1099,42 +1152,35 @@ def _rock_read_views():
     in the module that reaches stdout and is not on the list above. Widening it
     from the read commands to the whole module cost nothing, because the last
     helper that reported for itself was `_find_entity`, and it raises now.
-
-    Every name on the list has to exist, so renaming one means visiting the list
-    rather than leaving a dead entry to cover a future namesake.
     """
-    rel = "plugins/rock/runtime/scripts/rock_query.py"
-    path = ROOT / rel
+    _stdout_boundary(
+        "plugins/rock/runtime/scripts/rock_query.py", _ROCK_MAY_PRINT,
+        "Build a Listing, a Detail, a Raw or a Text and return it — render() is "
+        "the only place the read side reaches stdout, and a command that prints "
+        "answers its caller with nothing")
 
-    if not path.exists():
-        fail(rel, "is missing — this check guards it by path, so a move has to "
-                  "update the path here as well")
-        return
 
-    tree = ast.parse(path.read_text())
-    defined = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
-    defined |= {f"{top.name}.{member.name}" for top in tree.body
-                if isinstance(top, ast.ClassDef) for member in top.body
-                if isinstance(member, ast.FunctionDef)}
-    for name in sorted(_ROCK_MAY_PRINT - defined):
-        fail(rel, f"{name} may print, by this check's list, and no longer exists. "
-                  f"Drop it from the list, so the next definition to take that "
-                  f"name does not inherit the exemption")
+@check("rock-build-reports")
+def _rock_build_reports():
+    """A handler records what it did to Rock. One method prints that.
 
-    named, total = _stdout_callers(tree)
-    if len(named) != total:
-        fail(rel, f"{total - len(named)} call(s) reach stdout from somewhere this "
-                  f"check does not look — module level, or a definition nested "
-                  f"inside a class inside something else. Move the printing into "
-                  f"a function, or teach _stdout_callers where to look")
+    Sixty-three calls to a reporting helper used to sit through these handlers,
+    one beside all but six of the failure paths, so the answer to "where did
+    this line come from" depended on which request failed. `BuildResult` holds
+    the record now and `run_plan` renders it once, at the end, on whatever the
+    handler returned.
 
-    for name, lineno in named:
-        if name in _ROCK_MAY_PRINT:
-            continue
-        fail(f"{rel}:{lineno}",
-             f"{name} prints. Build a Listing, a Detail, a Raw or a Text and "
-             f"return it — render() is the only place the read side reaches "
-             f"stdout, and a command that prints answers its caller with nothing")
+    One handler kept printing anyway, twice, and both lines said `Warning:`
+    about something the plan named and did not get. That is the shape ADR 0022
+    rejected: a report saying created about an entity missing a part of what was
+    asked for. Both are failures now, and this is what stops a third being
+    written, because printing is how the first two got past a reader.
+    """
+    _stdout_boundary(
+        "plugins/rock/runtime/scripts/rock_build.py", _ROCK_BUILD_MAY_PRINT,
+        "Record it on the BuildResult instead — result.add for what landed, "
+        "result.fail for what did not, and report() prints the lot once. A "
+        "handler that prints is a handler whose output nothing can assert")
 
 
 @check("no-repo-writes")
