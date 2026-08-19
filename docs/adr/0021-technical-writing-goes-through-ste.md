@@ -36,3 +36,5 @@ They are near-opposites. **`to-ste` removes voice on purpose. `humanize` puts it
 `general` now carries two de-slopping skills that every department installs, distinguished by a single word in both descriptions. If people route to the wrong one, the discriminator is the thing to fix, not the skill count.
 
 The seven call sites are duplication of a kind: seven sentences that all say "run `/general:to-ste` before delivering". They are cheap and each names its own mode and exemptions, which is the part that cannot be centralised. If an eighth and ninth appear and the sentences start drifting, that is the signal to reconsider.
+
+> *An eighth call site landed in `jira:ticket`. The skill runs the pass twice now: once over a write-up it composes, and once over a comment before it asks to post. The second sentence points at the exemptions the first one names rather than restating them. The drift half of this tripwire has not fired. The thing to watch is a call site that states its own exemptions where another already states them.*

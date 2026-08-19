@@ -1,9 +1,4 @@
----
-name: status
-description: Check whether Rock RMS is reachable, refresh the cached catalog, read Rock's exception logs, and set up or troubleshoot Rock credentials. Use for "rock status", "rock refresh", "is Rock up", "what's erroring in Rock", screenshotting a Rock page, connection failures, and first-time Rock setup.
----
-
-# Rock connection, catalog, and errors
+# Connection, catalog, logs, and screenshots
 
 ```bash
 R="${CLAUDE_PLUGIN_ROOT}/runtime/rock.sh"
@@ -23,13 +18,17 @@ ROCK_USERNAME=your_rock_login
 ROCK_PASSWORD=your_rock_password
 ```
 
-Real environment variables win over the file if both are set. The account needs
-admin access; the client signs in with `POST /api/Auth/Login` and reuses the
-session cookie. Ask whoever administers Rock for the URL and for an account —
-do not guess the hostname.
+Real environment variables win over the file if both are set. The client signs in
+with `POST /api/Auth/Login` and reuses the session cookie. Ask whoever
+administers Rock for the URL and for an account — do not guess the hostname.
 
-Setup is done when `catalog status` prints a Rock version and the search
-returns at least one match:
+**Ask for the narrowest account that does the job.** Rock's permissions are the
+only limit on what these tools can change; there is no read-only install to fall
+back on. Someone who only ever looks things up should be given an account that
+only ever looks things up.
+
+Setup is done when `catalog status` prints a Rock version and a search returns at
+least one match:
 
 ```bash
 "$R" catalog status
@@ -38,10 +37,10 @@ returns at least one match:
 
 ## The catalog
 
-The catalog caches Rock's building blocks — action components, block types,
-field types, categories, sites — so name-to-ID lookups do not hit the API every
-time. Refresh it on first use, after anyone installs a Rock plugin, and when a
-lookup fails for something you can see in the Rock UI.
+The catalog caches Rock's building blocks — action components, block types, field
+types, categories, sites — so name-to-ID lookups do not hit the API every time.
+Refresh it on first use, after anyone installs a Rock plugin, and when a lookup
+fails for something you can see in the Rock UI.
 
 Prefer the catalog over hardcoded IDs. IDs differ between Rock instances, and a
 hardcoded one that happens to work today is a bug waiting for a restore.
@@ -58,15 +57,14 @@ Start with `--summary`: a handful of noisy recurring types dominate the log and
 bury anything new in a raw list. Compare counts and first-seen dates before
 concluding anything is new.
 
-`--verbose` adds stack traces to the list. Only useful once you have narrowed
-to a type.
-
-Deleting exception logs is a write, and it lives in the `rock-build` plugin.
+`--verbose` adds stack traces to the list, and is only useful once you have
+narrowed to a type. Deleting exception logs is a write — `exception-clear` in
+`references/writing.md`.
 
 ## The browser tooling is opt-in
 
-Screenshots and page verification need Playwright — a ~150 MB Chromium
-download, not installed by default. To add it:
+Screenshots and page verification need Playwright — a ~150 MB Chromium download,
+not installed by default. To add it:
 
 ```bash
 ROCK_WITH_BROWSER=1 "$R" catalog status   # installs Playwright and Chromium, once
@@ -92,12 +90,16 @@ Everything the runtime writes is under `~/.claude/passion-rock`:
 | `catalog.json` | the cached catalog |
 | `rock.log` | every API call and command — 2 MB rotating, 3 backups |
 | `screenshots/` | anything the browser tooling captured |
+| `snapshots/` | the entity a `PUT` replaced, written before the request went |
 | `.browser` | present once you opted into the browser tooling. Delete it and the next command re-syncs without Playwright |
 
-This directory is deliberately outside the plugin, because plugin directories
-are replaced wholesale on every update. `rock.log` is the first place to look
-when a command fails for no visible reason; it holds the full traceback that
-the command itself did not print.
+This directory is deliberately outside the plugin, because plugin directories are
+replaced wholesale on every update. It is also not managed by the plugin system:
+uninstalling Rock leaves the virtualenv, the catalog and the log behind, and
+deleting the directory is the way to reclaim them.
+
+`rock.log` is the first place to look when a command fails for no visible reason;
+it holds the full traceback that the command itself did not print.
 
 ## When the connection fails
 
@@ -112,3 +114,14 @@ Work through it in this order:
 
 Report all four with the result of each, and scope the conclusion to what you
 checked: "cannot reach it from here" is what these four establish.
+
+## When a write is refused
+
+```
+Refusing to run 'person-update': it modifies a person record, and it was not
+reached through rock.sh.
+```
+
+That means the script was run directly rather than through the entry point. Run
+it as `rock.sh query person-update ...`; the entry point is what logs the call
+and enables the write.

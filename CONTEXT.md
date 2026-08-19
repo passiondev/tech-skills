@@ -13,7 +13,7 @@ Anything the marketplace lists and a person can install. Always either a capabil
 _Avoid_: package, module
 
 **Capability plugin**:
-A plugin that contains skills. Its name is the namespace those skills are invoked under, so it is short: `/rock:inspect`.
+A plugin that contains skills. Its name is the namespace those skills are invoked under, so it is short: `/dev:tdd`.
 _Avoid_: skill pack, library
 
 **Department bundle**:
@@ -33,7 +33,7 @@ A deliberate change to a vendored skill, recorded in `docs/vendored.json`. The p
 _Avoid_: patch, customisation, drift
 
 **Runtime**:
-The executable code a plugin needs, installed outside the plugin so it survives updates. Rock has one, shared by two plugins at `~/.claude/passion-rock`. Skills are prose; a runtime is not.
+The executable code a plugin needs, installed outside the plugin so it survives updates. Rock has one, at `~/.claude/passion-rock`. Skills are prose; a runtime is not.
 _Avoid_: environment, install, venv
 
 **Passion skill**:
@@ -64,8 +64,9 @@ plugins/<name>/
   .claude-plugin/plugin.json      name, description, dependencies
   skills/<skill>/SKILL.md         one skill; supporting files sit beside it
   runtime/                        executable code, if the plugin has any
-docs/adr/                         twenty-one decisions and why
+docs/adr/                         twenty-three decisions and why
 docs/vendored.json                where every skill came from, and what we changed
+tests/                            what the runtime scripts send to Rock, asserted
 ONBOARDING.md                     read and acted on by Claude Code, not by a person
 ```
 

@@ -38,16 +38,9 @@
     {
       "name": "rock",
       "source": "./plugins/rock",
-      "description": "Read Rock RMS: find and inspect workflows, pages, blocks, people, groups, and data.",
+      "description": "Rock RMS, read and write: find and inspect workflows, pages, groups and data; audit and repair; create; change a roster; write Lava.",
       "category": "rock",
-      "tags": ["rock", "rms", "lava", "read-only"]
-    },
-    {
-      "name": "rock-build",
-      "source": "./plugins/rock-build",
-      "description": "Change Rock RMS: diagnose broken workflows, repair them, and create new entities.",
-      "category": "rock",
-      "tags": ["rock", "rms", "workflows", "write"]
+      "tags": ["rock", "rms", "workflows", "lava", "groups"]
     },
     {
       "name": "global-engineering",

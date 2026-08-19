@@ -12,7 +12,7 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
-from rock_client import RockClient, load_config
+from rock_client import RockClient, api_errors_reported
 from rock_log import get_logger
 
 log = get_logger("rock.catalog")
@@ -24,6 +24,12 @@ CATALOG_PATH = rock_paths.CATALOG
 
 
 PAGE = 500
+
+# Assemblies whose workflow actions this catalog collects. Rock's own, plus the
+# two vendors whose plugins we run. This was a key in config.yaml, which was
+# shipped state written in a second language: bootstrap.sh overwrote the copy at
+# $ROCK_HOME on every plugin change, so nobody could edit it and have it stick.
+ACTION_ASSEMBLIES = ("Rock", "com.bemaservices", "com.kfs")
 
 
 def get_all(client, endpoint, params=None, page=PAGE):
@@ -67,7 +73,7 @@ def save_catalog(catalog):
         json.dump(catalog, f, indent=2)
 
 
-def fetch_action_components(client, config):
+def fetch_action_components(client):
     """Workflow action components, and how they were found.
 
     The two paths do not mean the same thing, which matters to anyone reading
@@ -78,8 +84,6 @@ def fetch_action_components(client, config):
     the filter with a 400, not an empty list -- so the fallback is not a rare
     degraded path, it is the only path.
     """
-    prefixes = config.get("catalog", {}).get("action_assemblies", ["Rock"])
-
     # Try EntityTypes with IsComponent filter (not available in all Rock versions)
     actions = []
     try:
@@ -91,7 +95,8 @@ def fetch_action_components(client, config):
             for et in all_types:
                 name = et.get("Name", "")
                 assembly = et.get("AssemblyName", "")
-                if not any(name.startswith(f"{p}.Workflow.Action") for p in prefixes):
+                if not any(name.startswith(f"{p}.Workflow.Action")
+                           for p in ACTION_ASSEMBLIES):
                     if "WorkflowAction" not in name:
                         continue
                 actions.append({
@@ -215,11 +220,10 @@ def fetch_layouts(client):
 
 def refresh(client):
     """Pull full catalog from Rock instance."""
-    config = load_config()
     print("Refreshing Rock catalog...")
 
     print("  Fetching action components...")
-    actions, actions_source = fetch_action_components(client, config)
+    actions, actions_source = fetch_action_components(client)
     scope = "in use" if actions_source == "workflow-scan" else "available"
     print(f"    {len(actions)} action types ({scope})")
 
@@ -316,6 +320,11 @@ def main():
 
     cmd = sys.argv[1]
 
+    with api_errors_reported():
+        _dispatch(cmd)
+
+
+def _dispatch(cmd):
     if cmd == "status":
         client = RockClient()
         try:

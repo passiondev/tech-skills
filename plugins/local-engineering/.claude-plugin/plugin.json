@@ -1,5 +1,5 @@
 {
   "name": "local-engineering",
   "description": "Everything the Local Engineering department needs. Install this one.",
-  "dependencies": ["general", "dev", "plan", "rock", "rock-build"]
+  "dependencies": ["general", "dev", "plan", "rock"]
 }

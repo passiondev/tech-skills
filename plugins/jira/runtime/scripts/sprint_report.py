@@ -18,12 +18,11 @@ import argparse
 import datetime as dt
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import passion_env  # noqa: E402
+import jira_client  # noqa: E402
 
 # Jira groups every status into one of three built-in categories: new,
 # indeterminate, done. Bucketing on the category rather than on status names
@@ -31,28 +30,7 @@ import passion_env  # noqa: E402
 SECTIONS = (("In progress", "indeterminate"), ("To do", "new"))
 
 
-def _call(args: list) -> dict:
-    result = subprocess.run(
-        ["curl", "-s", "-w", "\n%{http_code}"] + args,
-        capture_output=True, text=True, timeout=60,
-    )
-    body, _, code = result.stdout.rpartition("\n")
-    status = int(code) if code.strip().isdigit() else 0
-
-    if status == 401:
-        sys.exit("ERROR: authentication failed — check JIRA_EMAIL and JIRA_API_TOKEN")
-    if status < 200 or status >= 300:
-        detail = ""
-        try:
-            detail = "; ".join(json.loads(body).get("errorMessages", []))
-        except (ValueError, AttributeError):
-            detail = body[:300]
-        sys.exit(f"ERROR: Jira returned {status}. {detail}".rstrip())
-
-    return json.loads(body)
-
-
-def search(base_url: str, email: str, token: str, jql: str) -> list:
+def search(client, jql: str) -> list:
     """Every matching issue. The endpoint pages at maxResults and reports more
     with isLast/nextPageToken, so a single call silently drops the tail of a
     busy sprint."""
@@ -64,27 +42,27 @@ def search(base_url: str, email: str, token: str, jql: str) -> list:
                 "maxResults": 100}
         if token_page:
             page["nextPageToken"] = token_page
-        data = _call(["-u", f"{email}:{token}",
-                      "-H", "Accept: application/json",
-                      "-H", "Content-Type: application/json",
-                      "-X", "POST", f"{base_url}/rest/api/3/search/jql",
-                      "-d", json.dumps(page)])
+        data = client.post("search/jql", page) or {}
         issues += data.get("issues", [])
         token_page = data.get("nextPageToken")
         if data.get("isLast", True) or not token_page:
             return issues
 
 
-def project_exists(base_url: str, email: str, token: str, project: str) -> bool:
+def project_exists(client, project: str) -> bool:
     """The search endpoint answers an unknown project key with an empty result,
-    identical to a real project with no open sprint. This tells them apart."""
-    result = subprocess.run(
-        ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-         "-u", f"{email}:{token}", "-H", "Accept: application/json",
-         f"{base_url}/rest/api/3/project/{project}"],
-        capture_output=True, text=True, timeout=30,
-    )
-    return result.stdout.strip() != "404"
+    identical to a real project with no open sprint. This tells them apart.
+
+    A 404 is the answer here rather than a failure, which is why it is caught:
+    the caller has a better sentence to say about it than the client does. Any
+    other status still raises, so a proxy or an expired token cannot be read as
+    a project that is not there.
+    """
+    try:
+        client.get(f"project/{project}")
+    except jira_client.JiraNotFound:
+        return False
+    return True
 
 
 def normalise(issues: list) -> list:
@@ -145,19 +123,20 @@ def main():
     ap.add_argument("--json", action="store_true", help="Emit raw JSON instead of markdown.")
     args = ap.parse_args()
 
-    base_url, email, token = passion_env.require("JIRA_BASE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN")
     project = args.project or os.environ.get("JIRA_PROJECT", "")
     if not project:
         sys.exit("ERROR: no project key. Pass --project ABC or set JIRA_PROJECT in ~/.claude/passion.env")
 
-    base_url = base_url.rstrip("/")
     jql = (f"project = {project} AND assignee = currentUser() "
            "AND sprint in openSprints() ORDER BY status ASC, priority DESC")
-    rows = normalise(search(base_url, email, token, jql))
 
-    if not rows and not project_exists(base_url, email, token, project):
-        sys.exit(f"ERROR: no project {project} on this Jira site, or your account cannot see it. "
-                 "Check the key, or pass --project with the right one.")
+    with jira_client.api_errors_reported():
+        client = jira_client.JiraClient()
+        rows = normalise(search(client, jql))
+
+        if not rows and not project_exists(client, project):
+            sys.exit(f"ERROR: no project {project} on this Jira site, or your account cannot see it. "
+                     "Check the key, or pass --project with the right one.")
 
     if args.json:
         json.dump({"project": project, "issues": rows}, sys.stdout, indent=2)

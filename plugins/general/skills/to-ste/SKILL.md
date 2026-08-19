@@ -59,11 +59,11 @@ STRUCTURE
 
 ### 4. Lint to prove it
 
-The linter sits in the `scripts/` folder beside this file. Call it by absolute path. Python 3 is all it needs. Piped stdin returns the per-category JSON. File paths as arguments return one summary line each.
+The linter sits in the `scripts/` folder beside this file. `${CLAUDE_PLUGIN_ROOT}` holds the plugin root at runtime, so the path below resolves from any working directory. Python 3 is all it needs. Piped stdin returns the per-category JSON. File paths as arguments return one summary line each.
 
 ```
-python3 <skill-dir>/scripts/ste-lint.py < original.md    # per-category JSON
-python3 <skill-dir>/scripts/ste-lint.py < rewrite.md
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/to-ste/scripts/ste-lint.py" < original.md   # per-category JSON
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/to-ste/scripts/ste-lint.py" < rewrite.md
 ```
 
 Lint the original and the rewrite. For a draft held in context, write each version to a scratch file and lint that. Counts are violations per 100 words, so the **delta** between original and rewrite is the signal.

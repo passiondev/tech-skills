@@ -1,5 +1,0 @@
-{
-  "name": "rock-build",
-  "description": "Change Rock RMS: diagnose broken workflows, repair them, and create new entities.",
-  "dependencies": ["rock"]
-}
