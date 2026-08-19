@@ -18,8 +18,10 @@ Run:  python3 -m unittest discover -s tests
 
 import io
 import json
+import sys
 import unittest
 from contextlib import redirect_stdout
+from unittest import mock
 from types import SimpleNamespace
 
 from rock_harness import FakeClient, rock_query
@@ -81,7 +83,7 @@ class TestTheProbeFetch(unittest.TestCase):
 
 
 class TestTheCountAdmitsACap(unittest.TestCase):
-    """`tally` and `more_note` — the wording a capped collection prints."""
+    """`tally` — the wording a capped collection prints."""
 
     def test_an_uncapped_count_is_just_the_number(self):
         self.assertEqual(rock_query.tally([1, 2, 3], False), "3")
@@ -96,8 +98,12 @@ class TestTheCountAdmitsACap(unittest.TestCase):
         self.assertIn("no --limit", text,
                       "blocks on a page have no --limit to raise, so the hint differs")
 
-    def test_a_dropped_candidate_names_what_was_searched_for(self):
-        self.assertIn("Smith", rock_query.more_note("Smith"))
+    def test_a_chooser_names_the_two_ways_out(self):
+        """`more_note` said this in a trailing line of its own. One caller had it,
+        and both choosers say it in the header now."""
+        text = rock_query.tally([1, 2], True, hint=rock_query.CHOOSER_HINT)
+        self.assertIn("narrow it", text)
+        self.assertIn("pass the ID", text)
 
 
 class TestGroupsFetchedByType(unittest.TestCase):
@@ -139,6 +145,12 @@ class TestGroupsFetchedByType(unittest.TestCase):
 class TestFindingOneEntity(unittest.TestCase):
     """`_find_entity` — the ladder every "name or ID" argument climbs."""
 
+    def miss(self, *args, **kwargs):
+        """The renderable the ladder raised, for a lookup that did not resolve."""
+        with self.assertRaises(rock_query.LookupMiss) as caught:
+            rock_query._find_entity(*args, **kwargs)
+        return caught.exception.report
+
     def test_a_number_is_tried_as_an_id_first(self):
         client = FakeClient(responses={"Groups/7": {"Id": 7, "Name": "Ushers"}})
         found = rock_query._find_entity(client, "Groups", "7")
@@ -163,40 +175,45 @@ class TestFindingOneEntity(unittest.TestCase):
         found = rock_query._find_entity(FakeClient(), "Groups", "ush", search=search)
         self.assertEqual(found["Id"], 9)
 
-    def test_several_matches_print_a_chooser_and_resolve_to_nothing(self):
+    def test_several_matches_are_a_chooser_and_not_a_pick(self):
         rows = [{"Id": 1, "Name": "Ushers A"}, {"Id": 2, "Name": "Ushers B"}]
         search = lambda flt, limit: (([], False) if "substringof" not in flt
                                      else (rows, False))
-        out = io.StringIO()
-        with redirect_stdout(out):
-            found = rock_query._find_entity(FakeClient(), "Groups", "ush",
-                                           label="group", search=search)
-        self.assertIsNone(found, "an ambiguous reference must not pick for the operator")
-        self.assertIn("Multiple groups match 'ush'", out.getvalue())
-        self.assertIn("Ushers B", out.getvalue())
+        chooser = self.miss(FakeClient(), "Groups", "ush", label="group",
+                            search=search)
+        self.assertEqual(chooser.title, "Multiple groups match 'ush'")
+        self.assertEqual([r[0] for r in chooser.rows], [1, 2],
+                         "an ambiguous reference must not pick for the operator")
 
     def test_a_capped_chooser_says_more_match(self):
         rows = [{"Id": i, "Name": f"Ushers {i}"} for i in range(5)]
         search = lambda flt, limit: (([], False) if "substringof" not in flt
                                      else (rows, True))
-        out = io.StringIO()
-        with redirect_stdout(out):
-            rock_query._find_entity(FakeClient(), "Groups", "ush", search=search)
-        self.assertIn("and more match", out.getvalue())
+        chooser = self.miss(FakeClient(), "Groups", "ush", search=search)
+        self.assertTrue(chooser.more, "a dropped candidate reads as not existing")
+        self.assertIn("pass the ID", chooser.hint)
 
     def test_nothing_found_says_so_and_names_the_kind(self):
-        out = io.StringIO()
-        with redirect_stdout(out):
-            found = rock_query._find_entity(FakeClient(), "Groups", "nobody",
-                                            label="check-in area")
-        self.assertIsNone(found)
-        self.assertIn("No check-in area found matching 'nobody'", out.getvalue())
+        report = self.miss(FakeClient(), "Groups", "nobody", label="check-in area")
+        self.assertEqual(report.text, "No check-in area found matching 'nobody'")
 
     def test_the_label_defaults_to_the_endpoint(self):
-        out = io.StringIO()
-        with redirect_stdout(out):
-            rock_query._find_entity(FakeClient(), "Schedules", "nope")
-        self.assertIn("No schedule found", out.getvalue())
+        report = self.miss(FakeClient(), "Schedules", "nope")
+        self.assertEqual(report.text, "No schedule found matching 'nope'")
+
+    def test_a_command_lets_the_miss_travel_to_the_boundary(self):
+        """Eleven commands wrote `if not x: return` after this call.
+
+        A returned None left each of them to remember the guard, and left the
+        boundary unable to tell a miss from an empty answer. The miss travels as
+        an exception now, so the guards are gone and the boundary exits 1.
+        """
+        with self.assertRaises(rock_query.LookupMiss) as caught:
+            rock_query.cmd_group(
+                SimpleNamespace(identifier="typo", json=False, limit=50),
+                FakeClient())
+        self.assertEqual(caught.exception.report.text,
+                         "No group found matching 'typo'")
 
     def test_a_caller_can_replace_the_search_without_editing_the_ladder(self):
         """The seam `checkin` needs: a name search restricted to group types."""
@@ -287,8 +304,14 @@ class TestAListingRendersItself(unittest.TestCase):
         parts[1].add(2, "b")
         self.assertIn("a\n\nGroups", self.render(parts))
 
-    def test_a_command_that_printed_for_itself_renders_nothing(self):
-        self.assertEqual(self.render(None), "")
+    def test_returning_nothing_fails_loudly_rather_than_printing_nothing(self):
+        """`render` has no `None` branch, and that is the point.
+
+        A command that forgets to return would otherwise print nothing and exit
+        0, which is the failure the renderables exist to make impossible.
+        """
+        with self.assertRaises(AttributeError):
+            self.render(None)
 
 
 class TestWhatAReadCommandReturns(unittest.TestCase):
@@ -528,25 +551,30 @@ class TestWhatADetailViewReturns(unittest.TestCase):
         self.assertIn("Byron Lovelace", depths[1][1])
         self.assertNotIn("Ada", depths[1][1], "the person is not their own relative")
 
-    def test_several_people_are_a_listing_that_counts_them(self):
-        client = FakeClient(responses={"People": [
+    def person_miss(self, client):
+        """What `person` raised, for a name that did not resolve to one person."""
+        with self.assertRaises(rock_query.LookupMiss) as caught:
+            rock_query.cmd_person(SimpleNamespace(identifier="Ada"), client)
+        return caught.exception.report
+
+    def test_several_people_are_a_chooser_and_not_a_pick(self):
+        listing = self.person_miss(FakeClient(responses={"People": [
             {"Id": 31, "FirstName": "Ada", "LastName": "Lovelace"},
-            {"Id": 32, "FirstName": "Ada", "LastName": "Byron"}]})
-        listing = rock_query.cmd_person(SimpleNamespace(identifier="Ada"), client)
+            {"Id": 32, "FirstName": "Ada", "LastName": "Byron"}]}))
         self.assertEqual([r[0] for r in listing.rows], [31, 32])
         self.assertIn("Ada", listing.title)
 
     def test_a_capped_chooser_says_how_to_narrow_it(self):
-        client = FakeClient(responses={"People": [
-            {"Id": i, "FirstName": "Ada", "LastName": str(i)} for i in range(11)]})
-        listing = rock_query.cmd_person(SimpleNamespace(identifier="Ada"), client)
+        listing = self.person_miss(FakeClient(responses={"People": [
+            {"Id": i, "FirstName": "Ada", "LastName": str(i)} for i in range(11)]}))
         self.assertTrue(listing.more)
         self.assertIn("pass the ID", listing.hint)
 
-    def test_nobody_matching_is_a_sentence_not_a_crash(self):
-        report = rock_query.cmd_person(SimpleNamespace(identifier="zzz"),
-                                       FakeClient())
-        self.assertEqual(report.text, "No person found matching 'zzz'")
+    def test_nobody_matching_is_a_miss_carrying_a_sentence(self):
+        with self.assertRaises(rock_query.LookupMiss) as caught:
+            rock_query.cmd_person(SimpleNamespace(identifier="zzz"), FakeClient())
+        self.assertEqual(caught.exception.report.text,
+                         "No person found matching 'zzz'")
 
     def test_a_page_groups_its_blocks_by_zone(self):
         client = FakeClient(responses={
@@ -665,6 +693,76 @@ class TestWhatADetailViewReturns(unittest.TestCase):
     def test_no_check_in_group_types_is_a_sentence(self):
         report = rock_query.cmd_checkin(SimpleNamespace(area=None), FakeClient())
         self.assertEqual(report.text, "No check-in group types found.")
+
+
+class TestWhatTheBoundaryDoesWithAnAnswer(unittest.TestCase):
+    """`main` — what reaches stdout, and what the exit code says about it.
+
+    The footnote in a0d8743 left one question open: a lookup that matched
+    nothing exited 0, and making every empty answer exit non-zero would be wrong
+    for `workflows` on an instance holding none. The renderables answer it. A
+    name that does not resolve raises `LookupMiss` and exits 1; a collection that
+    is genuinely empty is a `Listing` with no rows and exits 0. Both reach this
+    boundary, and they reach it by different routes.
+    """
+
+    def run_cli(self, *argv, responses=None, client=None):
+        client = client or FakeClient(responses=responses or {})
+        out, status = io.StringIO(), 0
+        argv = ["rock_query.py", *argv]
+        with mock.patch.object(sys, "argv", argv), \
+             mock.patch.object(rock_query, "RockClient", lambda: client), \
+             redirect_stdout(out):
+            try:
+                rock_query.main()
+            except SystemExit as stop:
+                status = stop.code
+        return status, out.getvalue()
+
+    def test_an_answer_prints_once_and_exits_zero(self):
+        status, out = self.run_cli("group", "7", responses={
+            "Groups/7": {"Id": 7, "Name": "Ushers", "IsActive": True}})
+        self.assertEqual(status, 0)
+        self.assertEqual(out.splitlines()[0], "Ushers (ID: 7)")
+
+    def test_a_name_that_resolves_to_nothing_exits_one(self):
+        status, out = self.run_cli("group", "typo")
+        self.assertEqual(status, 1, "naming a thing that is not there is a "
+                                   "failed request, not an empty answer")
+        self.assertEqual(out, "No group found matching 'typo'\n")
+
+    def test_a_name_that_resolves_to_several_things_exits_one(self):
+        class OnlyOnSubstring(FakeClient):
+            """Answers the ladder's substring step and not its exact-name step.
+
+            `FakeClient` replies from an endpoint table and ignores the filter,
+            so without this the exact step matches and the chooser never opens.
+            """
+
+            def get(self, endpoint, params=None, timeout=30):
+                if "substringof" not in (params or {}).get("$filter", ""):
+                    self._record("GET", endpoint, params=params)
+                    return []
+                return super().get(endpoint, params=params, timeout=timeout)
+
+        status, out = self.run_cli("group", "Ush", client=OnlyOnSubstring(
+            responses={"Groups": [{"Id": 1, "Name": "Ushers A"},
+                                  {"Id": 2, "Name": "Ushers B"}]}))
+        self.assertEqual(status, 1)
+        self.assertIn("Multiple groups match 'Ush' (2):", out)
+        self.assertIn("Ushers B", out)
+
+    def test_a_collection_that_is_genuinely_empty_exits_zero(self):
+        status, out = self.run_cli("workflows")
+        self.assertEqual(status, 0, "an instance holding no workflows was asked "
+                                   "and answered")
+        self.assertEqual(out, "No workflows found.\n")
+
+    def test_a_write_command_reached_the_wrong_way_exits_two(self):
+        """`_guard_writes` runs before the client is built. See ADR 0016."""
+        status, out = self.run_cli("person-update", "31", "Email=a@example.com")
+        self.assertEqual(status, 2)
+        self.assertEqual(out, "", "the refusal goes to stderr")
 
 
 if __name__ == "__main__":

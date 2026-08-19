@@ -179,15 +179,35 @@ def cmd_things(client):
         self.assertEqual(found, [])
 
 
-class TestTheReadViewCheckCatchesACommandThatPrints(CheckTestCase):
-    """rock-read-views — a read command returns its answer, `render` prints it."""
+class TestTheReadViewCheckCatchesAnythingElseThatPrints(CheckTestCase):
+    """rock-read-views — a command returns its answer, `render` prints it."""
 
     BASE = '''
 import sys
 
 
+class Listing:
+    def render(self):
+        print(self.title)
+
+
+class Detail:
+    def render(self):
+        print(self.heading)
+
+
+class Raw:
+    def render(self):
+        print(self.entity)
+
+
+class Text:
+    def render(self):
+        print(self.text)
+
+
 def render(report):
-    print(report)
+    report.render()
 
 
 def cmd_block_set(args, client):
@@ -214,7 +234,7 @@ def cmd_search(args, client):
         return self.run_check(checks._rock_read_views,
                               {str(QUERY_PATH): self.BASE + added})
 
-    def test_the_writers_that_report_as_they_go_are_clean(self):
+    def test_the_boundary_and_the_writers_that_report_as_they_go_are_clean(self):
         self.assertEqual(self.views(), [])
 
     def test_a_read_view_that_prints_is_caught(self):
@@ -234,11 +254,25 @@ def cmd_group(args, client):
     return detail
 '''), [])
 
+    def test_a_helper_that_reports_for_itself_is_caught_too(self):
+        """`_find_entity` printed the chooser and returned None.
+
+        That was the second place the read side reached stdout, and the reason
+        this check once read only command bodies. It raises the miss now, so the
+        check covers the whole module and a helper earns no exemption.
+        """
+        found = self.views('''
+def _find_entity(client, entity, identifier):
+    print("Multiple matches:")
+''')
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("_find_entity", found[0])
+
     def test_a_print_hidden_in_a_nested_helper_is_caught(self):
         """The dodge, and the accident: a `def` inside the view that prints.
 
-        `_by_function` tags a node with the innermost function around it, so a
-        nested one would come back tagged with its own name and pass.
+        `_by_function` names a node for the innermost function around it, so a
+        nested one would come back named `emit` and read as somebody else.
         """
         found = self.views('''
 def cmd_group(args, client):
@@ -271,23 +305,22 @@ def cmd_group(args, client):
     return Detail("Ushers (ID: 7)")
 '''), [])
 
-    def test_a_helper_a_view_calls_is_out_of_this_checks_reach(self):
-        """`_find_entity` asks which of several matches was meant, on stdout.
+    def test_printing_from_somewhere_this_check_cannot_see_is_reported(self):
+        """A print at module level sits outside every definition.
 
-        This reads command bodies, so a helper they call sits outside it. Worth
-        a test rather than a docstring line, because a check read as broader
-        than it is, is worse than one that admits its edge.
+        Failing loudly beats passing over it: the check would otherwise report
+        nothing and look like it had found nothing.
         """
-        self.assertEqual(self.views('''
-def _find_entity(client, entity, identifier):
-    print("Multiple matches:")
-'''), [])
+        found = self.views('\nprint("loaded")\n')
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("does not look", found[0])
 
     def test_deleting_the_renderer_fails_rather_than_disarming_the_check(self):
         found = self.run_check(
             checks._rock_read_views,
             {str(QUERY_PATH): "def cmd_group(args, client):\n    pass\n"})
-        self.assertTrue(any("render()" in f for f in found), found)
+        self.assertTrue(any(f.startswith(f"{QUERY_PATH}: render may print")
+                            for f in found), found)
 
     def test_an_allow_list_entry_that_no_longer_exists_is_caught(self):
         """A renamed write command has to be renamed here too.
@@ -297,11 +330,11 @@ def _find_entity(client, entity, identifier):
         source = self.BASE.replace("def cmd_person_update", "def cmd_person_edit")
         found = self.run_check(checks._rock_read_views, {str(QUERY_PATH): source})
         self.assertEqual(len(found), 2, found)
-        self.assertIn("allow-list", found[0])
         self.assertIn("cmd_person_update", found[0])
+        self.assertIn("no longer exists", found[0])
         # The rename lands the write command outside the list, so it is reported
-        # as a view that prints. Both halves are the same message: the list and
-        # the commands have to be renamed together.
+        # as something printing that should not. Both halves say the same thing:
+        # the list and the definitions have to be renamed together.
         self.assertIn("cmd_person_edit", found[1])
 
     def test_moving_the_file_fails_rather_than_passing_vacuously(self):

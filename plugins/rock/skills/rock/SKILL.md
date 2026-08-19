@@ -60,6 +60,12 @@ does not exist. Several matches is the normal case, not an error — Rock
 accumulates near-duplicate names over years. List them with what tells them
 apart and ask which one.
 
+A name that resolves to nothing, or to several things, exits 1. That is the
+lookup reporting its result, not the tool failing — the message on stdout is the
+whole story, so read it and retry or ask. An empty collection is different:
+`query workflows` on an instance holding none exits 0, because the question was
+answered.
+
 Report every match with its name **and its ID**. Everything downstream takes the
 ID:
 

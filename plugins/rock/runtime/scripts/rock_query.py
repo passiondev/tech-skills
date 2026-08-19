@@ -45,6 +45,9 @@ CHOOSER_LIMIT = 5
 # of printing the cap as the total.
 CHILD_LIMIT = 200
 CHILD_HINT = "this view has no --limit"
+# What to do about a name that matched several things. Both choosers say it:
+# the shared ladder's, and the one `person` builds from a people search.
+CHOOSER_HINT = "narrow it, or pass the ID"
 # `search` has no --limit to raise, so its cap needs different advice.
 WIDEN = "narrow the term or list that entity directly"
 
@@ -74,12 +77,6 @@ def groups_of_types(client, name_filter, type_ids, limit):
                 seen.add(g["Id"])
                 rows.append(g)
     return rows[:limit], len(rows) > limit
-
-
-def more_note(identifier):
-    """A disambiguation list that silently drops candidates is worse than a
-    long one: the entity someone wants reads as not existing."""
-    return f"  ... and more match '{identifier}' — narrow it, or pass the ID."
 
 
 def get_capped(client, endpoint, params, limit):
@@ -302,17 +299,36 @@ def render(report):
     of them where a view has two parts. The only thing asked of any of them is
     that it renders itself, and a list gets a blank line between its parts.
 
-    `None` means the command already reported the problem: a lookup matching
-    nothing says so through `_find_entity`, which is the one helper on this side
-    that still prints. So there is nothing left here to print.
+    There is no branch for `None`, because no command returns one: a name that
+    resolves to nothing raises `LookupMiss` instead. A guard here would turn a
+    command that forgot to return into a command that prints nothing, which is
+    the failure this whole arrangement exists to make impossible.
     """
-    if report is None:
-        return
     parts = report if isinstance(report, list) else [report]
     for index, part in enumerate(parts):
         if index:
             print()
         part.render()
+
+
+class LookupMiss(Exception):
+    """What an operator named does not resolve to one entity.
+
+    Carries the renderable that says so: a `Text` where nothing matched, a
+    `Listing` where several did. The boundary renders it and exits 1, which is
+    the answer to the question the footnote in a0d8743 left open. Naming a thing
+    that is not there is a failed request. An empty collection is not -- `query
+    workflows` on an instance holding none answered correctly -- and the two
+    reach the boundary by different routes, so they can be told apart.
+
+    A raise rather than a returned None, because eleven commands wrote the same
+    `if not x: return` after the same call, and because a helper that reports a
+    miss by printing is a second place the read side reaches stdout.
+    """
+
+    def __init__(self, report):
+        self.report = report
+        super().__init__("lookup miss")
 
 
 def _resolve_name(client, endpoint, entity_id, field="Name"):
@@ -351,7 +367,7 @@ def _resolve_person_name(client, alias_id, cache=None):
 
 def _find_entity(client, endpoint, identifier, name_field="Name", label=None,
                  search=None):
-    """The one entity an operator meant, or None with the reason printed.
+    """The one entity an operator meant, or `LookupMiss` carrying the reason.
 
     Every command that takes a name-or-ID argument climbs the same ladder: try
     it as an ID, then as an exact name, then as a substring. Five commands used
@@ -390,14 +406,15 @@ def _find_entity(client, endpoint, identifier, name_field="Name", label=None,
     if len(results) == 1:
         return results[0]
     if results:
-        print(f"Multiple {label}s match '{identifier}':")
+        # A chooser that silently drops candidates is worse than a long one: the
+        # entity somebody wants reads as not existing. So the count is in the
+        # header, the same way every other capped collection says it.
+        chooser = Listing(f"Multiple {label}s match '{identifier}'", more,
+                          hint=CHOOSER_HINT)
         for r in results:
-            print(row(r["Id"], r.get(name_field, "?")))
-        if more:
-            print(more_note(identifier))
-        return None
-    print(f"No {label} found matching '{identifier}'")
-    return None
+            chooser.add(r["Id"], r.get(name_field, "?"))
+        raise LookupMiss(chooser)
+    raise LookupMiss(Text(f"No {label} found matching '{identifier}'"))
 
 
 def _people_filter(identifier):
@@ -532,8 +549,6 @@ def cmd_workflows(args, client):
 def cmd_workflow(args, client):
     wf = _find_entity(client, "WorkflowTypes", args.identifier,
                       label="workflow")
-    if not wf:
-        return
     _load_workflow_tree(wf, client)
     return Raw(wf) if args.json else Text(format_workflow_tree(wf))
 
@@ -574,8 +589,6 @@ def cmd_page(args, client):
     if not page:
         page = _find_entity(client, "Pages", identifier,
                             name_field="InternalName", label="page")
-    if not page:
-        return
 
     # Get blocks on this page
     blocks, blocks_capped = get_capped(client, "Blocks", {
@@ -721,11 +734,7 @@ def _audit_report(wf, issues, warnings):
 def cmd_audit(args, client):
     wf = _find_entity(client, "WorkflowTypes", args.identifier,
                       label="workflow")
-    if not wf:
-        return
     _load_workflow_tree(wf, client)
-    if not wf:
-        return
 
     issues = []
     warnings = []
@@ -844,8 +853,6 @@ def cmd_actions(args, client):
 def cmd_attributes(args, client):
     wf = _find_entity(client, "WorkflowTypes", args.identifier,
                       label="workflow")
-    if not wf:
-        return
 
     attrs, attrs_capped = get_capped(client, "Attributes", {
         "$filter": f"EntityTypeQualifierColumn eq 'WorkflowTypeId' and EntityTypeQualifierValue eq '{wf['Id']}'",
@@ -924,9 +931,6 @@ def _load_filter_tree(client, filter_id, depth=0):
 
 def cmd_dataview(args, client):
     dv = _find_entity(client, "DataViews", args.identifier, label="data view")
-    if not dv:
-        return
-
     if args.json:
         return Raw(dv)
 
@@ -979,16 +983,17 @@ def cmd_person(args, client):
                                SEARCH_LIMIT)
 
     if not results:
-        return Text(f"No person found matching '{identifier}'")
+        raise LookupMiss(Text(f"No person found matching '{identifier}'"))
 
     if len(results) == 1:
         return _person_detail(results[0], client)
 
-    # More than one match is a chooser, so it is a listing like any other. The
-    # count is new: this branch printed a header with no number in it, and a
-    # dropped candidate reads as a person who does not exist.
+    # More than one match is a chooser, so it is a listing like any other, and
+    # the same miss the shared ladder raises. The count is new: this branch
+    # printed a header with no number in it, and a dropped candidate reads as a
+    # person who does not exist.
     listing = Listing(f"People matching '{identifier}'", more,
-                      hint="narrow it, or pass the ID")
+                      hint=CHOOSER_HINT)
     campus_cache = {}
     for p in results:
         email = f" ({p.get('Email', '')})" if p.get("Email") else ""
@@ -1001,7 +1006,7 @@ def cmd_person(args, client):
                 campus = f" [{campus_cache[cid]}]"
         listing.add(p["Id"], f"{p.get('FirstName', '')} {p.get('LastName', '')}"
                              f"{email}{campus}")
-    return listing
+    raise LookupMiss(listing)
 
 
 def _person_detail(person, client):
@@ -1086,9 +1091,6 @@ def _person_detail(person, client):
 
 def cmd_group(args, client):
     group = _find_entity(client, "Groups", args.identifier, label="group")
-    if not group:
-        return
-
     if args.json:
         return Raw(group)
 
@@ -1130,9 +1132,6 @@ def cmd_group(args, client):
 
 def cmd_report(args, client):
     report = _find_entity(client, "Reports", args.identifier, label="report")
-    if not report:
-        return
-
     if args.json:
         return Raw(report)
 
@@ -1257,9 +1256,6 @@ def cmd_schedules(args, client):
 
 def cmd_schedule(args, client):
     schedule = _find_entity(client, "Schedules", args.identifier, label="schedule")
-    if not schedule:
-        return
-
     if args.json:
         return Raw(schedule)
 
@@ -1308,9 +1304,6 @@ def cmd_registrations(args, client):
 
 def cmd_registration(args, client):
     reg = _find_entity(client, "RegistrationInstances", args.identifier, label="registration")
-    if not reg:
-        return
-
     if args.json:
         return Raw(reg)
 
@@ -1484,9 +1477,6 @@ def _checkin_area(args, client, checkin_group_types):
 
     group = _find_entity(client, "Groups", args.area, label="check-in area",
                          search=among_checkin_types)
-    if not group:
-        return
-
     detail = Detail(f"{group['Name']} (ID: {group['Id']})")
     detail.field("Active", group.get("IsActive", False))
 
@@ -1570,8 +1560,6 @@ def cmd_attendance(args, client):
     filters = []
     if args.group:
         group = _find_entity(client, "Groups", args.group, label="group")
-        if not group:
-            return
         filters.append(f"GroupId eq {group['Id']}")
     if args.date:
         filters.append(f"OccurrenceDate eq datetime'{args.date}'")
@@ -1971,6 +1959,13 @@ def main():
         try:
             render(parsed.func(parsed, client))
             log.info("cmd=%s ok", parsed.command)
+        except LookupMiss as miss:
+            # A name that resolves to nothing, or to several things, is a failed
+            # request rather than an empty answer. An empty collection comes back
+            # as a `Listing` with no rows and still exits 0.
+            render(miss.report)
+            log.info("cmd=%s no match", parsed.command)
+            sys.exit(1)
         except Exception:
             log.error("cmd=%s failed\n%s", parsed.command, traceback.format_exc())
             raise
