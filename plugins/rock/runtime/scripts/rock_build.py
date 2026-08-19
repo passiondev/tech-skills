@@ -32,6 +32,168 @@ from rock_log import get_logger
 log = get_logger("rock.build")
 
 
+class PlanError(ValueError):
+    """The plan asked for something this operation cannot do.
+
+    Distinct from a Rock failure: nothing has been sent, and no amount of
+    retrying helps. `run_plan` turns it into a reported failure so the operator
+    reads a sentence rather than a traceback.
+    """
+
+
+def plan_value(plan, path):
+    """Walk a dotted plan path. Returns (present, value).
+
+    "modification.updates" is plan["modification"]["updates"].
+    """
+    node = plan
+    for segment in path.split("."):
+        if not isinstance(node, dict) or segment not in node:
+            return False, None
+        node = node[segment]
+    return True, node
+
+
+def rock_field(field_map, key, also_accepted=()):
+    """The Rock column a plan field names. Raises PlanError where there is none.
+
+    The five field maps this replaces all ended `.get(key, key)`, forwarding a
+    key they did not recognise to Rock verbatim. That is not a harmless
+    passthrough. It is the mechanism that sent a role *name* to `GroupRoleId`
+    and had Rock answer 400 for a reason nobody reading the plan could see. An
+    unrecognised key now names itself, and lists what the operation does take.
+
+    `also_accepted` names the keys the calling handler resolves itself — a
+    `category` it looks up, a `role` it has to resolve inside a group.
+    """
+    if key in field_map:
+        return field_map[key]
+    accepted = ", ".join(sorted(set(field_map) | set(also_accepted)))
+    raise PlanError(f"unknown field {key!r}. This operation accepts: {accepted}")
+
+
+# What a plan must carry before a request is worth sending.
+#
+# Paths are dotted, so "modification.updates" is plan["modification"]["updates"].
+# A tuple means at least one of them, which is how every "pass the Id or pass the
+# name" pair in this file already reads.
+#
+# `non_empty` is a correctness fix, not tidiness. A PATCH with an empty body
+# changes nothing and still answers 200, so `update_workflow`,
+# `update_activity`, `update_action`, `reorder_actions` and `move_action` could
+# each report "1 entities created successfully" for a request that did nothing.
+# `update_group`, `update_group_member` and `api_request` guarded it already —
+# three handlers, three different ways, none of them shared.
+#
+# `requires` removes an error mode. Eighteen of the nineteen handlers index their
+# plan keys directly, so a typo in a plan file was a raw KeyError traceback
+# rather than a failure anyone could read. Declaring the keys here is what makes
+# the direct indexing safe.
+REQUIREMENTS = {
+    "create_workflow": {
+        "requires": ["workflow.name"],
+    },
+    "create_page": {
+        "requires": ["page.name", ("page.layout_id", "page.layout"),
+                     ("page.parent_page_id", "page.parent_page")],
+    },
+    "add_action": {
+        "requires": ["modification.activity_type_id", "modification.action",
+                     "modification.action.action_type"],
+    },
+    "add_block": {
+        "requires": ["modification.page_id", "modification.block",
+                     ("modification.block.block_type_id",
+                      "modification.block.block_type")],
+    },
+    "update_workflow": {
+        "requires": ["modification.workflow_type_id", "modification.updates"],
+        "non_empty": ["modification.updates"],
+    },
+    "update_activity": {
+        "requires": ["modification.activity_type_id", "modification.updates"],
+        "non_empty": ["modification.updates"],
+    },
+    "update_action": {
+        "requires": ["modification.action_type_id"],
+        "any_non_empty": ["modification.updates", "modification.settings"],
+    },
+    "delete_action": {
+        "requires": ["modification.action_type_id"],
+    },
+    "delete_activity": {
+        "requires": ["modification.activity_type_id"],
+    },
+    "reorder_actions": {
+        "requires": ["modification.action_order"],
+        "non_empty": ["modification.action_order"],
+    },
+    "move_action": {
+        "requires": ["modification.action_type_id",
+                     "modification.target_activity_type_id"],
+    },
+    "create_checkin_area": {
+        "requires": ["checkin_area.name",
+                     ("checkin_area.group_type_id", "checkin_area.group_type")],
+    },
+    "create_group": {
+        "requires": ["group.name", ("group.group_type_id", "group.group_type")],
+    },
+    "update_group": {
+        "requires": ["modification.group_id", "modification.updates"],
+        "non_empty": ["modification.updates"],
+    },
+    "add_group_member": {
+        "requires": ["modification.group_id", "modification.person_id",
+                     ("modification.group_role_id", "modification.role")],
+    },
+    "update_group_member": {
+        "requires": ["modification.group_member_id", "modification.updates"],
+        "non_empty": ["modification.updates"],
+    },
+    "remove_group_member": {
+        "requires": ["modification.group_member_id"],
+    },
+    "create_group_sync": {
+        "requires": ["modification.group_id",
+                     ("modification.group_type_role_id", "modification.role"),
+                     ("modification.sync_data_view_id", "modification.data_view")],
+    },
+    "api_request": {
+        # api_request checks its own method, endpoint and body, and says more
+        # about each than a table can. All this adds is a readable failure for a
+        # plan that forgot the "request" object altogether.
+        "requires": ["request"],
+    },
+}
+
+
+def missing_requirements(operation, plan):
+    """What this plan is missing, as sentences an operator can act on."""
+    spec = REQUIREMENTS.get(operation, {})
+    problems = []
+
+    for path in spec.get("requires", ()):
+        options = (path,) if isinstance(path, str) else path
+        if not any(plan_value(plan, option)[0] for option in options):
+            problems.append("needs " + " or ".join(f'"{o}"' for o in options))
+
+    empty_message = ('is empty. A request with nothing in it changes nothing and '
+                     'still answers 200, so this would report success having done '
+                     'nothing at all.')
+    for path in spec.get("non_empty", ()):
+        present, value = plan_value(plan, path)
+        if present and not value:
+            problems.append(f'"{path}" {empty_message}')
+
+    any_of = spec.get("any_non_empty", ())
+    if any_of and not any(plan_value(plan, path)[1] for path in any_of):
+        listed = " or ".join(f'"{path}"' for path in any_of)
+        problems.append(f"needs something in {listed}. Both {empty_message}")
+
+    return problems
+
+
 def resolve_action_type(catalog, name):
     """Find an action component EntityType ID by friendly name."""
     name_lower = name.lower().replace(" ", "")
@@ -616,7 +778,7 @@ def update_workflow(plan, client, catalog):
                 result.report()
                 return result
         else:
-            data[field_map.get(key, key)] = value
+            data[rock_field(field_map, key, ("category",))] = value
 
     try:
         client.patch(f"WorkflowTypes/{wf_id}", data)
@@ -641,7 +803,7 @@ def update_activity(plan, client, catalog):
         "order": "Order", "is_active": "IsActive",
     }
 
-    data = {field_map.get(k, k): v for k, v in updates.items()}
+    data = {rock_field(field_map, k): v for k, v in updates.items()}
 
     try:
         client.patch(f"WorkflowActivityTypes/{act_id}", data)
@@ -678,7 +840,7 @@ def update_action(plan, client, catalog):
                     result.report()
                     return result
             else:
-                data[field_map.get(key, key)] = value
+                data[rock_field(field_map, key, ("action_type",))] = value
 
         try:
             client.patch(f"WorkflowActionTypes/{action_id}", data)
@@ -967,7 +1129,7 @@ def update_group(plan, client, catalog):
     mod = plan["modification"]
     group_id = mod["group_id"]
 
-    data = {GROUP_FIELDS.get(k, k): v for k, v in mod["updates"].items()}
+    data = {rock_field(GROUP_FIELDS, k): v for k, v in mod["updates"].items()}
     if not data:
         result.fail("Group", str(group_id), "No fields to update")
         result.report()
@@ -1106,7 +1268,7 @@ def update_group_member(plan, client, catalog):
                 return result
             data["GroupRoleId"] = role_id
         else:
-            data[GROUP_MEMBER_FIELDS.get(key, key)] = value
+            data[rock_field(GROUP_MEMBER_FIELDS, key, ("status", "role"))] = value
 
     if not data:
         result.fail("GroupMember", str(member_id), "No fields to update")
@@ -1397,8 +1559,69 @@ NEEDS_CATALOG = {"create_workflow", "create_page", "add_action", "add_block",
                  "update_action"}
 
 
-def main():
-    # Read build plan from stdin or file argument
+def refused(kind, label, message):
+    """A plan that never reached Rock, reported the way a failed one is.
+
+    A gate and a 400 are the same thing to the person reading the output: the
+    write did not happen and here is why.
+    """
+    result = BuildResult()
+    result.fail(kind, label, message)
+    result.report()
+    return result
+
+
+def run_plan(plan, connect, catalog=None):
+    """Dispatch one plan to its handler and return the result.
+
+    Everything deciding whether a write may happen is here rather than inside
+    `main`: the operation table, the write guard, the catalog gate, and the plan
+    contract. `main` reads input and sets an exit code.
+
+    That split is the whole point. These decisions had no caller but the shell,
+    so two tests reached them by reading the *text* of `main` through
+    `inspect.getsource` and asserting on substring positions. Now they run.
+
+    `connect` is called for a client, and only once every gate has passed.
+    Logging in is itself a request, so a plan naming an unknown operation, or one
+    not reached through rock.sh, must not touch Rock at all.
+    """
+    operation = plan.get("operation")
+    handler = OPERATIONS.get(operation)
+    if not handler:
+        return refused("Operation", str(operation),
+                       f"unknown operation: {operation!r}. "
+                       f"Supported: {', '.join(OPERATIONS)}")
+
+    require_writes_enabled(operation)
+
+    # The catalog resolves names to IDs for the things Rock will not look up by
+    # name — action components, field types, block types, layouts. An operation
+    # that resolves nothing must not be blocked by a missing or stale cache.
+    if catalog is None and operation in NEEDS_CATALOG:
+        return refused("Catalog", operation,
+                       "no catalog found. Refresh it: rock_catalog.py refresh")
+
+    problems = missing_requirements(operation, plan)
+    if problems:
+        return refused("Plan", operation, "; ".join(problems))
+
+    log.info("build operation=%s", operation)
+    client = connect()
+    try:
+        return handler(plan, client, catalog or {})
+    except PlanError as exc:
+        return refused("Plan", operation, str(exc))
+    except KeyError as exc:
+        log.error("build operation=%s missing key %s\n%s", operation, exc,
+                  traceback.format_exc())
+        return refused("Plan", operation,
+                       f"the plan is missing {exc.args[0]!r}, which this operation "
+                       f"needed. The traceback is in the log.")
+
+
+def read_plan():
+    """Read the build plan from a file argument or from stdin."""
     if len(sys.argv) > 1 and sys.argv[1] != "-":
         plan_path = Path(sys.argv[1]).resolve()
         allowed = Path("/tmp").resolve()
@@ -1407,37 +1630,19 @@ def main():
             sys.exit(1)
         try:
             with open(plan_path) as f:
-                plan = json.load(f)
+                return json.load(f)
         except FileNotFoundError:
             print(f"Error: file not found: {plan_path}")
             sys.exit(1)
-    else:
-        plan = json.load(sys.stdin)
+    return json.load(sys.stdin)
 
-    operation = plan.get("operation")
-    handler = OPERATIONS.get(operation)
-    if not handler:
-        print(f"Error: unknown operation: {operation}")
-        print(f"Supported: {', '.join(OPERATIONS)}")
-        sys.exit(1)
 
-    require_writes_enabled(operation)
-
-    # The catalog resolves names to IDs for the things Rock does not let you
-    # look up by name — action components, field types, block types, layouts.
-    # Operations that resolve nothing should not be blocked by a stale or
-    # missing cache.
-    catalog = load_catalog()
-    if catalog is None and operation in NEEDS_CATALOG:
-        print("Error: no catalog found. Refresh it: rock_catalog.py refresh")
-        sys.exit(1)
-
+def main():
+    result = None
     with api_errors_reported():
-        client = RockClient()
-        log.info("build operation=%s", operation)
-        result = handler(plan, client, catalog or {})
+        result = run_plan(read_plan(), RockClient, load_catalog())
 
-    if not result.success:
+    if result is None or not result.success:
         sys.exit(1)
 
 

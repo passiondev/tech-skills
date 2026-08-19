@@ -95,6 +95,23 @@ Deleting an activity deletes every action inside it, so spell that out with the
 count. There is no rollback — a partly applied plan stays partly applied, which
 is what the yes is for.
 
+### The script checks the plan before it logs in
+
+Every operation declares the keys it cannot work without. A plan naming an
+unknown operation, or missing a required key, or carrying an empty `updates`
+object, is refused by name and nothing reaches Rock at all:
+
+```
+  ✗ Plan: update_action — "modification.updates" is empty. A request with
+    nothing in it changes nothing and still answers 200.
+```
+
+That is a complaint about the plan, not a report from Rock. Nothing was written,
+so there is nothing to verify and nothing to clean up: fix the plan and run it
+again. Field names work the same way. Each operation accepts a fixed set, and an
+unrecognised one is refused with the accepted list rather than sent to Rock as a
+column name it does not have.
+
 ## Repair
 
 | Operation | `modification` |

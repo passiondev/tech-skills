@@ -835,21 +835,173 @@ class TestWritePermission(unittest.TestCase):
         os.environ["ROCK_ALLOW_WRITES"] = "1"
         rock_build.require_writes_enabled("create_group")
 
-    def test_the_guard_runs_before_any_operation_does(self):
-        """One dispatch point, so one guard covers every operation — including
-        ones added later."""
-        import inspect
-        src = inspect.getsource(rock_build.main)
-        self.assertIn("require_writes_enabled(", src)
-        self.assertLess(src.index("require_writes_enabled("), src.index("handler(plan"),
-                        "the guard must run before the operation does")
+    def test_the_guard_runs_before_anything_reaches_rock(self):
+        """One dispatch point, so one guard covers every operation.
 
-    def test_every_registered_operation_goes_through_that_dispatch(self):
-        import inspect
-        src = inspect.getsource(rock_build.main)
-        self.assertEqual(src.count("handler(plan"), 1)
-        self.assertIn("api_request", rock_build.OPERATIONS)
-        self.assertIn("create_group", rock_build.OPERATIONS)
+        This used to be asserted by reading the text of `main` with
+        `inspect.getsource` and comparing substring positions. Now it runs the
+        dispatch: `connect` is what makes the login request, and refusing before
+        it is called is the property that matters."""
+        os.environ.pop("ROCK_ALLOW_WRITES", None)
+        connected = []
+
+        def connect():
+            connected.append(True)
+            raise AssertionError("the guard let a request through")
+
+        with self.assertRaises(SystemExit) as caught:
+            rock_build.run_plan({"operation": "create_group",
+                                 "group": {"name": "Team", "group_type": "Small Group"}},
+                                connect)
+        self.assertEqual(caught.exception.code, 2)
+        self.assertEqual(connected, [], "nothing may log in before the guard passes")
+
+
+class TestPlanContract(WriteTestCase):
+    """Every operation declares what its plan must carry, checked at dispatch.
+
+    Two failures used to be invisible here. A missing key was a raw KeyError
+    traceback, because eighteen of the nineteen handlers index their plan keys
+    directly. And an empty `updates` on a PATCH was a request that changed
+    nothing and reported success — five operations had no guard against it, and
+    the three that did each wrote their own."""
+
+    def setUp(self):
+        os.environ["ROCK_ALLOW_WRITES"] = "1"
+
+    def run_plan(self, plan, client=None, catalog=None):
+        client = client if client is not None else FakeClient()
+        result = rock_build.run_plan(plan, lambda: client, catalog or CATALOG)
+        return result, client
+
+    def test_every_operation_declares_its_requirements(self):
+        self.assertEqual(set(rock_build.REQUIREMENTS), set(rock_build.OPERATIONS))
+
+    def test_an_unknown_operation_never_builds_a_client(self):
+        result = rock_build.run_plan({"operation": "delete_everything"},
+                                     lambda: self.fail("connected anyway"))
+        self.assertFalse(result.success)
+        self.assertIn("unknown operation", result.failed["error"])
+
+    def test_every_operation_reports_a_plan_problem_rather_than_dispatching(self):
+        """A bare `{"operation": ...}` names something every operation needs."""
+        for operation in rock_build.OPERATIONS:
+            with self.subTest(operation=operation):
+                result, client = self.run_plan({"operation": operation})
+                self.assertFalse(result.success)
+                self.assertNotIn("unknown operation", result.failed["error"])
+                self.assertEqual(client.writes, [],
+                                 "an incomplete plan must not send a request")
+
+    EMPTY_BODY_PLANS = {
+        "update_workflow": {"workflow_type_id": 12, "updates": {}},
+        "update_activity": {"activity_type_id": 34, "updates": {}},
+        "update_group": {"group_id": 31, "updates": {}},
+        "update_group_member": {"group_member_id": 88, "updates": {}},
+        "reorder_actions": {"action_order": []},
+    }
+
+    def test_an_empty_body_is_refused_rather_than_sent(self):
+        for operation, modification in self.EMPTY_BODY_PLANS.items():
+            with self.subTest(operation=operation):
+                result, client = self.run_plan({"operation": operation,
+                                                "modification": modification})
+                self.assertFalse(result.success,
+                                 "an empty body changes nothing and answers 200")
+                self.assertEqual(client.writes, [])
+
+    def test_update_action_still_allows_a_settings_only_change(self):
+        result, client = self.run_plan({
+            "operation": "update_action",
+            "modification": {"action_type_id": 56, "settings": {"Order": "1"}},
+        })
+        self.assertSucceeded(result)
+        self.assertEqual(client.writes[0]["endpoint"],
+                         "WorkflowActionTypes/AttributeValue/56")
+
+    def test_update_action_refuses_a_plan_that_changes_nothing(self):
+        result, client = self.run_plan({
+            "operation": "update_action",
+            "modification": {"action_type_id": 56, "updates": {}, "settings": {}},
+        })
+        self.assertFalse(result.success)
+        self.assertEqual(client.writes, [])
+
+    def test_a_missing_key_is_a_named_failure_not_a_traceback(self):
+        result, client = self.run_plan({"operation": "update_group",
+                                        "modification": {"updates": {"name": "X"}}})
+        self.assertFalse(result.success)
+        self.assertIn("modification.group_id", result.failed["error"])
+        self.assertEqual(client.writes, [])
+
+    def test_either_the_id_or_the_name_satisfies_a_pair(self):
+        for modification in ({"group_id": 31, "person_id": 7, "role": "Member"},
+                             {"group_id": 31, "person_id": 7, "group_role_id": 4}):
+            with self.subTest(modification=modification):
+                problems = rock_build.missing_requirements(
+                    "add_group_member", {"modification": modification})
+                self.assertEqual(problems, [])
+
+    def test_neither_the_id_nor_the_name_names_both(self):
+        problems = rock_build.missing_requirements(
+            "add_group_member", {"modification": {"group_id": 31, "person_id": 7}})
+        self.assertEqual(len(problems), 1)
+        self.assertIn("modification.group_role_id", problems[0])
+        self.assertIn("modification.role", problems[0])
+
+
+class TestFieldMapsAreClosed(WriteTestCase):
+    """An unrecognised field is refused, not forwarded to Rock verbatim.
+
+    All five maps ended `.get(key, key)`. That is the mechanism that sent a role
+    *name* to `GroupRoleId` and had Rock answer 400 for a reason nobody reading
+    the plan could see."""
+
+    def setUp(self):
+        os.environ["ROCK_ALLOW_WRITES"] = "1"
+
+    UNKNOWN_FIELD_PLANS = {
+        "update_workflow": {"workflow_type_id": 12, "updates": {"nope": 1}},
+        "update_activity": {"activity_type_id": 34, "updates": {"nope": 1}},
+        "update_action": {"action_type_id": 56, "updates": {"nope": 1}},
+        "update_group": {"group_id": 31, "updates": {"nope": 1}},
+        "update_group_member": {"group_member_id": 88, "updates": {"nope": 1}},
+    }
+
+    def test_an_unknown_field_is_refused_and_lists_what_is_accepted(self):
+        for operation, modification in self.UNKNOWN_FIELD_PLANS.items():
+            with self.subTest(operation=operation):
+                client = FakeClient()
+                result = rock_build.run_plan(
+                    {"operation": operation, "modification": modification},
+                    lambda: client, CATALOG)
+                self.assertFalse(result.success)
+                self.assertIn("unknown field", result.failed["error"])
+                self.assertIn("accepts:", result.failed["error"])
+                self.assertEqual(client.writes, [],
+                                 "nothing may be forwarded to Rock")
+
+    def test_a_role_name_can_no_longer_land_in_group_role_id(self):
+        """The reported bug, as a test.
+
+        `GROUP_MEMBER_FIELDS` was fixed by omitting `role`, but the passthrough
+        that carried the name through was still there for every other key."""
+        self.assertNotIn("role", rock_build.GROUP_MEMBER_FIELDS)
+        with self.assertRaises(rock_build.PlanError):
+            rock_build.rock_field(rock_build.GROUP_MEMBER_FIELDS, "role")
+
+    def test_a_field_the_handler_resolves_itself_is_still_accepted(self):
+        client = FakeClient(responses={
+            "GroupMembers/88": {"Id": 88, "GroupId": 31},
+            "Groups/31": {"Id": 31, "GroupTypeId": 9},
+            "GroupTypeRoles": [{"Id": 4}],
+        })
+        result = rock_build.run_plan(
+            {"operation": "update_group_member",
+             "modification": {"group_member_id": 88, "updates": {"role": "Leader"}}},
+            lambda: client, CATALOG)
+        self.assertSucceeded(result)
+        self.assertEqual(client.only_write()["data"], {"GroupRoleId": 4})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
