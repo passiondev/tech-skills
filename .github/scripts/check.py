@@ -28,9 +28,7 @@ checks_run = 0
 
 
 def fail(where, message):
-    line = f"{where}: {message}"
-    if line not in failures:  # the same manifest is read by several checks
-        failures.append(line)
+    failures.append(f"{where}: {message}")
 
 
 def check(name):
@@ -52,6 +50,99 @@ def load_json(path):
     except json.JSONDecodeError as exc:
         fail(path.relative_to(ROOT), f"is not valid JSON — {exc}")
         return None
+
+
+_PARSED = {}
+
+
+def json_at(path):
+    """The JSON at `path`, read and complained about once per run.
+
+    Ten plugin manifests were each parsed between five and sixteen times, and
+    docs/vendored.json three times, because every check that wanted one opened
+    it. Two checks reading the same broken manifest then both reported it, which
+    is why `fail` used to carry a de-duplicating `if line not in failures`. Read
+    each file once and the duplicate goes with its cause.
+
+    A file that is not there reads as None rather than raising. `marketplace`
+    reports a missing manifest by name; the checks downstream of it would only
+    say the same thing again in a worse way.
+    """
+    key = str(path)
+    if key not in _PARSED:
+        _PARSED[key] = load_json(path) if Path(path).is_file() else None
+    return _PARSED[key]
+
+
+def manifest_path(name):
+    """Where one plugin's manifest lives. Six call sites spelled this out."""
+    return PLUGINS / name / ".claude-plugin" / "plugin.json"
+
+
+def manifest_of(name):
+    """One plugin's manifest, or an empty one if it has none."""
+    return json_at(manifest_path(name)) or {}
+
+
+DEPENDENCY_CYCLES = []
+_INSTALLS = {}
+
+
+def installs(name):
+    """Every plugin that installing `name` brings in, `name` included (ADR 0002).
+
+    Two functions walked this graph and disagreed about a cycle: `dependencies`
+    reported one, `cross-references` stopped at one in silence. There is one
+    walk now, and it records what it found here for `dependencies` to report, so
+    the closure a department installs and the cycle that would break it come out
+    of the same traversal.
+    """
+    if name not in _INSTALLS:
+        reached = set()
+
+        def walk(node, path):
+            if node in path:
+                cycle = " -> ".join(path[path.index(node):] + [node])
+                if cycle not in DEPENDENCY_CYCLES:
+                    DEPENDENCY_CYCLES.append(cycle)
+                return
+            reached.add(node)
+            for dep in manifest_of(node).get("dependencies", []):
+                if dep in LISTED:
+                    walk(dep, path + [node])
+
+        walk(name, [])
+        _INSTALLS[name] = reached
+    return _INSTALLS[name]
+
+
+def reset_caches():
+    """Forget everything read or walked so far.
+
+    One run answers each question once, so the answers are cached for the life
+    of the process. The test harness points these checks at a repository it
+    built itself, which is a second run inside the same process — and `installs`
+    caches under a plugin name, not a path, so a fixture plugin called `dev`
+    would otherwise be told what the real one depends on.
+    """
+    _PARSED.clear()
+    _INSTALLS.clear()
+    DEPENDENCY_CYCLES.clear()
+
+
+def owner_of(path):
+    """The plugin and the skill a file under plugins/ belongs to.
+
+    Five call sites read this out of path segments, three counting from the end
+    (`parts[-4]`, `parts[-2]`) and two from the front. Two of them named the
+    result `owner`, meaning different halves of it: the plugin in
+    `cross-references`, the skill in `invocability`. The skill is None for a file
+    that sits in no skill — a plugin manifest, a runtime script.
+    """
+    parts = Path(path).relative_to(PLUGINS).parts
+    plugin = parts[0] if parts else None
+    skill = parts[2] if len(parts) > 3 and parts[1] == "skills" else None
+    return plugin, skill
 
 
 def repo_files(under="", suffixes=None):
@@ -88,7 +179,7 @@ def repo_files(under="", suffixes=None):
 # Manifests, sources, and the dependency graph
 # ─────────────────────────────────────────────────────────────────────────────
 
-MARKETPLACE = load_json(ROOT / ".claude-plugin" / "marketplace.json")
+MARKETPLACE = json_at(ROOT / ".claude-plugin" / "marketplace.json")
 LISTED = {e["name"]: e for e in MARKETPLACE["plugins"]} if MARKETPLACE else {}
 
 
@@ -101,19 +192,25 @@ def _manifests():
         if " " in name:
             fail(name, "plugin names cannot contain spaces — use kebab-case")
 
+        # Every check downstream of this one finds a plugin's files at
+        # plugins/<name>, so the layout is required here rather than suggested.
+        # This check used to read the manifest through the declared source and
+        # the rest of the file went to plugins/<name> regardless, which made a
+        # divergence something eight checks would notice and none would explain.
         src = entry.get("source")
-        if not isinstance(src, str) or not src.startswith("./"):
-            fail(name, f"source should be a relative path like ./plugins/{name}, got {src!r}")
+        if src != f"./plugins/{name}":
+            fail(name, f"source must be ./plugins/{name}, got {src!r} — "
+                       "the rest of this file finds a plugin's files by its name")
             continue
         if not (ROOT / src).is_dir():
             fail(name, f"source path does not exist: {src}")
             continue
 
-        manifest = ROOT / src / ".claude-plugin" / "plugin.json"
+        manifest = manifest_path(name)
         if not manifest.is_file():
             fail(name, f"no plugin.json at {manifest.relative_to(ROOT)}")
             continue
-        pj = load_json(manifest)
+        pj = json_at(manifest)
         if pj is None:
             continue
         if pj.get("name") != name:
@@ -125,26 +222,18 @@ def _manifests():
 @check("dependencies")
 def _dependencies():
     for name in LISTED:
-        pj = load_json(PLUGINS / name / ".claude-plugin" / "plugin.json")
-        if pj is None:
-            continue
-        for dep in pj.get("dependencies", []):
+        for dep in manifest_of(name).get("dependencies", []):
             if dep not in LISTED:
                 fail(name, f'depends on "{dep}", which the marketplace does not list — '
                            "catalog may be stale")
 
-    # Cycles would make an install order impossible.
-    def walk(node, seen):
-        if node in seen:
-            fail("dependencies", f"cycle: {' -> '.join(seen + [node])}")
-            return
-        pj = load_json(PLUGINS / node / ".claude-plugin" / "plugin.json") or {}
-        for dep in pj.get("dependencies", []):
-            if dep in LISTED:
-                walk(dep, seen + [node])
-
+    # A cycle would make an install order impossible. `installs` finds them
+    # while walking the closure, so asking for every closure asks for every
+    # cycle.
     for name in LISTED:
-        walk(name, [])
+        installs(name)
+    for cycle in DEPENDENCY_CYCLES:
+        fail("dependencies", f"cycle: {cycle}")
 
 
 @check("departments")
@@ -153,7 +242,7 @@ def _departments():
     for name, entry in LISTED.items():
         if entry.get("category") != "department":
             continue
-        pj = load_json(PLUGINS / name / ".claude-plugin" / "plugin.json") or {}
+        pj = manifest_of(name)
         if not pj.get("dependencies"):
             fail(name, "is a department bundle with no dependencies")
         if list((PLUGINS / name).glob("skills/*/SKILL.md")):
@@ -163,8 +252,7 @@ def _departments():
 
     orphans = set(LISTED) - {"jira"}
     for name in LISTED:
-        pj = load_json(PLUGINS / name / ".claude-plugin" / "plugin.json") or {}
-        orphans -= set(pj.get("dependencies", []))
+        orphans -= set(manifest_of(name).get("dependencies", []))
     orphans = {n for n in orphans if LISTED[n].get("category") != "department"}
     if orphans:
         fail("departments", f"capability plugins no department installs: {sorted(orphans)}")
@@ -216,7 +304,7 @@ def _skills():
             fail(rel, f"lives under plugins/{plugin}, which the marketplace does not list")
 
 
-SKILL_PLUGIN = {p.parts[-2]: p.parts[-4] for p in SKILLS}
+SKILL_PLUGIN = {skill: plugin for plugin, skill in map(owner_of, SKILLS)}
 
 # A skill body naming another skill is a promise. Two ways it breaks here that
 # it never broke upstream, where every skill sat in one flat directory:
@@ -252,27 +340,12 @@ SLASH_REF = re.compile(r"(?<![\w/:])/([a-z][a-z0-9-]{2,})(:([a-z][a-z0-9-]{2,}))
 
 @check("cross-references")
 def _cross_references():
-    departments = {}
-    for name, entry in LISTED.items():
-        if entry.get("category") != "department":
-            continue
-        seen = set()
-
-        def walk(node):
-            if node in seen:
-                return
-            seen.add(node)
-            pj = load_json(PLUGINS / node / ".claude-plugin" / "plugin.json") or {}
-            for dep in pj.get("dependencies", []):
-                if dep in LISTED:
-                    walk(dep)
-
-        walk(name)
-        departments[name] = seen
+    departments = {name: installs(name) for name, entry in LISTED.items()
+                   if entry.get("category") == "department"}
 
     for doc in sorted(PLUGINS.rglob("*.md")):
         rel = doc.relative_to(ROOT).as_posix()
-        owner = doc.relative_to(PLUGINS).parts[0]
+        home, _ = owner_of(doc)
         for m in SLASH_REF.finditer(doc.read_text()):
             first, skill = m.group(1), m.group(3)
             if skill is None:
@@ -290,10 +363,10 @@ def _cross_references():
             if (rel, skill) in OPTIONAL_REFS or rel in CATALOGUE_FILES:
                 continue
             unreachable = sorted(d for d, closure in departments.items()
-                                 if owner in closure and first not in closure)
+                                 if home in closure and first not in closure)
             if unreachable:
                 fail(rel, f"references `/{first}:{skill}`, but {', '.join(unreachable)} "
-                          f"install `{owner}` without `{first}` — make the sentence say the "
+                          f"install `{home}` without `{first}` — make the sentence say the "
                           "reference is conditional and add it to OPTIONAL_REFS, or drop it")
 
     for rel, why in CATALOGUE_FILES.items():
@@ -309,10 +382,11 @@ def _cross_references():
             fail("cross-references", f"OPTIONAL_REFS still excuses {rel} -> {skill} ({why}), "
                                      "but that reference is gone — delete the entry")
             continue
-        owner, target = path.relative_to(PLUGINS).parts[0], SKILL_PLUGIN[skill]
-        if not any(owner in c and target not in c for c in departments.values()):
+        home, _ = owner_of(path)
+        target = SKILL_PLUGIN[skill]
+        if not any(home in c and target not in c for c in departments.values()):
             fail("cross-references", f"OPTIONAL_REFS excuses {rel} -> {skill} ({why}), but "
-                                     f"every department with `{owner}` now installs `{target}` "
+                                     f"every department with `{home}` now installs `{target}` "
                                      "— delete the entry and drop the caveat from the prose")
 
 
@@ -329,7 +403,8 @@ USER_INVOKED = {}
 for _path in SKILLS:
     _fm = FRONTMATTER.match(_path.read_text())
     if _fm and re.search(r"^disable-model-invocation:\s*true\s*$", _fm.group(1), re.M):
-        USER_INVOKED[_path.parts[-2]] = _path.parts[-4]
+        _plugin, _skill = owner_of(_path)
+        USER_INVOKED[_skill] = _plugin
 
 INVOKE_VERB = re.compile(r"(?i)\b(run|invoke|call|launch|trigger|hands? off to|"
                          r"hand off to|handing off to|delegate to|defer to|use)\b")
@@ -346,11 +421,12 @@ INVOCABLE_REFS = {}
 def _invocability():
     for doc in sorted(PLUGINS.rglob("*.md")):
         rel = doc.relative_to(ROOT).as_posix()
-        parts = doc.relative_to(PLUGINS).parts
-        owner = parts[2] if len(parts) > 3 and parts[1] == "skills" else None
+        # The skill this document belongs to, so that a user-invoked skill
+        # naming itself is not read as telling the agent to run it.
+        _, own_skill = owner_of(doc)
         text = doc.read_text()
         for skill, plugin in USER_INVOKED.items():
-            if skill == owner:
+            if skill == own_skill:
                 continue
             for m in re.finditer(r"(?:/%s:%s\b|`%s`)" % (plugin, skill, skill), text):
                 start = max(text.rfind(".", 0, m.start()), text.rfind("\n", 0, m.start()))
@@ -418,12 +494,12 @@ def _skill_paths():
     """
     skills = {}
     for path in repo_files("plugins/"):
-        parts = path.relative_to(PLUGINS).parts
-        if len(parts) > 3 and parts[1] == "skills":
-            skills.setdefault(PLUGINS.joinpath(*parts[:3]), []).append(path)
+        plugin, skill = owner_of(path)
+        if skill:
+            skills.setdefault((plugin, skill), []).append(path)
 
-    for directory, files in sorted(skills.items()):
-        plugin = directory.relative_to(PLUGINS).parts[0]
+    for (plugin, skill), files in sorted(skills.items()):
+        directory = PLUGINS / plugin / "skills" / skill
         docs = [f for f in files if f.suffix == ".md"]
         scripts = [f for f in files if f.parent.name == "scripts"]
         subdirs = {f.relative_to(directory).parts[0] for f in files
@@ -460,13 +536,13 @@ def _skill_paths():
 
 @check("contamination")
 def _contamination():
-    vend = load_json(ROOT / "docs" / "vendored.json") or {}
+    vend = json_at(ROOT / "docs" / "vendored.json") or {}
     banned = set(vend.get("contaminated_skills", {}).get("names", []))
     banned |= set(vend.get("excluded_skills", {}))
     banned_files = set(vend.get("excluded_files", []))
 
     for path in SKILLS:
-        skill = path.parts[-2]
+        _, skill = owner_of(path)
         if skill in banned:
             fail(path.relative_to(ROOT),
                  f'"{skill}" is on the exclusion list in docs/vendored.json and must not ship')
@@ -498,10 +574,10 @@ def _files_recorded(list_name, listed, shipped, base):
 
 @check("provenance")
 def _provenance():
-    vend = load_json(ROOT / "docs" / "vendored.json") or {}
+    vend = json_at(ROOT / "docs" / "vendored.json") or {}
     shipped = repo_files("plugins/")
     recorded = {(v["plugin"], k) for k, v in vend.get("skills", {}).items()}
-    on_disk = {(p.parts[-4], p.parts[-2]) for p in shipped if p.name == "SKILL.md"}
+    on_disk = {owner_of(p) for p in shipped if p.name == "SKILL.md"}
     for plugin, skill in sorted(on_disk - recorded):
         fail(f"{plugin}/{skill}", "is not in docs/vendored.json — every skill records where it came from")
     for plugin, skill in sorted(recorded - on_disk):

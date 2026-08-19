@@ -60,7 +60,7 @@ def first(client, endpoint, params):
 class CheckTestCase(unittest.TestCase):
     """Runs one real check over a repository of our own making."""
 
-    def run_check(self, fn, files):
+    def run_check(self, fn, files, listed=None):
         """Report what `fn` complains about, given `files` as the whole repo.
 
         The temp directory is made a real git repository with `files` added to
@@ -68,6 +68,9 @@ class CheckTestCase(unittest.TestCase):
         than walking the filesystem. That is also the only way to write a test
         for a file git ignores: put it in `.gitignore` here and it is ignored
         here too, by the same code that ignores it upstairs.
+
+        `listed` stands in for the marketplace catalog, for the checks that walk
+        it. Pass plugin names mapped to their marketplace entry.
         """
         with tempfile.TemporaryDirectory() as tmp:
             for rel, source in files.items():
@@ -78,16 +81,22 @@ class CheckTestCase(unittest.TestCase):
                 subprocess.run(["git", "-C", tmp, *command],
                                check=True, capture_output=True)
             kept, real_root = list(checks.failures), checks.ROOT
+            real_listed = checks.LISTED
             checks.failures.clear()
             checks.ROOT = Path(tmp)
             checks.PLUGINS = checks.ROOT / "plugins"
+            if listed is not None:
+                checks.LISTED = listed
+            checks.reset_caches()
             try:
                 fn()
                 return list(checks.failures)
             finally:
                 checks.ROOT = real_root
                 checks.PLUGINS = real_root / "plugins"
+                checks.LISTED = real_listed
                 checks.failures[:] = kept
+                checks.reset_caches()
 
     def caps(self, added=""):
         return self.run_check(checks._rock_query_caps,
@@ -394,6 +403,88 @@ class TestWhichFilesTheChecksSee(CheckTestCase):
                 self.assertEqual(checks.repo_files(), [])
             finally:
                 checks.ROOT = real_root
+
+
+class TestWhatAPluginInstalls(CheckTestCase):
+    """installs — the closure a department pulls in, and the cycles in the way.
+
+    Two functions used to walk this graph. `dependencies` reported a cycle and
+    `cross-references` stopped at one without a word, so a cycle could break the
+    closure a department was checked against and only the other check would say.
+    """
+
+    def repo(self, deps):
+        return {f"plugins/{name}/.claude-plugin/plugin.json":
+                json.dumps({"name": name, "description": name,
+                            "dependencies": on})
+                for name, on in deps.items()}
+
+    def closure(self, deps, of):
+        got = {}
+        self.run_check(lambda: got.update(reached=checks.installs(of),
+                                          cycles=list(checks.DEPENDENCY_CYCLES)),
+                       self.repo(deps), listed={n: {} for n in deps})
+        return got
+
+    def test_a_plugin_installs_itself_and_everything_below_it(self):
+        got = self.closure({"dept": ["dev"], "dev": ["general"], "general": []},
+                           of="dept")
+        self.assertEqual(got["reached"], {"dept", "dev", "general"})
+
+    def test_a_dependency_off_the_catalog_is_not_walked_into(self):
+        """`dependencies` reports that separately. Walking it would crash here."""
+        got = self.closure({"dept": ["ghost"]}, of="dept")
+        self.assertEqual(got["reached"], {"dept"})
+
+    def test_a_cycle_is_recorded_rather_than_looped_on(self):
+        got = self.closure({"dev": ["plan"], "plan": ["dev"]}, of="dev")
+        self.assertEqual(got["cycles"], ["dev -> plan -> dev"])
+        self.assertEqual(got["reached"], {"dev", "plan"})
+
+    def test_the_cycle_reported_is_the_cycle_and_not_the_path_to_it(self):
+        """Reaching a cycle from three plugins away is still that cycle."""
+        got = self.closure({"dept": ["dev"], "dev": ["plan"], "plan": ["dev"]},
+                           of="dept")
+        self.assertEqual(got["cycles"], ["dev -> plan -> dev"])
+
+    def test_the_repository_installs_what_the_dependencies_check_says(self):
+        kept = list(checks.failures)
+        checks.failures.clear()
+        try:
+            checks._dependencies()
+            self.assertEqual(checks.failures, [])
+        finally:
+            checks.failures[:] = kept
+
+
+class TestWhoOwnsAFile(CheckTestCase):
+    """owner_of — the plugin and the skill, read out of a path in one place.
+
+    Five call sites decoded this themselves, three counting from the end of the
+    path and two from the front, and two of them called different halves of it
+    the owner.
+    """
+
+    def owner(self, rel):
+        return checks.owner_of(checks.PLUGINS / rel)
+
+    def test_a_file_in_a_skill_names_both(self):
+        self.assertEqual(self.owner("general/skills/to-ste/SKILL.md"),
+                         ("general", "to-ste"))
+
+    def test_a_file_deeper_in_a_skill_still_names_both(self):
+        self.assertEqual(self.owner("general/skills/to-ste/scripts/lint.py"),
+                         ("general", "to-ste"))
+
+    def test_a_file_in_no_skill_has_no_skill(self):
+        self.assertEqual(self.owner("dev/.claude-plugin/plugin.json"),
+                         ("dev", None))
+        self.assertEqual(self.owner("rock/runtime/scripts/rock_client.py"),
+                         ("rock", None))
+
+    def test_the_skills_directory_itself_owns_nothing(self):
+        """`plugins/dev/skills` is three parts, and a skill needs a file in it."""
+        self.assertEqual(self.owner("dev/skills"), ("dev", None))
 
 
 if __name__ == "__main__":
