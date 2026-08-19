@@ -376,6 +376,88 @@ def _invocability():
                                  f"`{skill}` is model-invoked now — delete the entry")
 
 
+SIDECAR_LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
+PLUGIN_ROOT_PATH = re.compile(r"\$\{CLAUDE_PLUGIN_ROOT\}/([\w./-]+)")
+FILE_SUFFIX = re.compile(r"\.(md|py|sh|html|json|yaml|toml)$")
+
+
+def _skill_relative(target, subdirs):
+    """The part of a link target that has to resolve inside the skill, or None.
+
+    A skill's markdown links two unlike things. `MAP-FORMAT.md` and
+    `references/lava.md` are files it ships. `./src/ordering/CONTEXT.md` is an
+    example of a layout in somebody else's repository, and `(url)` is a hole in
+    a template. Only the first kind is ours to check, so: a bare sibling name,
+    or a path into a directory this skill actually ships.
+    """
+    if target.startswith(("http", "#", "mailto:", "/", "$")):
+        return None
+    target = target.split("#")[0].removeprefix("./")
+    if not target or not FILE_SUFFIX.search(target):
+        return None
+    head, _, rest = target.partition("/")
+    if rest and head not in subdirs:
+        return None
+    return target
+
+
+@check("skill-paths")
+def _skill_paths():
+    """A skill's own files must be reachable from the words that name them.
+
+    Three failures, and no reader catches any of them by reading:
+
+      * a link to a sidecar since renamed. The link still looks right.
+      * a sidecar nothing names. Progressive disclosure is a pointer out of the
+        SKILL.md, so a reference file no line points at is one no agent opens —
+        which is what `plugins/rock/skills/lava/references/` had become.
+      * a script named by a relative path. Two were, in two plugins. The working
+        directory is the repository being worked on, not the plugin, so
+        `scripts/hitl-loop.template.sh` resolved to nothing anywhere. The two
+        jira skills already had the answer: `${CLAUDE_PLUGIN_ROOT}`.
+    """
+    skills = {}
+    for path in repo_files("plugins/"):
+        parts = path.relative_to(PLUGINS).parts
+        if len(parts) > 3 and parts[1] == "skills":
+            skills.setdefault(PLUGINS.joinpath(*parts[:3]), []).append(path)
+
+    for directory, files in sorted(skills.items()):
+        plugin = directory.relative_to(PLUGINS).parts[0]
+        docs = [f for f in files if f.suffix == ".md"]
+        scripts = [f for f in files if f.parent.name == "scripts"]
+        subdirs = {f.relative_to(directory).parts[0] for f in files
+                   if len(f.relative_to(directory).parts) > 1}
+        for sidecar in docs:
+            if sidecar.name == "SKILL.md":
+                continue
+            # Its own text does not count. A format document that quotes its own
+            # filename would otherwise vouch for itself.
+            elsewhere = "\n".join(doc.read_text() for doc in docs if doc != sidecar)
+            if sidecar.name not in elsewhere:
+                fail(sidecar.relative_to(ROOT),
+                     "ships beside a skill that never names it — an agent reaches "
+                     "a reference file only through a pointer to it")
+
+        for doc in docs:
+            where = doc.relative_to(ROOT).as_posix()
+            for n, line in enumerate(doc.read_text().splitlines(), 1):
+                for target in SIDECAR_LINK.findall(line):
+                    inside = _skill_relative(target, subdirs)
+                    if inside and not (doc.parent / inside).exists() \
+                            and not (directory / inside).exists():
+                        fail(f"{where}:{n}", f"links to `{target}`, which is not there")
+                for named in PLUGIN_ROOT_PATH.findall(line):
+                    if not (PLUGINS / plugin / named).exists():
+                        fail(f"{where}:{n}", f"runs ${{CLAUDE_PLUGIN_ROOT}}/{named}, "
+                                             f"which `{plugin}` does not ship")
+                for script in scripts:
+                    if script.name in line and "CLAUDE_PLUGIN_ROOT" not in line:
+                        fail(f"{where}:{n}", f"names {script.name} by a relative path. "
+                             "The working directory is the repository being worked on "
+                             "— reach it through ${CLAUDE_PLUGIN_ROOT}")
+
+
 @check("contamination")
 def _contamination():
     vend = load_json(ROOT / "docs" / "vendored.json") or {}

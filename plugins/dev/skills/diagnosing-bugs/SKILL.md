@@ -26,7 +26,7 @@ Spend disproportionate effort here, and be **relentless**.
 7. **Property / fuzz loop.** If the bug is "sometimes wrong output", run 1000 random inputs and look for the failure mode.
 8. **Bisection harness.** If the bug appeared between two known states (commit, dataset, version), automate "boot at state X, check, repeat" so you can `git bisect run` it.
 9. **Differential loop.** Run the same input through old-version vs new-version (or two configs) and diff outputs.
-10. **HITL bash script.** Last resort. If a human must click, copy `scripts/hitl-loop.template.sh`, edit its steps to drive _them_, and parse the `KEY=VALUE` output it prints back.
+10. **HITL bash script.** Last resort. If a human must click, copy `${CLAUDE_PLUGIN_ROOT}/skills/diagnosing-bugs/scripts/hitl-loop.template.sh`, edit its steps to drive _them_, and parse the `KEY=VALUE` output it prints back.
 
 ### Non-deterministic bugs
 
@@ -43,7 +43,7 @@ Phase 1 is done when you can name **one command** — a script path, a test invo
 - [ ] **Red-capable** — it drives the actual bug code path and asserts the **user's exact symptom**, so it goes red on this bug and green once fixed. Sharpen the assertion until it catches _this_ bug rather than merely running clean.
 - [ ] **Deterministic** — same verdict every run. Pin time, seed RNG, isolate the filesystem, freeze the network. (Flaky bugs: the raised reproduction rate, above.)
 - [ ] **Fast** — seconds, not minutes. Cache setup, skip unrelated init, narrow the scope.
-- [ ] **Agent-runnable** — you can run it unattended; a human in the loop only via `scripts/hitl-loop.template.sh`.
+- [ ] **Agent-runnable** — you can run it unattended; a human in the loop only via `${CLAUDE_PLUGIN_ROOT}/skills/diagnosing-bugs/scripts/hitl-loop.template.sh`.
 
 If you catch yourself reading code to build a theory before this command exists, go back to building the loop. No red-capable command, no Phase 2.
 

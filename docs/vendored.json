@@ -43,7 +43,7 @@
         "SKILL.md",
         "scripts/hitl-loop.template.sh"
       ],
-      "diverged": "Skill pointers namespaced to `/plugin:skill` \u2014 upstream is one flat directory where `/x` resolves; here it does not (CI check `cross-references`)."
+      "diverged": "Skill pointers namespaced to `/plugin:skill` \u2014 upstream is one flat directory where `/x` resolves; here it does not (CI check `cross-references`). The HITL template is named through `${CLAUDE_PLUGIN_ROOT}` rather than as a bare relative path, which resolves nowhere from the repository being debugged (CI check `skill-paths`)."
     },
     "domain-modeling": {
       "plugin": "plan",

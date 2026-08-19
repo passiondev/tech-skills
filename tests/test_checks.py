@@ -80,11 +80,13 @@ class CheckTestCase(unittest.TestCase):
             kept, real_root = list(checks.failures), checks.ROOT
             checks.failures.clear()
             checks.ROOT = Path(tmp)
+            checks.PLUGINS = checks.ROOT / "plugins"
             try:
                 fn()
                 return list(checks.failures)
             finally:
                 checks.ROOT = real_root
+                checks.PLUGINS = real_root / "plugins"
                 checks.failures[:] = kept
 
     def caps(self, added=""):
@@ -276,6 +278,74 @@ class TestProvenanceReadsTheFileLists(CheckTestCase):
         checks.failures.clear()
         try:
             checks._provenance()
+            self.assertEqual(list(checks.failures), [])
+        finally:
+            checks.failures[:] = kept
+
+
+class TestSkillPathsFollowsThePointers(CheckTestCase):
+    """skill-paths — a skill's own files are reachable from the words for them."""
+
+    SKILL = "plugins/dev/skills/probe/SKILL.md"
+
+    def skill(self, body, **extra):
+        files = {self.SKILL: body}
+        files.update(extra)
+        return self.run_check(checks._skill_paths, files)
+
+    def test_a_skill_that_names_what_it_ships_is_clean(self):
+        self.assertEqual(self.skill(
+            "Read [NOTES.md](NOTES.md) and `references/deep.md`.\n",
+            **{"plugins/dev/skills/probe/NOTES.md": "notes\n",
+               "plugins/dev/skills/probe/references/deep.md": "deep\n"}), [])
+
+    def test_a_link_to_a_renamed_sidecar_is_caught(self):
+        found = self.skill("Read [NOTES.md](NOTES.md) and NOTES-v2.md.\n",
+                           **{"plugins/dev/skills/probe/NOTES-v2.md": "body\n"})
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("links to `NOTES.md`", found[0])
+
+    def test_a_sidecar_that_only_names_itself_is_still_unreachable(self):
+        found = self.skill("Nothing to see.\n",
+                           **{"plugins/dev/skills/probe/ALONE.md": "ALONE.md is this file.\n"})
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("ALONE.md", found[0])
+
+    def test_a_sidecar_nothing_names_is_caught(self):
+        found = self.skill("Nothing to see.\n",
+                           **{"plugins/dev/skills/probe/ORPHAN.md": "body\n"})
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("ORPHAN.md", found[0])
+        self.assertIn("pointer", found[0])
+
+    def test_a_script_named_by_a_relative_path_is_caught(self):
+        found = self.skill("Run `scripts/run.py` on the file.\n",
+                           **{"plugins/dev/skills/probe/scripts/run.py": "x = 1\n"})
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("CLAUDE_PLUGIN_ROOT", found[0])
+
+    def test_the_plugin_root_form_is_what_it_asks_for(self):
+        self.assertEqual(self.skill(
+            'Run `${CLAUDE_PLUGIN_ROOT}/skills/probe/scripts/run.py`.\n',
+            **{"plugins/dev/skills/probe/scripts/run.py": "x = 1\n"}), [])
+
+    def test_a_plugin_root_path_into_thin_air_is_caught(self):
+        found = self.skill(
+            'Run `${CLAUDE_PLUGIN_ROOT}/skills/probe/scripts/gone.py`.\n',
+            **{"plugins/dev/skills/probe/scripts/run.py": "x = 1\n"})
+        self.assertTrue(any("does not ship" in f for f in found), found)
+
+    def test_an_example_of_somebody_elses_layout_is_left_alone(self):
+        self.assertEqual(self.skill(
+            "One per context: [./src/ordering/CONTEXT.md](./src/ordering/CONTEXT.md), "
+            "and a hole in a template: [Title](url).\n"), [])
+
+    def test_the_repository_itself_passes(self):
+        """Not a repository of our making — this one, and its ten sidecar links."""
+        kept = list(checks.failures)
+        checks.failures.clear()
+        try:
+            checks._skill_paths()
             self.assertEqual(list(checks.failures), [])
         finally:
             checks.failures[:] = kept
