@@ -59,6 +59,7 @@ before `/dev:tdd`.
 | "I debug things" | `/dev:diagnosing-bugs` | Follows the evidence instead of guessing at a fix |
 | "I look people up in Rock" | `/rock:find`, `/rock:inspect` | Search, then the full record |
 | "Rock workflows break" | `/rock:status`, `/rock-build:audit` | Check the connection, then find what is broken |
+| "I manage group rosters" | `/rock-build:group` | Members, roles, and sync from a data view |
 | "I pull reports and numbers" | `/rock:data` | Dataviews, reports, attendance |
 | "I write the spec / the ticket" | `/plan:to-spec`, `/plan:to-tickets` | Turns a conversation into something someone can pick up |
 | "I get vague requests" | `/plan:triage` | Verifies the claim before anyone builds |

@@ -127,6 +127,7 @@ for _p in (str(ROCK_SCRIPTS), str(BUILD_SCRIPTS)):
         sys.path.insert(0, _p)
 
 import rock_build            # noqa: E402
+import rock_paths           # noqa: E402
 import rock_client           # noqa: E402
 import rock_query            # noqa: E402
 
@@ -486,6 +487,60 @@ class TestGroupOperations(WriteTestCase):
                          {"method": "PATCH", "endpoint": "GroupMembers/88", "params": None,
                           "data": {"GroupMemberStatus": 0, "Note": "moved away"}})
 
+    def test_update_group_member_resolves_a_role_name(self):
+        """A role arrives as a name and Rock wants an Id. Sending the name is a
+        400, and it was what this operation did while the skill advertised
+        "make him a leader"."""
+        client = FakeClient(responses={
+            "GroupMembers/88": {"Id": 88, "GroupId": 31},
+            "Groups/31": {"Id": 31, "GroupTypeId": 25},
+            "GroupTypeRoles": [{"Id": 7}],
+        })
+        result = rock_build.update_group_member(
+            {"modification": {"group_member_id": 88, "updates": {"role": "Leader"}}},
+            client, CATALOG)
+        self.assertSucceeded(result)
+        self.assertEqual(client.only_write(),
+                         {"method": "PATCH", "endpoint": "GroupMembers/88", "params": None,
+                          "data": {"GroupRoleId": 7}})
+
+    def test_update_group_member_resolves_the_role_in_its_own_group(self):
+        """Role names repeat across group types, so the membership's group has to
+        be read back before the name means anything."""
+        client = FakeClient(responses={
+            "GroupMembers/88": {"Id": 88, "GroupId": 31},
+            "Groups/31": {"Id": 31, "GroupTypeId": 25},
+            "GroupTypeRoles": [{"Id": 7}],
+        })
+        rock_build.update_group_member(
+            {"modification": {"group_member_id": 88, "updates": {"role": "Leader"}}},
+            client, CATALOG)
+        reads = [c["endpoint"] for c in client.calls if c["method"] == "GET"]
+        self.assertEqual(reads[:2], ["GroupMembers/88", "Groups/31"])
+        role_query = [c for c in client.calls if c["endpoint"] == "GroupTypeRoles"][0]
+        self.assertIn("GroupTypeId eq 25", role_query["params"]["$filter"])
+
+    def test_update_group_member_fails_when_the_role_is_unknown(self):
+        client = FakeClient(responses={
+            "GroupMembers/88": {"Id": 88, "GroupId": 31},
+            "Groups/31": {"Id": 31, "GroupTypeId": 25},
+            "GroupTypeRoles": [],
+        })
+        result = rock_build.update_group_member(
+            {"modification": {"group_member_id": 88, "updates": {"role": "Hedgehog"}}},
+            client, CATALOG)
+        self.assertFalse(result.success)
+        self.assertEqual(client.writes, [])
+
+    def test_update_group_member_takes_a_role_id_without_a_lookup(self):
+        client = FakeClient()
+        result = rock_build.update_group_member(
+            {"modification": {"group_member_id": 88, "updates": {"group_role_id": 7}}},
+            client, CATALOG)
+        self.assertSucceeded(result)
+        self.assertEqual(client.only_write()["data"], {"GroupRoleId": 7})
+        self.assertEqual([c for c in client.calls if c["method"] == "GET"], [])
+
     def test_remove_group_member_deletes(self):
         client = FakeClient()
         result = rock_build.remove_group_member(
@@ -605,6 +660,56 @@ class TestApiRequest(WriteTestCase):
             self.assertFalse(result.success, endpoint)
         self.assertEqual(client.calls, [])
 
+    def test_a_patch_needs_a_body(self):
+        """An empty PATCH changes nothing and reports success."""
+        client = FakeClient()
+        for body in (None, {}):
+            result = rock_build.api_request(
+                {"request": {"method": "PATCH", "endpoint": "Groups/31", "body": body}},
+                client, CATALOG)
+            self.assertFalse(result.success, repr(body))
+        self.assertEqual(client.writes, [])
+
+    def test_a_put_needs_a_body_even_when_acknowledged(self):
+        """An empty PUT is the original bug in its purest form: Rock would null
+        every column in the row. `full_replace` must not buy it."""
+        client = FakeClient()
+        result = rock_build.api_request(
+            {"request": {"method": "PUT", "endpoint": "Groups/31", "full_replace": True}},
+            client, CATALOG)
+        self.assertFalse(result.success)
+        self.assertEqual(client.writes, [])
+
+    def test_a_percent_encoded_traversal_is_refused(self):
+        """`requests` passes %2e%2e through untouched and the server decodes it,
+        so checking only the literal text is not enough."""
+        client = FakeClient()
+        for endpoint in ("Groups/%2e%2e/%2e%2e/x", "Groups/..%2fx", "Groups/%2e%2e"):
+            result = rock_build.api_request(
+                {"request": {"method": "DELETE", "endpoint": endpoint}}, client, CATALOG)
+            self.assertFalse(result.success, endpoint)
+        self.assertEqual(client.calls, [])
+
+    def test_a_put_snapshots_the_entity_before_replacing_it(self):
+        client = FakeClient(responses={"Groups/31": {"Id": 31, "Name": "Before"}})
+        result = rock_build.api_request(
+            {"request": {"method": "PUT", "endpoint": "Groups/31", "full_replace": True,
+                         "body": {"Id": 31, "Name": "After"}}}, client, CATALOG)
+        self.assertSucceeded(result)
+        saved = sorted(rock_paths.SNAPSHOTS.glob("Groups-31-*.json"))
+        self.assertTrue(saved, "a PUT must leave the previous entity on disk")
+        self.assertIn("Before", saved[-1].read_text())
+
+    def test_a_put_is_refused_when_the_entity_cannot_be_read(self):
+        """No snapshot, no replace. Whatever stops the read also means nobody
+        could undo the write."""
+        client = FakeClient(fail_on={("GET", "Groups/31")})
+        result = rock_build.api_request(
+            {"request": {"method": "PUT", "endpoint": "Groups/31", "full_replace": True,
+                         "body": {"Id": 31, "Name": "After"}}}, client, CATALOG)
+        self.assertFalse(result.success)
+        self.assertEqual(client.writes, [])
+
     def test_a_missing_endpoint_is_refused(self):
         client = FakeClient()
         result = rock_build.api_request({"request": {"method": "POST"}}, client, CATALOG)
@@ -674,6 +779,23 @@ class TestQueryWrites(WriteTestCase):
         self.assertEqual(call["endpoint"], "Blocks/AttributeValue/4821")
         self.assertEqual(call["params"],
                          {"attributeKey": "EnableDebug", "attributeValue": "false"})
+
+    def test_block_set_exits_non_zero_when_rock_rejects_the_key(self):
+        """It printed the error and exited 0, so a skill reading the exit code
+        saw a setting land that never did -- the fault it was fixed for."""
+        client = FakeClient(responses={"Blocks/4821": {"Id": 4821}},
+                            fail_on={("POST", "Blocks/AttributeValue/4821")})
+        with self.assertRaises(SystemExit) as caught:
+            rock_query.cmd_block_set(
+                SimpleNamespace(id="4821", key="Nonsense", value="x"), client)
+        self.assertNotEqual(caught.exception.code, 0)
+
+    def test_block_set_exits_non_zero_when_the_block_is_missing(self):
+        client = FakeClient()
+        with self.assertRaises(SystemExit) as caught:
+            rock_query.cmd_block_set(
+                SimpleNamespace(id="4821", key="EnableDebug", value="false"), client)
+        self.assertNotEqual(caught.exception.code, 0)
 
     def test_person_create_still_posts(self):
         client = FakeClient()

@@ -20,6 +20,7 @@ VENV = HOME / ".venv"
 CATALOG = HOME / "catalog.json"
 LOG = HOME / "rock.log"
 SCREENSHOTS = HOME / "screenshots"
+SNAPSHOTS = HOME / "snapshots"
 
 
 def ensure() -> Path:

@@ -12,6 +12,7 @@ apart. Everything else is the curator's job.
 Exit 0 if clean, 1 otherwise. Every failure names the file and what to do.
 """
 
+import ast
 import json
 import re
 import sys
@@ -527,6 +528,32 @@ def _write_guard():
         fail("rock_query.py", f"WRITE_COMMANDS lists subcommands that no longer exist: {sorted(stale)}")
 
 
+def _string_literals(src, skip_docstrings=False):
+    """Every string constant in the source, docstrings optionally left out.
+
+    f-strings arrive in pieces -- f"Blocks/{id}/AttributeValues" yields
+    "Blocks/" and "/AttributeValues" as separate constants -- which is what we
+    want, since the interesting half is the literal tail.
+    """
+    tree = ast.parse(src)
+    docs = set()
+    if skip_docstrings:
+        for node in ast.walk(tree):
+            body = getattr(node, "body", None)
+            if not isinstance(body, list) or not body:
+                continue
+            if not isinstance(node, (ast.Module, ast.ClassDef,
+                                     ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            first = body[0]
+            if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                    and isinstance(first.value.value, str)):
+                docs.add(id(first.value))
+    return [n for n in ast.walk(tree)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)
+            and id(n) not in docs]
+
+
 @check("rock-write-shapes")
 def _rock_write_shapes():
     """The two request shapes Rock will not forgive (ADR 0022).
@@ -543,27 +570,33 @@ def _rock_write_shapes():
     route; both shapes that look plausible answer "The OData path is invalid."
     The real route binds from the query string.
     """
-    put_is_deliberate = {("rock_build.py", "api_request")}
+    put_is_deliberate = {("plugins/rock-build/runtime/scripts/rock_build.py", "api_request")}
 
     for path in sorted(PLUGINS.rglob("*.py")):
         rel = path.relative_to(ROOT)
         src = path.read_text()
 
-        for fn in re.finditer(r"^def (\w+)\(.*?(?=^def |\Z)", src, re.S | re.M):
+        # Split on any def, indented or not, so a PUT inside a class method is
+        # attributed to that method rather than to whatever function came before
+        # it. Both runtime scripts define classes.
+        for fn in re.finditer(r"^[ \t]*def (\w+)\(.*?(?=^[ \t]*def |\Z)", src, re.S | re.M):
             if "client.put(" not in fn.group(0):
                 continue
-            if (path.name, fn.group(1)) in put_is_deliberate:
+            if (str(rel), fn.group(1)) in put_is_deliberate:
                 continue
             fail(f"{rel}", f"{fn.group(1)}() sends a PUT. Rock's PUT replaces the whole "
                            f"entity — use client.patch for a partial update")
 
-        for n, line in enumerate(src.splitlines(), 1):
-            if line.lstrip().startswith("#"):
-                continue  # a comment naming the dead route is documentation
-            if "/AttributeValues" in line:
-                fail(f"{rel}:{n}", "there is no {Entity}/{id}/AttributeValues route — "
-                                   "attribute values go to POST {Entity}/AttributeValue/{id} "
-                                   "with attributeKey and attributeValue as query parameters")
+        # Only a string the code actually sends is a defect. Prose naming the
+        # dead route is documentation, and matching on the text of a line cannot
+        # tell the two apart. The parse tree can: comments are not in it at all,
+        # and a docstring is a statement we can identify and skip.
+        for node in _string_literals(src, skip_docstrings=True):
+            if "/AttributeValues" in node.value:
+                fail(f"{rel}:{node.lineno}",
+                     "there is no {Entity}/{id}/AttributeValues route — attribute "
+                     "values go to POST {Entity}/AttributeValue/{id} with "
+                     "attributeKey and attributeValue as query parameters")
 
 
 @check("no-repo-writes")

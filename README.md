@@ -46,7 +46,7 @@ whole of it, and it is two commands.
 | Department | Skills | Capability plugins |
 | --- | ---: | --- |
 | `global-engineering` | 23 | general, jira, dev, plan |
-| `local-engineering` | 31 | general, jira, dev, plan, rock, rock-build |
+| `local-engineering` | 32 | general, jira, dev, plan, rock, rock-build |
 | `ops` | 15 | general, jira, plan |
 | `analytics` | 28 | general, jira, dev, plan, rock |
 | `service-and-support` | 15 | general, jira, rock |
@@ -61,7 +61,7 @@ Skills are invoked as `/plugin:skill` — `/dev:tdd`, `/rock:find`,
 `codebase-design`, `improve-codebase-architecture`, `resolving-merge-conflicts`
 **plan** — `to-spec`, `to-tickets`, `wayfinder`, `triage`, `domain-modeling`
 **rock** — read Rock RMS: `find`, `inspect`, `data`, `lava`, `status`
-**rock-build** — change Rock RMS: `audit`, `fix`, `create`
+**rock-build** — change Rock RMS: `audit`, `fix`, `create`, `group`
 
 Departments are bundles: they hold no skills, only the list of capability
 plugins they need. You install one thing.
@@ -137,7 +137,7 @@ GitHub issues, mostly. [`docs/vendored.json`](docs/vendored.json) records where
 every skill came from and whether we have diverged from it. Read it before
 "fixing" something that looks odd upstream-shaped.
 
-Twenty-one decisions and their reasoning are in [`docs/adr/`](docs/adr/). Start
+Twenty-two decisions and their reasoning are in [`docs/adr/`](docs/adr/). Start
 with [0001](docs/adr/0001-public-marketplace-repo.md) (why public) and
 [0002](docs/adr/0002-capability-plugins-and-department-bundles.md) (why two
 layers). [`CONTEXT.md`](CONTEXT.md) defines the vocabulary this repo uses
@@ -146,4 +146,4 @@ precisely.
 ## Licence
 
 MIT. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE) — eighteen of the
-thirty-one skills are Matt Pocock's work, redistributed under his licence.
+thirty-two skills are Matt Pocock's work, redistributed under his licence.

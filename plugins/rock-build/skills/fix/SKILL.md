@@ -135,6 +135,11 @@ Then:
   that acknowledgement is only honest when the body is the entity you just read
   back whole — `Id`, `Guid`, `CreatedDateTime` and all. If you are reaching for
   it to change two fields, reach for `PATCH` instead.
+- **A `PUT` writes the old row to disk first**, under the runtime's `snapshots/`
+  directory, and does not go at all if that read fails. Report the path it
+  prints — it is the only way back.
+- **`PATCH` and `PUT` both need a non-empty body.** An empty `PATCH` changes
+  nothing and would report success; an empty `PUT` nulls every column.
 - **Show the request in the plan** — method, URL, body — before sending it. The
   named operations have shapes a reader can check against the table. This one has
   none, so the requester is the only check there is.

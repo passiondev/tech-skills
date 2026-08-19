@@ -30,14 +30,21 @@ So every workflow this plugin has ever created had unconfigured actions, and the
 
 That is a real loss of a real constraint. It is still the right trade, because the constraint was not holding. Rock has hundreds of entities and this plugin names a couple of dozen; when a request landed outside them, the honest options were to give up or to guess at an operation that does not exist. What actually happened was neither: people with `rock-tools` checked out went and used it — no guard, no plan file, no confirmation — and people without it were stuck. A boundary that pushes work onto an archived repo is not protecting anything.
 
-`api_request` is deliberately thin. No field maps, no name resolution, no conveniences: what you write is what Rock receives. Four guards, and they are the whole safety story:
+`api_request` is deliberately thin. No field maps, no name resolution, no conveniences: what you write is what Rock receives. The guards are the whole safety story:
 
 - the method is one of GET, POST, PATCH, PUT, DELETE;
-- the endpoint is a path under `/api/` — no scheme, no leading slash, no `..` segment, so an authenticated session cannot be aimed elsewhere or climbed out of;
-- `PUT` is refused without `"full_replace": true`, which is the bug above made unreachable by accident;
+- the endpoint is a path under `/api/` — no scheme, no leading slash, no `..` segment, so an authenticated session cannot be aimed elsewhere or climbed out of. The percent-decoded form is checked too, because `requests` forwards `%2e%2e` untouched and the server is what decodes it;
+- `PATCH` and `PUT` both need a non-empty body. An empty `PATCH` would change nothing and report success; an empty `PUT` would null every column in the row, which is the bug at its purest;
+- `PUT` is refused without `"full_replace": true`, and refused again if the row could not be read and written to disk first;
 - the request is printed before it is sent, and the skill requires the same yes as every other operation.
 
 `GET` is in that list on purpose. Building an honest `full_replace` body means reading the entity first, and a caller that cannot read has to guess at field names.
+
+### The snapshot is a precondition, not a courtesy
+
+`rock-tools` had a `safe_put` that backed the row up before replacing it, and its own instructions said to use it and never a bare `put`. That did not come across in the split, and it is the better half of the idea — an instruction saying *always use the safe one* is an instruction someone eventually does not follow.
+
+So the snapshot is not advice here. Before a `PUT`, `api_request` reads the entity and writes it to `$ROCK_HOME/snapshots/`, and if that read fails for any reason — a 404, a permission, a typo in the endpoint — the `PUT` does not go. Whatever stopped the read would also have stopped anyone undoing the write. It is the one write in this runtime that earns a file on disk, and the only place the old `safe_put` habit is enforced rather than requested.
 
 ## Six group operations, and a skill to reach them
 
@@ -55,7 +62,7 @@ They get their own skill rather than a row in `/rock-build:fix`'s table. Adding 
 
 ## Consequences
 
-CI now carries a check for this bug class ([0010](0010-curator-merges-ci-guards.md)): `rock-write-shapes` fails on `client.put(` in any function except `api_request`, and on `/AttributeValues` anywhere outside a comment. It is a grep, so it catches the shape and not the intent — a new whole-entity replace that genuinely needs `PUT` has to be added to the allow-list by name, which is the review conversation we want. The test suite runs in CI too, which it did not before.
+CI now carries a check for this bug class ([0010](0010-curator-merges-ci-guards.md)): `rock-write-shapes` fails on `client.put(` in any function or method except `api_request`, and on `/AttributeValues` in any string the code actually sends. The second half reads the parse tree rather than the text of each line, because a comment or a docstring naming the dead route is documentation and no pattern over raw lines tells the two apart — this ADR's own explanation of the bug would have failed the check that forbids it. What it catches is the shape and not the intent, so a new whole-entity replace that genuinely needs `PUT` has to be added to the allow-list by name, which is the review conversation we want. The test suite runs in CI too, which it did not before.
 
 `api_request` has no shape a reader can check. The named operations can be read against the table in the skill; this one is method, URL and body, and the only check is the person answering yes. The skill says so, and says to read the entity before changing it. If that turns out not to be enough, the fix is a narrower allow-list of endpoints, not another paragraph of instructions.
 

@@ -1514,7 +1514,7 @@ def cmd_block_set(args, client):
     block = client.get(f"Blocks/{block_id}")
     if not block:
         print(f"Block {block_id} not found")
-        return
+        sys.exit(1)
 
     print(f"Setting {args.key}={args.value[:80]}{'...' if len(args.value) > 80 else ''} on block {block_id}")
 
@@ -1536,6 +1536,10 @@ def cmd_block_set(args, client):
         print(f"Error setting attribute: {e}")
         print(f"  Rock rejects a key it does not know. Check it against: "
               f"rock.sh query block {block_id}")
+        # Exit non-zero. The caller is a skill reporting what it changed, and a
+        # setting that did not land must not read as one that did -- the whole
+        # fault this command was fixed for.
+        sys.exit(1)
 
 
 def cmd_person_create(args, client):

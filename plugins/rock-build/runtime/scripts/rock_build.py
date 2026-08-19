@@ -20,8 +20,11 @@ import json
 import os
 import sys
 import traceback
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import unquote
 
+import rock_paths
 from rock_client import RockClient, odata_str
 from rock_catalog import load_catalog
 from rock_log import get_logger
@@ -91,14 +94,25 @@ def resolve_layout(catalog, name, site_id=None):
     return None
 
 
-def resolve_group_type(client, name):
-    """Find a GroupType ID by name (substring match, as check-in areas rely on)."""
-    gts = client.get("GroupTypes", params={
-        "$filter": f"substringof('{odata_str(name)}', Name) eq true",
+def _first_id(client, endpoint, filter_str):
+    """The Id of the first match, or None. The shape every lookup here shares."""
+    found = client.get(endpoint, params={
+        "$filter": filter_str,
         "$select": "Id",
         "$top": 1,
     })
-    return gts[0]["Id"] if gts else None
+    return found[0]["Id"] if found else None
+
+
+def _named(client, endpoint, name):
+    """Look up by exact name."""
+    return _first_id(client, endpoint, f"Name eq '{odata_str(name)}'")
+
+
+def resolve_group_type(client, name):
+    """Find a GroupType ID by name (substring match, as check-in areas rely on)."""
+    return _first_id(client, "GroupTypes",
+                     f"substringof('{odata_str(name)}', Name) eq true")
 
 
 def resolve_group_role(client, group_id, role_name):
@@ -110,23 +124,27 @@ def resolve_group_role(client, group_id, role_name):
     group = client.get(f"Groups/{group_id}", params={"$select": "GroupTypeId"})
     if not group or not group.get("GroupTypeId"):
         return None
-    roles = client.get("GroupTypeRoles", params={
-        "$filter": f"GroupTypeId eq {group['GroupTypeId']} and "
-                   f"Name eq '{odata_str(role_name)}'",
-        "$select": "Id",
-        "$top": 1,
-    })
-    return roles[0]["Id"] if roles else None
+    return _first_id(client, "GroupTypeRoles",
+                     f"GroupTypeId eq {group['GroupTypeId']} and "
+                     f"Name eq '{odata_str(role_name)}'")
+
+
+def resolve_member_role(client, member_id, role_name):
+    """Find a GroupTypeRole ID by name, for the group a membership is in.
+
+    `update_group_member` is handed a membership and no group, so the group has
+    to be read back before a role name means anything — same reason
+    `resolve_group_role` needs a group and not just a name.
+    """
+    member = client.get(f"GroupMembers/{member_id}", params={"$select": "GroupId"})
+    if not member or not member.get("GroupId"):
+        return None
+    return resolve_group_role(client, member["GroupId"], role_name)
 
 
 def resolve_data_view(client, name):
     """Find a DataView ID by name."""
-    views = client.get("DataViews", params={
-        "$filter": f"Name eq '{odata_str(name)}'",
-        "$select": "Id",
-        "$top": 1,
-    })
-    return views[0]["Id"] if views else None
+    return _named(client, "DataViews", name)
 
 
 # Rock.Model.GroupMemberStatus. Sending nothing means 0 — Inactive — so every
@@ -830,13 +848,7 @@ def create_checkin_area(plan, client, catalog):
         if not loc_id and isinstance(loc_ref, dict):
             loc_name = loc_ref.get("name", "")
             if loc_name:
-                locs = client.get("Locations", params={
-                    "$filter": f"Name eq '{odata_str(loc_name)}'",
-                    "$select": "Id",
-                    "$top": 1,
-                })
-                if locs:
-                    loc_id = locs[0]["Id"]
+                loc_id = _named(client, "Locations", loc_name)
         if loc_id:
             try:
                 gl_id = client.post("GroupLocations", {
@@ -858,13 +870,9 @@ def create_checkin_area(plan, client, catalog):
         if not sched_id and isinstance(first, dict):
             sname = first.get("name", "")
             if sname:
-                found = client.get("Schedules", params={
-                    "$filter": f"substringof('{odata_str(sname)}', Name) eq true",
-                    "$select": "Id",
-                    "$top": 1,
-                })
-                if found:
-                    sched_id = found[0]["Id"]
+                sched_id = _first_id(
+                    client, "Schedules",
+                    f"substringof('{odata_str(sname)}', Name) eq true")
         if sched_id:
             try:
                 client.patch(f"Groups/{group_id}", {"ScheduleId": sched_id})
@@ -1053,8 +1061,11 @@ def add_group_member(plan, client, catalog):
     return result
 
 
+# `role` is deliberately absent: it arrives as a name and Rock wants an Id, so
+# update_group_member resolves it rather than mapping it. `group_role_id` is the
+# same column for a caller who already holds the Id.
 GROUP_MEMBER_FIELDS = {
-    "role": "GroupRoleId", "group_role_id": "GroupRoleId", "note": "Note",
+    "group_role_id": "GroupRoleId", "note": "Note",
     "is_notified": "IsNotified", "is_archived": "IsArchived",
     "order": "GroupOrder", "guest_count": "GuestCount",
 }
@@ -1066,8 +1077,15 @@ def update_group_member(plan, client, catalog):
     Plan format:
     {
         "operation": "update_group_member",
-        "modification": {"group_member_id": 88, "updates": {"status": "inactive"}}
+        "modification": {
+            "group_member_id": 88,
+            "updates": {"role": "Leader", "status": "inactive"}
+        }
     }
+
+    A `role` name resolves inside the group this membership belongs to, which
+    means reading the group back first. Pass `group_role_id` instead when the Id
+    is already in hand.
     """
     result = BuildResult()
     mod = plan["modification"]
@@ -1084,6 +1102,16 @@ def update_group_member(plan, client, catalog):
                 result.report()
                 return result
             data["GroupMemberStatus"] = status
+        elif key == "role":
+            role_id = resolve_member_role(client, member_id, value)
+            if role_id is None:
+                result.fail("GroupMember", str(member_id),
+                            f"Could not resolve role {value!r} in this member's "
+                            f"group. Role names belong to the group type — take it "
+                            f"from the group's own roster.")
+                result.report()
+                return result
+            data["GroupRoleId"] = role_id
         else:
             data[GROUP_MEMBER_FIELDS.get(key, key)] = value
 
@@ -1223,7 +1251,8 @@ def api_request(plan, client, catalog):
     Id and Guid and CreatedDateTime included. That is not ceremony: Rock's PUT
     replaces the row, so a partial body is the bug this operation was written
     alongside. GET is here because reading the entity is the only way to build
-    that body honestly.
+    that body honestly, and a PUT snapshots the row to disk first or does not
+    go at all.
     """
     result = BuildResult()
     req = plan.get("request") or {}
@@ -1244,11 +1273,29 @@ def api_request(plan, client, catalog):
 
     # An endpoint is a path under /api/, and nothing else. Anything that could
     # aim the authenticated session somewhere else, or climb out of /api/, is
-    # refused rather than normalised.
-    if "://" in endpoint or endpoint.startswith("/") or ".." in endpoint.split("/"):
+    # refused rather than normalised. The percent-decoded form is checked too:
+    # `requests` sends %2e%2e through untouched and the server decodes it, so
+    # checking only the literal text would miss the encoded spelling.
+    for form in (endpoint, unquote(endpoint)):
+        if ("://" in form or form.startswith("/")
+                or ".." in form.replace("\\", "/").split("/")):
+            result.fail("Request", label,
+                        "endpoint must be a path under /api/ — no scheme, no leading "
+                        "slash, no '..', encoded or not")
+            result.report()
+            return result
+
+    params = req.get("params")
+    body = req.get("body")
+
+    # A PATCH with nothing in it is a no-op that reports success. An empty PUT is
+    # the whole-entity replace this operation exists to make hard: Rock would
+    # null every column in the row.
+    if method in ("PATCH", "PUT") and not (isinstance(body, dict) and body):
         result.fail("Request", label,
-                    "endpoint must be a path under /api/ — no scheme, no leading "
-                    "slash, no '..'")
+                    f"{method} needs a non-empty \"body\" object holding the fields "
+                    f"to send. Read the entity with a GET first if you need its "
+                    f"field names.")
         result.report()
         return result
 
@@ -1262,9 +1309,6 @@ def api_request(plan, client, catalog):
         result.report()
         return result
 
-    params = req.get("params")
-    body = req.get("body")
-
     print(f"  {method} /api/{endpoint}" + (f"  params={params}" if params else ""))
 
     try:
@@ -1277,6 +1321,11 @@ def api_request(plan, client, catalog):
             client.patch(endpoint, body)
             result.add("Response", label, endpoint)
         elif method == "PUT":
+            # No snapshot, no replace. Anything that stops us reading the row
+            # back — a 404, a permission, a typo in the endpoint — also means
+            # nobody could undo what the PUT is about to do.
+            saved = snapshot_entity(client, endpoint)
+            print(f"  saved the current entity to {saved}")
             client.put(endpoint, body)
             result.add("Response", label, endpoint)
         else:
@@ -1287,6 +1336,26 @@ def api_request(plan, client, catalog):
 
     result.report()
     return result
+
+
+def snapshot_entity(client, endpoint):
+    """Write the entity to disk before something replaces it. Returns its path.
+
+    `rock-tools` had a `safe_put` that backed the row up first, and its own
+    instructions said to use it and never a bare PUT. That was the right
+    instinct and it did not come across in the split. Here the snapshot is not
+    advice: `api_request` refuses a PUT it could not take one for, because a
+    replace nobody can undo is the one write in this runtime that deserves a
+    file on disk.
+    """
+    current = client.get(endpoint)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    slug = endpoint.strip("/").replace("/", "-")
+    rock_paths.SNAPSHOTS.mkdir(parents=True, exist_ok=True)
+    path = rock_paths.SNAPSHOTS / f"{slug}-{stamp}.json"
+    path.write_text(json.dumps(current, indent=2, default=str))
+    log.info("snapshot %s -> %s", endpoint, path)
+    return path
 
 
 def require_writes_enabled(operation):

@@ -35,9 +35,9 @@ has to be right before the role name matters.
 ```
 Roster change: "Guest Services" (group 312, type Serving Team)
 
-  [add]    Kylie Barnett (person 8842) as Leader, active
+  [add]    someone@example.com (person 8842) as Leader, active
              gains: group email, Sunday schedule, group leader toolbox
-  [status] Sam Whitfield (person 7115) Leader -> inactive
+  [status] someone-else@example.com (person 7115) Leader -> inactive
              keeps the membership row and its history
 
 Apply? [y/n]
@@ -72,11 +72,15 @@ PLAN
 | Operation | Key | Fields |
 | --- | --- | --- |
 | `create_group` | `group` | `name`, `group_type` or `group_type_id`, and optionally `parent_group_id`, `campus_id`, `description`, `is_active`, `is_public`, `is_security_role`, `schedule_id`, `group_capacity`, `settings` |
-| `update_group` | `modification` | `group_id` + `updates` (any of the same field names) |
-| `add_group_member` | `modification` | `group_id`, `person_id`, `role` or `group_role_id`, and optionally `status`, `note`, `is_notified` |
-| `update_group_member` | `modification` | `group_member_id` + `updates` (`role`, `status`, `note`, `is_archived`, `guest_count`) |
+| `update_group` | `modification` | `group_id` + `updates` (any of the same field names except `group_type` — a group cannot change type) and optionally `settings` |
+| `add_group_member` | `modification` | `group_id`, `person_id`, `role` or `group_role_id`, and optionally `status`, `note`, `is_notified`, `order` |
+| `update_group_member` | `modification` | `group_member_id` + `updates` (`role` or `group_role_id`, `status`, `note`, `is_archived`, `guest_count`, `order`) |
 | `remove_group_member` | `modification` | `group_member_id` — **deletes the row** |
 | `create_group_sync` | `modification` | `group_id`, `role` or `group_type_role_id`, `data_view` or `sync_data_view_id`, and optionally `add_user_accounts`, `schedule_interval_minutes`, `welcome_email_id`, `exit_email_id` |
+
+A `role` given as a name resolves inside the group's own type, which for
+`update_group_member` means reading the membership's group back first. Pass
+`group_role_id` when the ID is already in hand.
 
 `status` is `active`, `inactive`, or `pending`, and it defaults to `active` here.
 Rock's own default is inactive, so a membership created any other way with the
@@ -117,7 +121,7 @@ it would not come back from the data view, say so and stop:
 Sync plan: "Guest Services" (312), role Member <- data view "Active Adults" (71)
 
   Roster now: 14 Members
-  Not returned by the data view: 3 (Sam Whitfield, ...)
+  Not returned by the data view: 3 (persons 7115, 7240, 7311)
              group sync will remove these three on its first run
 
 Apply? [y/n]
@@ -142,7 +146,7 @@ Re-query and report what Rock now holds:
 
 ```
 Applied 2 of 2. "Guest Services" (312): 15 members, 3 Leaders.
-Kylie Barnett is Leader, active. Sam Whitfield is Leader, inactive.
+Person 8842 is Leader, active. Person 7115 is Leader, inactive.
 ```
 
 Done when the report accounts for every line of the plan, applied or not, and

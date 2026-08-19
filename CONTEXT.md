@@ -64,8 +64,9 @@ plugins/<name>/
   .claude-plugin/plugin.json      name, description, dependencies
   skills/<skill>/SKILL.md         one skill; supporting files sit beside it
   runtime/                        executable code, if the plugin has any
-docs/adr/                         twenty-one decisions and why
+docs/adr/                         twenty-two decisions and why
 docs/vendored.json                where every skill came from, and what we changed
+tests/                            what the runtime scripts send to Rock, asserted
 ONBOARDING.md                     read and acted on by Claude Code, not by a person
 ```
 
