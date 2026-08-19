@@ -395,11 +395,16 @@ class TestAttributeValues(WriteTestCase):
             rock_build.set_attribute_values(client, "Blocks", 1, {"Nope": "x"})
 
     def test_a_rejected_key_fails_the_build(self):
+        """The step stops the plan by raising, so a caller cannot miss it.
+
+        This used to be a False the seven callers were each trusted to check."""
         client = FakeClient(fail_on={"Blocks/AttributeValue/1"})
         result = rock_build.BuildResult()
-        ok = rock_build.apply_settings(result, client, "Blocks", 1, "a block", {"Nope": "x"})
-        self.assertFalse(ok)
+        with self.assertRaises(rock_build.StepFailed):
+            rock_build.apply_settings(result, client, "Blocks", 1, "a block",
+                                      {"Nope": "x"})
         self.assertFalse(result.success)
+        self.assertEqual(result.failures[0]["type"], "Settings")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -806,10 +811,12 @@ class TestApiRequest(WriteTestCase):
         """No snapshot, no replace. Whatever stops the read also means nobody
         could undo the write."""
         client = FakeClient(fail_on={("GET", "Groups/31")})
-        result = rock_build.api_request(
-            {"request": {"method": "PUT", "endpoint": "Groups/31", "full_replace": True,
-                         "body": {"Id": 31, "Name": "After"}}}, client)
-        self.assertFalse(result.success)
+        with self.assertRaises(rock_build.StepFailed) as stopped:
+            rock_build.api_request(
+                {"request": {"method": "PUT", "endpoint": "Groups/31",
+                             "full_replace": True,
+                             "body": {"Id": 31, "Name": "After"}}}, client)
+        self.assertFalse(stopped.exception.result.success)
         self.assertEqual(client.writes, [])
 
     def test_a_missing_endpoint_is_refused(self):
@@ -953,6 +960,54 @@ class TestPlanContract(WriteTestCase):
         self.assertEqual(len(problems), 1)
         self.assertIn("modification.group_role_id", problems[0])
         self.assertIn("modification.role", problems[0])
+
+
+class TestStepStopsThePlan(WriteTestCase):
+    """A failed step records what failed and ends the plan.
+
+    Thirty blocks in rock_build.py were the same four lines — try, except,
+    record, return — differing only in two strings. Every one of them ended the
+    handler, so ending the handler is the step's job, and a thirty-first block
+    cannot forget the return."""
+
+    def setUp(self):
+        os.environ["ROCK_ALLOW_WRITES"] = "1"
+
+    NEW_GROUP = {"operation": "create_group",
+                 "group": {"name": "Ushers", "group_type_id": 15,
+                           "settings": {"Nope": "x"}}}
+
+    def test_the_plan_reports_what_landed_before_the_step_that_failed(self):
+        client = FakeClient(fail_on={"Groups/AttributeValue/1001"})
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            result = rock_build.run_plan(self.NEW_GROUP, lambda: client, None)
+        self.assertFalse(result.success)
+        self.assertEqual([c["type"] for c in result.created], ["Group"])
+        self.assertEqual([f["type"] for f in result.failures], ["Settings"])
+        self.assertIn("1 of 2 entities created.", buffer.getvalue())
+
+    def test_nothing_is_sent_after_the_step_that_failed(self):
+        client = FakeClient(fail_on={"Groups/AttributeValue/1001"})
+        with redirect_stdout(io.StringIO()):
+            rock_build.run_plan(self.NEW_GROUP, lambda: client, None)
+        self.assertEqual([c["endpoint"] for c in client.writes],
+                         ["Groups", "Groups/AttributeValue/1001"])
+
+    def test_a_step_that_succeeds_records_nothing(self):
+        result = rock_build.BuildResult()
+        with rock_build.step(result, "Group", "Ushers"):
+            pass
+        self.assertTrue(result.success)
+
+    def test_a_nested_step_is_recorded_once(self):
+        """`step` catches Exception, so it has to let its own signal through."""
+        result = rock_build.BuildResult()
+        with self.assertRaises(rock_build.StepFailed):
+            with rock_build.step(result, "Outer", "outer"):
+                with rock_build.step(result, "Inner", "inner"):
+                    raise RuntimeError("Rock API HTTP 400")
+        self.assertEqual([f["type"] for f in result.failures], ["Inner"])
 
 
 class TestTheCatalogGate(WriteTestCase):

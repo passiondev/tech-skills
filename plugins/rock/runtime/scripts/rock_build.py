@@ -21,6 +21,7 @@ import json
 import os
 import sys
 import traceback
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote
@@ -350,24 +351,17 @@ def set_attribute_values(client, endpoint, entity_id, settings):
 
 
 def apply_settings(result, client, endpoint, entity_id, label, settings):
-    """set_attribute_values, with any failure recorded on the build result.
+    """set_attribute_values, as one step of the plan.
 
-    Returns False when a setting did not land. The caller must stop there: the
-    entity exists but is not configured, and reporting success anyway is the
-    failure mode this whole function exists to prevent.
-
-    Recording is all it does. The caller returns the result and `run_plan`
-    prints it, which is why the six `return result` statements that follow a
-    False from here no longer look like they forgot something.
+    A setting that did not land stops the plan, because the entity exists and
+    is not configured, and reporting success anyway is the failure mode this
+    function exists to prevent. It used to say so by returning False and
+    trusting seven callers to check -- and to remember that a False had already
+    been printed on their behalf.
     """
-    if not settings:
-        return True
-    try:
-        set_attribute_values(client, endpoint, entity_id, settings)
-        return True
-    except Exception as e:
-        result.fail("Settings", label, e)
-        return False
+    if settings:
+        with step(result, "Settings", label):
+            set_attribute_values(client, endpoint, entity_id, settings)
 
 
 class BuildResult:
@@ -415,6 +409,42 @@ class BuildResult:
         return not self.failures
 
 
+class StepFailed(Exception):
+    """One step of a plan failed, and the plan stops here.
+
+    It carries the result rather than the error: the failure is already
+    recorded, and what the boundary needs back is the list of everything that
+    did land before this.
+    """
+
+    def __init__(self, result):
+        super().__init__("a step of the plan failed")
+        self.result = result
+
+
+@contextmanager
+def step(result, kind, label):
+    """One thing done to Rock, recorded by name if it fails.
+
+    Thirty blocks in this file were the same four lines — try, except, record,
+    return — varying only in the two strings. The strings are the arguments
+    now, and stopping the plan is this function's job rather than a `return` the
+    thirty-first block can forget.
+
+    It catches `Exception` because that is what those blocks caught: a 400 from
+    Rock, a `KeyError` on a field Rock did not send back, a `ValueError` from an
+    identifier that was not a number. The step that failed is the useful thing
+    to name, not the class of the failure.
+    """
+    try:
+        yield
+    except StepFailed:
+        raise
+    except Exception as exc:
+        result.fail(kind, label, exc)
+        raise StepFailed(result) from exc
+
+
 def get_workflow_entity_type_id(client):
     """Get the EntityType ID for WorkflowType (needed for attributes)."""
     results = client.get("EntityTypes", params={
@@ -458,12 +488,9 @@ def create_workflow(plan, client, catalog):
     if category_id:
         wf_data["CategoryId"] = category_id
 
-    try:
+    with step(result, "WorkflowType", wf["name"]):
         wf_id = client.post("WorkflowTypes", wf_data)
         result.add("WorkflowType", wf["name"], wf_id)
-    except Exception as e:
-        result.fail("WorkflowType", wf["name"], e)
-        return result
 
     # 2. Create Attributes on the WorkflowType
     wf_entity_type_id = get_workflow_entity_type_id(client)
@@ -488,13 +515,10 @@ def create_workflow(plan, client, catalog):
             "IsGridColumn": attr_def.get("is_grid_column", False),
         }
 
-        try:
+        with step(result, "Attribute", attr_def["key"]):
             attr_id = client.post("Attributes", attr_data)
             attr_ids[attr_def["key"]] = attr_id
             result.add("Attribute", attr_def["key"], attr_id)
-        except Exception as e:
-            result.fail("Attribute", attr_def["key"], e)
-            return result
 
     # 3. Create Activities and Actions
     for act_order, act_def in enumerate(wf.get("activities", [])):
@@ -507,12 +531,9 @@ def create_workflow(plan, client, catalog):
             "IsActive": True,
         }
 
-        try:
+        with step(result, "ActivityType", act_def["name"]):
             act_id = client.post("WorkflowActivityTypes", act_data)
             result.add("ActivityType", act_def["name"], act_id)
-        except Exception as e:
-            result.fail("ActivityType", act_def["name"], e)
-            return result
 
         # Actions within this activity
         for action_order, action_def in enumerate(act_def.get("actions", [])):
@@ -531,16 +552,12 @@ def create_workflow(plan, client, catalog):
                 "IsActivityCompletedOnSuccess": action_def.get("complete_activity_on_success", False),
             }
 
-            try:
+            with step(result, "ActionType", action_def["name"]):
                 action_id = client.post("WorkflowActionTypes", action_data)
                 result.add("ActionType", action_def["name"], action_id)
-            except Exception as e:
-                result.fail("ActionType", action_def["name"], e)
-                return result
 
-            if not apply_settings(result, client, "WorkflowActionTypes", action_id,
-                                  action_def["name"], action_def.get("settings", {})):
-                return result
+            apply_settings(result, client, "WorkflowActionTypes", action_id,
+                           action_def["name"], action_def.get("settings", {}))
 
             # Create form if specified
             form_def = action_def.get("form")
@@ -552,12 +569,9 @@ def create_workflow(plan, client, catalog):
                     "AllowNotes": form_def.get("allow_notes", False),
                 }
 
-                try:
+                with step(result, "Form", f"form on {action_def['name']}"):
                     form_id = client.post("WorkflowActionForms", form_data)
                     result.add("Form", f"form on {action_def['name']}", form_id)
-                except Exception as e:
-                    result.fail("Form", f"form on {action_def['name']}", e)
-                    return result
 
                 # Form attributes (fields shown on the form)
                 for field_order, field_key in enumerate(form_def.get("attributes", [])):
@@ -576,12 +590,9 @@ def create_workflow(plan, client, catalog):
                         "HideLabel": False,
                     }
 
-                    try:
+                    with step(result, "FormAttribute", field_key):
                         fa_id = client.post("WorkflowActionFormAttributes", form_attr_data)
                         result.add("FormAttribute", field_key, fa_id)
-                    except Exception as e:
-                        result.fail("FormAttribute", field_key, e)
-                        return result
 
     return result
 
@@ -621,25 +632,19 @@ def create_page(plan, client, catalog):
     if parent_id:
         page_data["ParentPageId"] = parent_id
 
-    try:
+    with step(result, "Page", pg["name"]):
         page_id = client.post("Pages", page_data)
         result.add("Page", pg["name"], page_id)
-    except Exception as e:
-        result.fail("Page", pg["name"], e)
-        return result
 
     # 2. Create route
     route = pg.get("route")
     if route:
-        try:
+        with step(result, "PageRoute", route):
             route_id = client.post("PageRoutes", {
                 "PageId": page_id,
                 "Route": route.lstrip("/"),
             })
             result.add("PageRoute", route, route_id)
-        except Exception as e:
-            result.fail("PageRoute", route, e)
-            return result
 
     # 3. Create blocks
     for block_order, block_def in enumerate(pg.get("blocks", [])):
@@ -660,17 +665,13 @@ def create_page(plan, client, catalog):
             "IsSystem": False,
         }
 
-        try:
+        with step(result, "Block", block_def.get("name", f"block-{block_order}")):
             block_id = client.post("Blocks", block_data)
             result.add("Block", block_def.get("name", f"block-{block_order}"), block_id)
-        except Exception as e:
-            result.fail("Block", block_def.get("name", f"block-{block_order}"), e)
-            return result
 
-        if not apply_settings(result, client, "Blocks", block_id,
-                              block_def.get("name", f"block-{block_order}"),
-                              block_def.get("settings", {})):
-            return result
+        apply_settings(result, client, "Blocks", block_id,
+                       block_def.get("name", f"block-{block_order}"),
+                       block_def.get("settings", {}))
 
     return result
 
@@ -699,16 +700,12 @@ def add_workflow_action(plan, client, catalog):
         "IsActivityCompletedOnSuccess": action_def.get("complete_activity_on_success", False),
     }
 
-    try:
+    with step(result, "ActionType", action_def["name"]):
         action_id = client.post("WorkflowActionTypes", action_data)
         result.add("ActionType", action_def["name"], action_id)
-    except Exception as e:
-        result.fail("ActionType", action_def["name"], e)
-        return result
 
-    if not apply_settings(result, client, "WorkflowActionTypes", action_id,
-                          action_def["name"], action_def.get("settings", {})):
-        return result
+    apply_settings(result, client, "WorkflowActionTypes", action_id,
+                   action_def["name"], action_def.get("settings", {}))
 
     return result
 
@@ -740,17 +737,13 @@ def add_page_block(plan, client, catalog):
         "IsSystem": False,
     }
 
-    try:
+    with step(result, "Block", block_def.get("name", "new block")):
         block_id = client.post("Blocks", block_data)
         result.add("Block", block_def.get("name", "new block"), block_id)
-    except Exception as e:
-        result.fail("Block", block_def.get("name", "new block"), e)
-        return result
 
-    if not apply_settings(result, client, "Blocks", block_id,
-                          block_def.get("name", "new block"),
-                          block_def.get("settings", {})):
-        return result
+    apply_settings(result, client, "Blocks", block_id,
+                   block_def.get("name", "new block"),
+                   block_def.get("settings", {}))
 
     return result
 
@@ -779,11 +772,9 @@ def update_workflow(plan, client):
         else:
             data[rock_field(field_map, key, ("category",))] = value
 
-    try:
+    with step(result, "WorkflowType", str(wf_id)):
         client.patch(f"WorkflowTypes/{wf_id}", data)
         result.add("WorkflowType", f"updated {wf_id}", wf_id)
-    except Exception as e:
-        result.fail("WorkflowType", str(wf_id), e)
 
     return result
 
@@ -803,11 +794,9 @@ def update_activity(plan, client):
 
     data = {rock_field(field_map, k): v for k, v in updates.items()}
 
-    try:
+    with step(result, "ActivityType", str(act_id)):
         client.patch(f"WorkflowActivityTypes/{act_id}", data)
         result.add("ActivityType", f"updated {act_id}", act_id)
-    except Exception as e:
-        result.fail("ActivityType", str(act_id), e)
 
     return result
 
@@ -838,18 +827,14 @@ def update_action(plan, client, catalog):
             else:
                 data[rock_field(field_map, key, ("action_type",))] = value
 
-        try:
+        with step(result, "ActionType", str(action_id)):
             client.patch(f"WorkflowActionTypes/{action_id}", data)
             result.add("ActionType", f"updated {action_id}", action_id)
-        except Exception as e:
-            result.fail("ActionType", str(action_id), e)
-            return result
 
     settings = mod.get("settings", {})
     if settings:
-        if not apply_settings(result, client, "WorkflowActionTypes", action_id,
-                              str(action_id), settings):
-            return result
+        apply_settings(result, client, "WorkflowActionTypes", action_id,
+                       str(action_id), settings)
         result.add("Settings", f"updated on {action_id}", action_id)
 
     return result
@@ -860,11 +845,9 @@ def delete_action(plan, client):
     result = BuildResult()
     action_id = plan["modification"]["action_type_id"]
 
-    try:
+    with step(result, "ActionType", str(action_id)):
         client.delete(f"WorkflowActionTypes/{action_id}")
         result.add("ActionType", f"deleted {action_id}", action_id)
-    except Exception as e:
-        result.fail("ActionType", str(action_id), e)
 
     return result
 
@@ -880,18 +863,13 @@ def delete_activity(plan, client):
     })
 
     for action in (actions or []):
-        try:
+        with step(result, "ActionType", action.get("Name", str(action["Id"]))):
             client.delete(f"WorkflowActionTypes/{action['Id']}")
             result.add("ActionType", f"deleted {action['Name']}", action["Id"])
-        except Exception as e:
-            result.fail("ActionType", action.get("Name", str(action["Id"])), e)
-            return result
 
-    try:
+    with step(result, "ActivityType", str(act_id)):
         client.delete(f"WorkflowActivityTypes/{act_id}")
         result.add("ActivityType", f"deleted {act_id}", act_id)
-    except Exception as e:
-        result.fail("ActivityType", str(act_id), e)
 
     return result
 
@@ -902,12 +880,9 @@ def reorder_actions(plan, client):
     mod = plan["modification"]
 
     for i, action_id in enumerate(mod["action_order"]):
-        try:
+        with step(result, "ActionType", str(action_id)):
             client.patch(f"WorkflowActionTypes/{action_id}", {"Order": i})
             result.add("ActionType", f"reordered {action_id} -> {i}", action_id)
-        except Exception as e:
-            result.fail("ActionType", str(action_id), e)
-            return result
 
     return result
 
@@ -921,14 +896,12 @@ def move_action(plan, client):
 
     next_order = _next_order(client, "WorkflowActionTypes", f"ActivityTypeId eq {new_activity_id}")
 
-    try:
+    with step(result, "ActionType", str(action_id)):
         client.patch(f"WorkflowActionTypes/{action_id}", {
             "ActivityTypeId": new_activity_id,
             "Order": mod.get("order", next_order),
         })
         result.add("ActionType", f"moved {action_id} to activity {new_activity_id}", action_id)
-    except Exception as e:
-        result.fail("ActionType", str(action_id), e)
 
     return result
 
@@ -976,12 +949,9 @@ def create_checkin_area(plan, client):
     if area.get("description"):
         group_data["Description"] = area["description"]
 
-    try:
+    with step(result, "Group", area["name"]):
         group_id = client.post("Groups", group_data)
         result.add("Group", area["name"], group_id)
-    except Exception as e:
-        result.fail("Group", area["name"], e)
-        return result
 
     # Link locations
     for loc_ref in area.get("locations", []):
@@ -991,15 +961,12 @@ def create_checkin_area(plan, client):
             if loc_name:
                 loc_id = _named(client, "Locations", loc_name)
         if loc_id:
-            try:
+            with step(result, "GroupLocation", str(loc_id)):
                 gl_id = client.post("GroupLocations", {
                     "GroupId": group_id,
                     "LocationId": loc_id,
                 })
                 result.add("GroupLocation", f"location {loc_id}", gl_id)
-            except Exception as e:
-                result.fail("GroupLocation", str(loc_id), e)
-                return result
 
     # Link schedules via group's ScheduleId (single) or GroupSchedules
     schedules = area.get("schedules", [])
@@ -1014,12 +981,9 @@ def create_checkin_area(plan, client):
                     client, "Schedules",
                     f"substringof('{odata_str(sname)}', Name) eq true")
         if sched_id:
-            try:
+            with step(result, "Schedule", str(sched_id)):
                 client.patch(f"Groups/{group_id}", {"ScheduleId": sched_id})
                 result.add("Schedule", f"schedule {sched_id} on group", group_id)
-            except Exception as e:
-                result.fail("Schedule", str(sched_id), e)
-                return result
 
     return result
 
@@ -1082,16 +1046,12 @@ def create_group(plan, client):
         if grp.get(key) is not None:
             data[GROUP_FIELDS[key]] = grp[key]
 
-    try:
+    with step(result, "Group", grp["name"]):
         group_id = client.post("Groups", data)
         result.add("Group", grp["name"], group_id)
-    except Exception as e:
-        result.fail("Group", grp["name"], e)
-        return result
 
-    if not apply_settings(result, client, "Groups", group_id, grp["name"],
-                          grp.get("settings", {})):
-        return result
+    apply_settings(result, client, "Groups", group_id, grp["name"],
+                   grp.get("settings", {}))
 
     return result
 
@@ -1114,16 +1074,12 @@ def update_group(plan, client):
         result.fail("Group", str(group_id), "No fields to update")
         return result
 
-    try:
+    with step(result, "Group", str(group_id)):
         client.patch(f"Groups/{group_id}", data)
         result.add("Group", f"updated {group_id}", group_id)
-    except Exception as e:
-        result.fail("Group", str(group_id), e)
-        return result
 
-    if not apply_settings(result, client, "Groups", group_id, str(group_id),
-                          mod.get("settings", {})):
-        return result
+    apply_settings(result, client, "Groups", group_id, str(group_id),
+                   mod.get("settings", {}))
 
     return result
 
@@ -1181,11 +1137,9 @@ def add_group_member(plan, client):
     if mod.get("order") is not None:
         data["GroupOrder"] = mod["order"]
 
-    try:
+    with step(result, "GroupMember", label):
         member_id = client.post("GroupMembers", data)
         result.add("GroupMember", label, member_id)
-    except Exception as e:
-        result.fail("GroupMember", label, e)
 
     return result
 
@@ -1246,11 +1200,9 @@ def update_group_member(plan, client):
         result.fail("GroupMember", str(member_id), "No fields to update")
         return result
 
-    try:
+    with step(result, "GroupMember", str(member_id)):
         client.patch(f"GroupMembers/{member_id}", data)
         result.add("GroupMember", f"updated {member_id}", member_id)
-    except Exception as e:
-        result.fail("GroupMember", str(member_id), e)
 
     return result
 
@@ -1271,11 +1223,9 @@ def remove_group_member(plan, client):
     result = BuildResult()
     member_id = plan["modification"]["group_member_id"]
 
-    try:
+    with step(result, "GroupMember", str(member_id)):
         client.delete(f"GroupMembers/{member_id}")
         result.add("GroupMember", f"removed {member_id}", member_id)
-    except Exception as e:
-        result.fail("GroupMember", str(member_id), e)
 
     return result
 
@@ -1330,11 +1280,9 @@ def create_group_sync(plan, client):
         if mod.get(key) is not None:
             data[field] = mod[key]
 
-    try:
+    with step(result, "GroupSync", label):
         sync_id = client.post("GroupSyncs", data)
         result.add("GroupSync", label, sync_id)
-    except Exception as e:
-        result.fail("GroupSync", label, e)
 
     return result
 
@@ -1427,7 +1375,7 @@ def api_request(plan, client):
 
     print(f"  {method} /api/{endpoint}" + (f"  params={params}" if params else ""))
 
-    try:
+    with step(result, "Request", label):
         if method == "GET":
             print(json.dumps(client.get(endpoint, params=params), indent=2, default=str))
             result.add("Response", label, endpoint)
@@ -1447,8 +1395,6 @@ def api_request(plan, client):
         else:
             client.delete(endpoint)
             result.add("Response", label, endpoint)
-    except Exception as e:
-        result.fail("Request", label, e)
 
     return result
 
@@ -1588,6 +1534,8 @@ def _apply_plan(plan, connect, catalog):
         if operation in NEEDS_CATALOG:
             return handler(plan, client, catalog)
         return handler(plan, client)
+    except StepFailed as stopped:
+        return stopped.result
     except PlanError as exc:
         return refused("Plan", operation, str(exc))
     except KeyError as exc:
