@@ -18,6 +18,8 @@ Three things follow, and all three were reported:
 
 Rock's `PATCH` sets only the keys it is given, by reflection, and refuses `Id`. That is the verb these six sites always wanted: `update_workflow`, `update_activity`, `update_action`, `reorder_actions`, `move_action`, and the schedule step of `create_checkin_area`, plus `person-update` in `rock_query.py`. `client.put` stays on the client, with a docstring explaining what it does, because a genuine whole-entity replace is still a thing a caller may mean.
 
+> *`client.put` now takes `full_replace` as a keyword argument with no default, so a call site that means a whole-entity replace says so in the call. The check is the backstop rather than the guard. The signature refuses a partial `PUT` at runtime, and `rock-write-shapes` catches a new call site before anyone runs it.*
+
 ## The attribute-value writes never worked
 
 `set_attribute_values` posted a JSON body to `{Entity}/Attributes/{id}` and then to `{Entity}/{id}/AttributeValues`. Neither route exists. Both 404s were caught, printed as `Warning: could not set X`, and the entity counted as created. `block-set` in `rock_query.py` had the same shape.

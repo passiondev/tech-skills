@@ -136,7 +136,7 @@ GitHub issues, mostly. [`docs/vendored.json`](docs/vendored.json) records where
 every skill came from and whether we have diverged from it. Read it before
 "fixing" something that looks odd upstream-shaped.
 
-Twenty-three decisions and their reasoning are in [`docs/adr/`](docs/adr/). Start
+Twenty-four decisions and their reasoning are in [`docs/adr/`](docs/adr/). Start
 with [0001](docs/adr/0001-public-marketplace-repo.md) (why public) and
 [0002](docs/adr/0002-capability-plugins-and-department-bundles.md) (why two
 layers). [`CONTEXT.md`](CONTEXT.md) defines the vocabulary this repo uses
