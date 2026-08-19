@@ -19,13 +19,15 @@ jobs:
       - name: Manifests, skills, secrets, runtime invariants
         run: python3 .github/scripts/check.py
 
-      # The Rock write paths are the one place in this repo where a plausible
+      # The Rock runtime is the one place in this repo where a plausible
       # request and a correct one look identical in review: Rock's PUT replaces
-      # the whole entity, and its attribute-value route binds from the query
-      # string. These tests assert the method and the URL of every write, with
-      # a recording fake in place of the client — no Rock, no network, stdlib
-      # only. See ADR 0022.
-      - name: Every Rock write still sends the request Rock accepts
+      # the whole entity, its attribute-value route binds from the query string,
+      # and a capped read prints its cap as a total. These tests assert the
+      # method and the URL of every write and the count of every read, with a
+      # recording fake in place of the client — no Rock, no network, stdlib
+      # only. They also run the checks above against source built to fail them,
+      # because a green check does not prove the check still bites. See ADR 0022.
+      - name: Every Rock request, and every check that guards one
         run: python3 -m unittest discover -s tests -v
 
       - name: The onboarding settings block must be valid JSON

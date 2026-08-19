@@ -528,6 +528,21 @@ def _write_guard():
         fail("rock_query.py", f"WRITE_COMMANDS lists subcommands that no longer exist: {sorted(stale)}")
 
 
+def _by_function(tree):
+    """Every node in the tree, tagged with the function it sits inside.
+
+    `ast.walk` is breadth-first, so an outer function is visited before the
+    functions nested in it and the inner name overwrites the outer one. A node
+    at module level is not in the mapping at all.
+    """
+    owner = {}
+    for fn in ast.walk(tree):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for node in ast.walk(fn):
+                owner[id(node)] = fn.name
+    return owner
+
+
 def _string_literals(src, skip_docstrings=False):
     """Every string constant in the source, docstrings optionally left out.
 
@@ -604,6 +619,96 @@ def _rock_write_shapes():
                      "there is no {Entity}/{id}/AttributeValues route — attribute "
                      "values go to POST {Entity}/AttributeValue/{id} with "
                      "attributeKey and attributeValue as query parameters")
+
+
+def _bare_table_read(node):
+    """The table name, if this call fetches a whole Rock table by name.
+
+    `client.get("Groups", ...)` asks for every group. `client.get(f"Groups/{id}")`
+    asks for one and is fine, and so is `row.get("Description")` — a dict lookup
+    that happens to share the method name. Two tests separate them, either of
+    which is enough: the receiver is the client this file always calls `client`,
+    or the call passes OData `params` alongside a table-shaped name. The second
+    is what catches a fetch written against a differently-named client.
+    """
+    if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get" and node.args):
+        return None
+    endpoint = node.args[0]
+    if not (isinstance(endpoint, ast.Constant) and isinstance(endpoint.value, str)):
+        return None
+    if "/" in endpoint.value or not re.fullmatch(r"[A-Z][A-Za-z]+", endpoint.value):
+        return None
+    receiver = node.func.value
+    is_client = isinstance(receiver, ast.Name) and receiver.id == "client"
+    has_odata = any(kw.arg == "params" for kw in node.keywords)
+    return endpoint.value if (is_client or has_odata) else None
+
+
+@check("rock-query-caps")
+def _rock_query_caps():
+    """A collection the read side shows is fetched through one of three functions.
+
+    `rock_query.py` answers questions about a Rock instance with tens of
+    thousands of people in it. A fetch written by hand there has two ways to
+    mislead, and both shipped: a `$top` of its own, which returns the first N
+    and prints N as though it were the total, and no bound at all, which asks
+    an instance-sized table for every row.
+
+    So the file has three ways to fetch a collection and no fourth:
+    `get_capped` for anything a person will see, which reads one row past the
+    limit and reports whether it found one; `groups_of_types` for the same thing
+    chunked past Rock's filter-size ceiling; and `first` for a probe that wants
+    one row and does not care what else matched.
+
+    Two shapes fail here. A `$top` outside those three is a fourth cap, and a
+    `client.get` on a bare table name outside those three is an unbounded read
+    of that table — `client.get("Groups", ...)` rather than
+    `client.get(f"Groups/{id}")`. What this does not catch is a named action
+    route that happens to return a list, such as `Groups/GetFamilies/{id}`;
+    those are bounded by the entity they hang off, and a check that guessed at
+    which ones were not would fail on the wrong thing.
+
+    The write side is deliberately out of scope. `rock_build.py` uses `$top: 1`
+    to turn a name into an id and never prints a count, and `rock_catalog.py`
+    pages with `$top` and `$skip` precisely so it can fetch every row. Neither
+    can mislead anyone about how much it found.
+    """
+    rel = "plugins/rock/runtime/scripts/rock_query.py"
+    path = ROOT / rel
+    fetchers = {"get_capped", "groups_of_types", "first"}
+
+    if not path.exists():
+        fail(rel, "is missing — this check guards it by path, so a move has to "
+                  "update the path here as well")
+        return
+
+    tree = ast.parse(path.read_text())
+    defined = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    for missing in sorted(fetchers - defined):
+        fail(rel, f"{missing}() is gone. It is one of the three fetchers this "
+                  f"check allows, so removing it silently stops the guard from "
+                  f"guarding — remove it from the allow-list here too")
+
+    owner = _by_function(tree)
+    for node in ast.walk(tree):
+        inside = owner.get(id(node))
+        if inside in fetchers:
+            continue
+
+        if isinstance(node, ast.Constant) and node.value == "$top":
+            fail(f"{rel}:{node.lineno}",
+                 f"{inside or '<module>'}() sets its own $top. That returns the "
+                 f"first N and says nothing about the rest — fetch through "
+                 f"get_capped, which reports whether more matched, or first, "
+                 f"which asks for one row on purpose")
+
+        table = _bare_table_read(node)
+        if table:
+            fail(f"{rel}:{node.lineno}",
+                 f"{inside or '<module>'}() reads the whole {table} table with "
+                 f"no bound. Fetch through get_capped, which reports whether "
+                 f"more matched, or first, which asks for one row on purpose")
 
 
 @check("no-repo-writes")

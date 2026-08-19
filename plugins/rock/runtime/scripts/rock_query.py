@@ -30,6 +30,13 @@ FAMILY_GROUP_TYPE_ID = 10
 KNOWN_RELATIONSHIPS_GROUP_TYPE_ID = 11
 SEARCH_LIMIT = 10
 CHOOSER_LIMIT = 5
+# A child collection nobody passes a --limit for: blocks on a page, actions in
+# an activity, fields in a report, sub-areas under a check-in group. It sits far
+# above any real value, so it is a backstop against an unbounded response rather
+# than a number anyone tunes -- and when it does bite, `tally` says so instead
+# of printing the cap as the total.
+CHILD_LIMIT = 200
+CHILD_HINT = "this view has no --limit"
 # `search` has no --limit to raise, so its cap needs different advice.
 WIDEN = "narrow the term or list that entity directly"
 
@@ -78,6 +85,22 @@ def get_capped(client, endpoint, params, limit):
     """
     rows = client.get(endpoint, params={**params, "$top": limit + 1}) or []
     return rows[:limit], len(rows) > limit
+
+
+def first(client, endpoint, params):
+    """The one row a probe wants, or None.
+
+    A probe asks "is there one, and what is its id" -- a route that resolves to
+    a page, an alias for a person, an exact name match ahead of a fuzzy one. It
+    is the one collection fetch that does not report a `more`, because more is
+    not something the caller can act on: it asked for one.
+
+    So there are three ways to fetch a collection in this file and no fourth.
+    `get_capped` for anything shown, `groups_of_types` for the chunked variant,
+    and this. CI fails on a `$top` written anywhere else.
+    """
+    rows = client.get(endpoint, params={**params, "$top": 1}) or []
+    return rows[0] if rows else None
 
 
 def tally(rows, more, hint="raise --limit"):
@@ -129,11 +152,11 @@ def _find_entity(client, endpoint, identifier, name_field="Name", label=None):
             return result
     except (ValueError, RockNotFound):
         pass
-    results = client.get(endpoint, params={
-        "$filter": f"{name_field} eq '{odata_str(identifier)}'", "$top": 1,
+    exact = first(client, endpoint, {
+        "$filter": f"{name_field} eq '{odata_str(identifier)}'",
     })
-    if results:
-        return results[0]
+    if exact:
+        return exact
     results, more = get_capped(client, endpoint, {
         "$filter": f"substringof('{odata_str(identifier)}', {name_field}) eq true",
     }, CHOOSER_LIMIT)
@@ -204,20 +227,22 @@ def _find_workflow(identifier, client):
 def _load_workflow_tree(wf, client):
     """Load full workflow tree: activities, actions, and entity type names."""
     wf_id = wf["Id"]
-    activities = client.get("WorkflowActivityTypes", params={
+    activities, activities_capped = get_capped(client, "WorkflowActivityTypes", {
         "$filter": f"WorkflowTypeId eq {wf_id}",
         "$orderby": "Order",
-    }) or []
+    }, CHILD_LIMIT)
     all_actions = []
     for act in activities:
-        actions = client.get("WorkflowActionTypes", params={
+        actions, actions_capped = get_capped(client, "WorkflowActionTypes", {
             "$filter": f"ActivityTypeId eq {act['Id']}",
             "$orderby": "Order",
-        }) or []
+        }, CHILD_LIMIT)
         act["ActionTypes"] = actions
+        act["ActionTypesCapped"] = actions_capped
         all_actions.extend(actions)
     _enrich_actions_entity_types(all_actions, client)
     wf["ActivityTypes"] = activities
+    wf["ActivityTypesCapped"] = activities_capped
     return wf
 
 
@@ -312,14 +337,11 @@ def cmd_page(args, client):
 
     # Try as route
     if not page:
-        routes = client.get("PageRoutes", params={
+        route = first(client, "PageRoutes", {
             "$filter": f"Route eq '{odata_str(identifier.lstrip('/'))}'",
-            "$top": 1,
         })
-        if routes:
-            page_id = routes[0].get("PageId")
-            if page_id:
-                page = client.get(f"Pages/{page_id}")
+        if route and route.get("PageId"):
+            page = client.get(f"Pages/{route['PageId']}")
 
     # Search by name
     if not page:
@@ -343,10 +365,10 @@ def cmd_page(args, client):
         return
 
     # Get blocks on this page
-    blocks = client.get("Blocks", params={
+    blocks, blocks_capped = get_capped(client, "Blocks", {
         "$filter": f"PageId eq {page['Id']}",
         "$orderby": "Zone,Order",
-    })
+    }, CHILD_LIMIT)
     if blocks:
         bt_ids = {b.get("BlockTypeId") for b in blocks if b.get("BlockTypeId")}
         bt_names = {btid: _resolve_name(client, "BlockTypes", btid) for btid in bt_ids}
@@ -354,10 +376,10 @@ def cmd_page(args, client):
             b["BlockType"] = {"Name": bt_names.get(b.get("BlockTypeId"), "unknown")}
 
     # Get routes
-    routes = client.get("PageRoutes", params={
+    routes, routes_capped = get_capped(client, "PageRoutes", {
         "$filter": f"PageId eq {page['Id']}",
         "$select": "Route",
-    })
+    }, CHILD_LIMIT)
 
     if args.json:
         page["Blocks"] = blocks or []
@@ -367,10 +389,11 @@ def cmd_page(args, client):
         name = page.get("InternalName") or page.get("PageTitle") or "(untitled)"
         print(f"{name} (ID: {page['Id']})")
         if routes:
-            print(f"  Routes: {', '.join('/' + r['Route'] for r in routes)}")
+            shown = ", ".join("/" + r["Route"] for r in routes)
+            print(f"  Routes: {shown}" + (", ..." if routes_capped else ""))
         print(f"  Layout ID: {page.get('LayoutId')}")
         if blocks:
-            print(f"  Blocks ({len(blocks)}):")
+            print(f"  Blocks ({tally(blocks, blocks_capped, hint=CHILD_HINT)}):")
             current_zone = None
             for b in blocks:
                 zone = b.get("Zone", "Main")
@@ -461,12 +484,15 @@ def _print_audit(wf, issues, warnings):
     activities = sorted(wf.get("ActivityTypes", []), key=lambda a: a.get("Order", 0))
     if activities:
         print("Structure:")
+        if wf.get("ActivityTypesCapped"):
+            print(f"  (only the first {CHILD_LIMIT} activities are shown)")
         for i, act in enumerate(activities):
             is_last = i == len(activities) - 1
             prefix = "  └─" if is_last else "  ├─"
             activated = " (activated)" if act.get("IsActivatedWithWorkflow") else ""
             actions = sorted(act.get("ActionTypes", []), key=lambda a: a.get("Order", 0))
-            print(f"{prefix} {act['Name']}{activated} [{len(actions)} actions]")
+            count = tally(actions, act.get("ActionTypesCapped"), hint=CHILD_HINT)
+            print(f"{prefix} {act['Name']}{activated} [{count} actions]")
             for j, action in enumerate(actions):
                 is_last_action = j == len(actions) - 1
                 branch = "     " if is_last else "  │  "
@@ -586,14 +612,14 @@ def cmd_actions(args, client):
         print(f"Activity {act_id} not found")
         return
 
-    actions = client.get("WorkflowActionTypes", params={
+    actions, actions_capped = get_capped(client, "WorkflowActionTypes", {
         "$filter": f"ActivityTypeId eq {act_id}",
         "$orderby": "Order",
-    }) or []
+    }, CHILD_LIMIT)
     _enrich_actions_entity_types(actions, client)
     print(f"Activity: {act['Name']} (ID: {act['Id']})")
     print(f"  Activated with workflow: {act.get('IsActivatedWithWorkflow', False)}")
-    print(f"  Actions: {len(actions)}")
+    print(f"  Actions: {tally(actions, actions_capped, hint=CHILD_HINT)}")
     print()
 
     for action in actions:
@@ -618,10 +644,10 @@ def cmd_attributes(args, client):
     if not wf:
         return
 
-    attrs = client.get("Attributes", params={
+    attrs, attrs_capped = get_capped(client, "Attributes", {
         "$filter": f"EntityTypeQualifierColumn eq 'WorkflowTypeId' and EntityTypeQualifierValue eq '{wf['Id']}'",
         "$orderby": "Order",
-    })
+    }, CHILD_LIMIT)
 
     if not attrs:
         print(f"No attributes on '{wf['Name']}' (ID: {wf['Id']})")
@@ -631,7 +657,8 @@ def cmd_attributes(args, client):
     ft_ids = {a.get("FieldTypeId") for a in attrs if a.get("FieldTypeId")}
     ft_names = {fid: _resolve_name(client, "FieldTypes", fid) for fid in ft_ids}
 
-    print(f"Attributes on '{wf['Name']}' (ID: {wf['Id']}):\n")
+    print(f"Attributes on '{wf['Name']}' "
+          f"(ID: {wf['Id']}, {tally(attrs, attrs_capped, hint=CHILD_HINT)}):\n")
     for attr in attrs:
         ft = ft_names.get(attr.get("FieldTypeId"), "?")
         req = " [required]" if attr.get("IsRequired") else ""
@@ -686,10 +713,12 @@ def _load_filter_tree(client, filter_id, depth=0):
         dv_note = f" (references DataView:{related_dv})" if related_dv else ""
         lines.append(f"{prefix}Filter [{entity_name}]: {sel_short}{dv_note}")
 
-    children = client.get("DataViewFilters", params={
+    children, children_capped = get_capped(client, "DataViewFilters", {
         "$filter": f"ParentId eq {filter_id}",
         "$select": "Id",
-    }) or []
+    }, CHILD_LIMIT)
+    if children_capped:
+        lines.append(f"{prefix}(only the first {CHILD_LIMIT} child filters are shown)")
     for child in children:
         child_lines = _load_filter_tree(client, child["Id"], depth + 1)
         if child_lines:
@@ -753,22 +782,19 @@ def cmd_person(args, client):
 
     # Search by email
     if "@" in identifier:
-        results = client.get("People", params={
+        results, more = get_capped(client, "People", {
             "$filter": f"Email eq '{odata_str(identifier)}'",
-            "$top": 5,
-        })
+        }, CHOOSER_LIMIT)
     else:
         parts = identifier.strip().split()
         if len(parts) >= 2:
-            results = client.get("People", params={
+            results, more = get_capped(client, "People", {
                 "$filter": f"FirstName eq '{odata_str(parts[0])}' and LastName eq '{odata_str(parts[-1])}'",
-                "$top": 10,
-            })
+            }, SEARCH_LIMIT)
         else:
-            results = client.get("People", params={
+            results, more = get_capped(client, "People", {
                 "$filter": f"LastName eq '{odata_str(parts[0])}'",
-                "$top": 10,
-            })
+            }, SEARCH_LIMIT)
 
     if not results:
         print(f"No person found matching '{identifier}'")
@@ -789,6 +815,8 @@ def cmd_person(args, client):
                 if campus_cache[cid] != "?":
                     campus = f" [{campus_cache[cid]}]"
             print(f"  {p['Id']:6d}  {p.get('FirstName', '')} {p.get('LastName', '')}{email}{campus}")
+        if more:
+            print(more_note(identifier))
 
 
 def _print_person(person, client):
@@ -818,18 +846,19 @@ def _print_person(person, client):
         families = client.get(f"Groups/GetFamilies/{person['Id']}")
         if families:
             for fam in families:
-                members = client.get("GroupMembers", params={
+                members, members_capped = get_capped(client, "GroupMembers", {
                     "$filter": f"GroupId eq {fam['Id']}",
                     "$select": "PersonId,GroupRoleId",
-                })
+                }, CHILD_LIMIT)
                 roles = {}
-                for m in (members or []):
+                for m in members:
                     rid = m["GroupRoleId"]
                     if rid not in role_cache:
                         role_cache[rid] = _resolve_name(client, "GroupTypeRoles", rid)
                     roles[m["PersonId"]] = role_cache[rid]
-                print(f"  Family: {fam['Name']} (ID: {fam['Id']})")
-                for m in (members or []):
+                capped = f" (first {CHILD_LIMIT})" if members_capped else ""
+                print(f"  Family: {fam['Name']} (ID: {fam['Id']}){capped}")
+                for m in members:
                     if m["PersonId"] == person["Id"]:
                         continue
                     try:
@@ -843,18 +872,18 @@ def _print_person(person, client):
 
     # Known relationships
     try:
-        rel_groups = client.get("Groups", params={
+        rel_group = first(client, "Groups", {
             "$filter": f"GroupTypeId eq {KNOWN_RELATIONSHIPS_GROUP_TYPE_ID} and Members/any(m: m/PersonId eq {person['Id']})",
             "$select": "Id",
-            "$top": 1,
         })
-        if rel_groups:
-            members = client.get("GroupMembers", params={
-                "$filter": f"GroupId eq {rel_groups[0]['Id']} and PersonId ne {person['Id']}",
+        if rel_group:
+            members, members_capped = get_capped(client, "GroupMembers", {
+                "$filter": f"GroupId eq {rel_group['Id']} and PersonId ne {person['Id']}",
                 "$select": "PersonId,GroupRoleId",
-            })
+            }, CHILD_LIMIT)
             if members:
-                print(f"  Known Relationships:")
+                capped = f" (first {CHILD_LIMIT})" if members_capped else ""
+                print(f"  Known Relationships:{capped}")
                 for m in members:
                     try:
                         p = client.get(f"People/{m['PersonId']}", params={"$select": "FirstName,LastName"})
@@ -946,26 +975,23 @@ def cmd_report(args, client):
             print(f"  Category: {cat_name}")
 
     # Report fields
-    fields = client.get("ReportFields", params={
+    fields, fields_capped = get_capped(client, "ReportFields", {
         "$filter": f"ReportId eq {report['Id']}",
         "$select": "ReportFieldType,ShowInGrid,ColumnOrder,ColumnHeaderText,DataSelectComponentEntityTypeId",
-    }) or []
+    }, CHILD_LIMIT)
     if fields:
-        print(f"  Fields ({len(fields)}):")
+        print(f"  Fields ({tally(fields, fields_capped, hint=CHILD_HINT)}):")
         for f in sorted(fields, key=lambda x: x.get("ColumnOrder", 0)):
             header = f.get("ColumnHeaderText", "") or "(no header)"
             print(f"    {f.get('ColumnOrder', '?'):3}  {header}")
 
 
 def cmd_exceptions(args, client):
-    params = {
-        "$orderby": "CreatedDateTime desc",
-        "$top": args.limit,
-    }
+    params = {"$orderby": "CreatedDateTime desc"}
     if args.type:
         params["$filter"] = f"substringof('{odata_str(args.type)}', ExceptionType) eq true"
 
-    exceptions = client.get("ExceptionLogs", params=params)
+    exceptions, more = get_capped(client, "ExceptionLogs", params, args.limit)
     if not exceptions:
         print("No exceptions found.")
         return
@@ -977,12 +1003,15 @@ def cmd_exceptions(args, client):
             et = ex.get("ExceptionType", "Unknown")
             short = et.split(".")[-1] if "." in et else et
             counts[short] = counts.get(short, 0) + 1
-        print(f"Exception summary (last {args.limit}):\n")
+        # The counts below are over the rows fetched, not over the log. Saying
+        # "last 50" made that sound deliberate; it was the cap.
+        window = f"{len(exceptions)} most recent" + (" of more" if more else "")
+        print(f"Exception summary ({window}):\n")
         for etype, count in sorted(counts.items(), key=lambda x: -x[1]):
             print(f"  {count:4d}  {etype}")
         return
 
-    print(f"Exceptions (last {len(exceptions)}):\n")
+    print(f"Exceptions ({tally(exceptions, more)}):\n")
     for ex in exceptions:
         dt = (ex.get("CreatedDateTime") or "")[:19]
         etype = ex.get("ExceptionType", "Unknown")
@@ -1027,14 +1056,13 @@ def cmd_exception(args, client):
         for line in ex["StackTrace"].split("\n")[:15]:
             print(f"    {line.strip()}")
     if ex.get("HasInnerException") and ex.get("Id"):
-        children = client.get("ExceptionLogs", params={
+        inner = first(client, "ExceptionLogs", {
             "$filter": f"ParentId eq {ex['Id']}",
-            "$top": 1,
         })
-        if children:
-            print(f"  Inner Exception: {children[0].get('ExceptionType', '?')}")
-            if children[0].get("Description"):
-                print(f"    {children[0]['Description'][:200]}")
+        if inner:
+            print(f"  Inner Exception: {inner.get('ExceptionType', '?')}")
+            if inner.get("Description"):
+                print(f"    {inner['Description'][:200]}")
 
 
 def cmd_schedules(args, client):
@@ -1247,29 +1275,29 @@ def cmd_bgc(args, client):
         # Find person first
         try:
             pid = int(args.person)
-            alias = client.get("PersonAlias", params={
-                "$filter": f"PersonId eq {pid}", "$top": 1, "$select": "Id",
+            alias = first(client, "PersonAlias", {
+                "$filter": f"PersonId eq {pid}", "$select": "Id",
             })
             if alias:
-                filters.append(f"PersonAliasId eq {alias[0]['Id']}")
+                filters.append(f"PersonAliasId eq {alias['Id']}")
         except (ValueError, RockNotFound):
             parts = args.person.strip().split()
             if len(parts) >= 2:
-                people = client.get("People", params={
+                person = first(client, "People", {
                     "$filter": f"FirstName eq '{odata_str(parts[0])}' and LastName eq '{odata_str(parts[-1])}'",
-                    "$select": "Id", "$top": 1,
+                    "$select": "Id",
                 })
             else:
-                people = client.get("People", params={
+                person = first(client, "People", {
                     "$filter": f"LastName eq '{odata_str(parts[0])}'",
-                    "$select": "Id", "$top": 1,
+                    "$select": "Id",
                 })
-            if people:
-                alias = client.get("PersonAlias", params={
-                    "$filter": f"PersonId eq {people[0]['Id']}", "$top": 1, "$select": "Id",
+            if person:
+                alias = first(client, "PersonAlias", {
+                    "$filter": f"PersonId eq {person['Id']}", "$select": "Id",
                 })
                 if alias:
-                    filters.append(f"PersonAliasId eq {alias[0]['Id']}")
+                    filters.append(f"PersonAliasId eq {alias['Id']}")
     if filters:
         params["$filter"] = " and ".join(filters)
 
@@ -1295,16 +1323,16 @@ def cmd_bgc(args, client):
 
 
 def cmd_checkin(args, client):
-    # Check-in areas are GroupTypes with a specific purpose
-    # GroupType 15 = Check-in in most Rock instances
-    # No $top: a production instance matched half again as many types as the
-    # 20 that used to be asked for, and what got dropped were whole check-in
-    # areas no subcommand could then see. The filter already bounds this.
-    checkin_group_types = client.get("GroupTypes", params={
+    # Check-in areas are GroupTypes with a specific purpose.
+    # A production instance matched half again as many types as the 20 that used
+    # to be asked for, and what got dropped were whole check-in areas no
+    # subcommand could then see. CHILD_LIMIT sits far past that number, and the
+    # line below says so if it ever binds.
+    checkin_group_types, types_capped = get_capped(client, "GroupTypes", {
         "$filter": "substringof('Check', Name) eq true",
         "$select": "Id,Name",
         "$orderby": "Name",
-    })
+    }, CHILD_LIMIT)
 
     if args.area:
         # Show specific check-in area (group) with locations and schedules
@@ -1347,12 +1375,12 @@ def cmd_checkin(args, client):
         print(f"  Active: {group.get('IsActive', False)}")
 
         # Locations
-        group_locs = client.get("GroupLocations", params={
+        group_locs, locs_capped = get_capped(client, "GroupLocations", {
             "$filter": f"GroupId eq {group['Id']}",
             "$select": "LocationId",
-        }) or []
+        }, CHILD_LIMIT)
         if group_locs:
-            print(f"  Locations ({len(group_locs)}):")
+            print(f"  Locations ({tally(group_locs, locs_capped, hint=CHILD_HINT)}):")
             for gl in group_locs:
                 loc_name = _resolve_name(client, "Locations", gl["LocationId"])
                 if loc_name != "?":
@@ -1361,13 +1389,13 @@ def cmd_checkin(args, client):
                     print(f"    Location ID: {gl['LocationId']}")
 
         # Child groups (sub-areas)
-        children = client.get("Groups", params={
+        children, children_capped = get_capped(client, "Groups", {
             "$filter": f"ParentGroupId eq {group['Id']}",
             "$select": "Id,Name,IsActive",
             "$orderby": "Order",
-        }) or []
+        }, CHILD_LIMIT)
         if children:
-            print(f"  Sub-areas ({len(children)}):")
+            print(f"  Sub-areas ({tally(children, children_capped, hint=CHILD_HINT)}):")
             for child in children:
                 active = "" if child.get("IsActive") else " [inactive]"
                 print(f"    {child['Id']:6d}  {child['Name']}{active}")
@@ -1379,25 +1407,29 @@ def cmd_checkin(args, client):
         return
 
     print("Check-in Configuration:\n")
+    if types_capped:
+        print(f"  (only the first {CHILD_LIMIT} check-in group types are shown)\n")
     for gt in checkin_group_types:
         print(f"  Group Type: {gt['Name']} (ID: {gt['Id']})")
         # Top-level groups of this type
-        top_groups = client.get("Groups", params={
+        top_groups, top_capped = get_capped(client, "Groups", {
             "$filter": f"GroupTypeId eq {gt['Id']} and ParentGroupId eq null",
             "$select": "Id,Name,IsActive",
             "$orderby": "Order",
-            "$top": 20,
-        }) or []
+        }, CHILD_LIMIT)
+        if top_capped:
+            print(f"    (only the first {CHILD_LIMIT} are shown)")
         for g in top_groups:
             active = "" if g.get("IsActive") else " [inactive]"
             print(f"    {g['Id']:6d}  {g['Name']}{active}")
             # First level children
-            children = client.get("Groups", params={
+            children, children_capped = get_capped(client, "Groups", {
                 "$filter": f"ParentGroupId eq {g['Id']}",
                 "$select": "Id,Name,IsActive",
                 "$orderby": "Order",
-                "$top": 20,
-            }) or []
+            }, CHILD_LIMIT)
+            if children_capped:
+                print(f"      (only the first {CHILD_LIMIT} are shown)")
             for child in children:
                 ca = "" if child.get("IsActive") else " [inactive]"
                 print(f"      {child['Id']:6d}  {child['Name']}{ca}")
@@ -1602,7 +1634,7 @@ def cmd_person_update(args, client):
 
 
 def cmd_exception_clear(args, client):
-    params = {"$select": "Id", "$top": args.limit, "$orderby": "CreatedDateTime asc"}
+    params = {"$select": "Id", "$orderby": "CreatedDateTime asc"}
     filters = []
     if args.before:
         filters.append(f"CreatedDateTime lt datetime'{args.before}T00:00:00'")
@@ -1611,12 +1643,15 @@ def cmd_exception_clear(args, client):
     if filters:
         params["$filter"] = " and ".join(filters)
 
-    exceptions = client.get("ExceptionLogs", params=params)
+    exceptions, more = get_capped(client, "ExceptionLogs", params, args.limit)
     if not exceptions:
         print("No exceptions matching criteria.")
         return
 
-    print(f"Deleting {len(exceptions)} exception logs...")
+    # `--limit` bounds one run. Without this line a caller reads "Deleting 500"
+    # and a clean log; what they have is 500 fewer and no idea how many are left.
+    print(f"Deleting {len(exceptions)} exception logs..."
+          + (f" More than {args.limit} match, so run this again." if more else ""))
     deleted = 0
     errors = 0
     for ex in exceptions:
