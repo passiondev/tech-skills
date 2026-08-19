@@ -487,5 +487,119 @@ class TestWhoOwnsAFile(CheckTestCase):
         self.assertEqual(self.owner("dev/skills"), ("dev", None))
 
 
+SETTINGS = {"extraKnownMarketplaces": {"passion-tech": {
+    "source": {"source": "github", "repo": "passiondev/tech-skills"},
+    "autoUpdate": True}}}
+
+
+class TestTheOnboardingBlockPeoplePasteFrom(CheckTestCase):
+    """onboarding — the settings a reader copies into their own settings.json.
+
+    Nobody types this from memory, so a wrong block is a wrong install for
+    everyone who reads the file next. This check ran as inline Python in the
+    workflow, where nobody could run it locally and it stopped at the first
+    thing it found.
+    """
+
+    def onboarding(self, block, before="Paste this:\n\n"):
+        text = f"# Onboarding\n\n{before}```json\n{block}\n```\n"
+        return self.run_check(checks._onboarding, {"ONBOARDING.md": text})
+
+    def test_the_block_we_ship_passes(self):
+        self.assertEqual(self.onboarding(json.dumps(SETTINGS, indent=2)), [])
+
+    def test_a_document_with_no_block_is_a_document_nobody_can_follow(self):
+        found = self.run_check(checks._onboarding,
+                               {"ONBOARDING.md": "# Onboarding\n\nGood luck.\n"})
+        self.assertEqual(len(found), 1)
+        self.assertIn("no JSON block", found[0])
+
+    def test_a_block_that_does_not_parse_is_reported_with_the_reason(self):
+        found = self.onboarding('{"extraKnownMarketplaces": }')
+        self.assertEqual(len(found), 1)
+        self.assertIn("not valid JSON", found[0])
+
+    def test_a_hand_written_enabledPlugins_is_the_bug_adr_0012_measured(self):
+        broken = {**SETTINGS, "enabledPlugins": {"ops@passion-tech": True}}
+        found = self.onboarding(json.dumps(broken))
+        self.assertEqual(len(found), 1)
+        self.assertIn("enabledPlugins", found[0])
+
+    def test_autoupdate_off_is_a_fix_that_reaches_nobody(self):
+        settings = json.loads(json.dumps(SETTINGS))
+        settings["extraKnownMarketplaces"]["passion-tech"]["autoUpdate"] = False
+        found = self.onboarding(json.dumps(settings))
+        self.assertEqual(len(found), 1)
+        self.assertIn("autoUpdate", found[0])
+
+    def test_a_missing_marketplace_entry_leaves_the_install_nothing_to_read(self):
+        found = self.onboarding(json.dumps({"extraKnownMarketplaces": {}}))
+        self.assertEqual(len(found), 1)
+        self.assertIn("passion-tech", found[0])
+
+    def test_the_wrong_repo_is_named_in_the_complaint(self):
+        settings = json.loads(json.dumps(SETTINGS))
+        settings["extraKnownMarketplaces"]["passion-tech"]["source"]["repo"] = "someone/else"
+        found = self.onboarding(json.dumps(settings))
+        self.assertEqual(len(found), 1)
+        self.assertIn("someone/else", found[0])
+
+    def test_every_block_in_the_document_is_parsed_not_only_the_first(self):
+        text = ("# Onboarding\n\n```json\n" + json.dumps(SETTINGS)
+                + "\n```\n\nand then\n\n```json\n{oops}\n```\n")
+        found = self.run_check(checks._onboarding, {"ONBOARDING.md": text})
+        self.assertEqual(len(found), 1)
+        self.assertIn("block 2", found[0])
+
+    def test_the_document_we_ship_passes(self):
+        kept = list(checks.failures)
+        checks.failures.clear()
+        try:
+            checks._onboarding()
+            self.assertEqual(checks.failures, [])
+        finally:
+            checks.failures[:] = kept
+
+
+class TestTheReadmeNamesEveryDepartment(CheckTestCase):
+    """readme — a bundle the README never names is a bundle nobody installs.
+
+    The names come from the marketplace. The check this replaced knew the five
+    department names by heart, in a regex, and would have failed on a sixth for
+    the wrong reason.
+    """
+
+    LISTED = {"ops": {"category": "department"},
+              "finance": {"category": "department"},
+              "general": {"category": "general"}}
+
+    def readme(self, body):
+        return self.run_check(checks._readme, {"README.md": body},
+                              listed=self.LISTED)
+
+    def test_both_bundles_named_passes(self):
+        """`general` goes unmentioned here on purpose. Only bundles are wanted."""
+        self.assertEqual(self.readme("Install `ops` or `finance`.\n"), [])
+
+    def test_a_bundle_the_prose_never_names_is_reported(self):
+        found = self.readme("Install `ops`.\n")
+        self.assertEqual(len(found), 1)
+        self.assertIn("`finance`", found[0])
+
+    def test_a_name_in_prose_without_a_code_span_does_not_count(self):
+        """The README names bundles as commands, and a bare word is not one."""
+        found = self.readme("Install ops or finance.\n")
+        self.assertEqual(len(found), 2)
+
+    def test_the_readme_we_ship_passes(self):
+        kept = list(checks.failures)
+        checks.failures.clear()
+        try:
+            checks._readme()
+            self.assertEqual(checks.failures, [])
+        finally:
+            checks.failures[:] = kept
+
+
 if __name__ == "__main__":
     unittest.main()

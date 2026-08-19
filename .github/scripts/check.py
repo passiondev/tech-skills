@@ -1005,6 +1005,81 @@ def _executables():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# What the documents promise
+# ─────────────────────────────────────────────────────────────────────────────
+
+JSON_BLOCK = re.compile(r"```json\n(.*?)```", re.S)
+
+# Where this marketplace is installed from (ADR 0001). A literal rather than the
+# git remote: a fork has its own remote and the same ONBOARDING.md, and a fork
+# that still points readers at upstream is right rather than broken.
+REPO = "passiondev/tech-skills"
+
+
+@check("onboarding")
+def _onboarding():
+    """The settings block a reader pastes into ~/.claude/settings.json.
+
+    Nobody types this from memory, so a broken block is a broken install for
+    everyone who reads the file next. Two of the four rules come out of ADR
+    0012, and both cost a colleague an afternoon:
+
+      * `autoUpdate` must stay true. ADR 0001 makes it the whole update story
+        — there is no other mechanism by which thirty people get a fix.
+      * `enabledPlugins` must not be there. `claude plugin install` writes it,
+        for the bundle and for every dependency. A hand-written one names the
+        bundle and nothing under it, so the bundle installs, its dependencies
+        do not, and no number of restarts repairs it.
+    """
+    text = (ROOT / "ONBOARDING.md").read_text()
+    blocks = JSON_BLOCK.findall(text)
+    if not blocks:
+        fail("ONBOARDING.md", "has no JSON block — the marketplace entry is pasted by hand")
+        return
+    for i, block in enumerate(blocks, 1):
+        try:
+            json.loads(block)
+        except json.JSONDecodeError as exc:
+            fail("ONBOARDING.md", f"JSON block {i} is not valid JSON — {exc}")
+
+    try:
+        settings = json.loads(blocks[0])
+    except json.JSONDecodeError:
+        return  # already reported, and there is nothing left to read
+    if "enabledPlugins" in settings:
+        fail("ONBOARDING.md", "hand-writes enabledPlugins — `claude plugin install` "
+                              "writes it, dependencies included (ADR 0012)")
+    entry = settings.get("extraKnownMarketplaces", {}).get("passion-tech")
+    if not entry:
+        fail("ONBOARDING.md", "settings block does not add `passion-tech` under "
+                              "extraKnownMarketplaces — the install has nothing to install from")
+        return
+    if entry.get("autoUpdate") is not True:
+        fail("ONBOARDING.md", "settings block turns autoUpdate off — it is the only way "
+                              "a fix reaches anybody (ADR 0001)")
+    if entry.get("source", {}).get("repo") != REPO:
+        fail("ONBOARDING.md", f"settings block points at "
+                              f"{entry.get('source', {}).get('repo')!r}, not {REPO}")
+
+
+@check("readme")
+def _readme():
+    """Every department bundle is named in the README.
+
+    A department nobody can find is a department nobody installs. The names come
+    from the marketplace rather than from a pattern over the prose: the check
+    this replaced matched `ops|analytics|service-and-support|...-engineering`,
+    so it knew the five names by heart and would have failed on the sixth for
+    the wrong reason.
+    """
+    readme = (ROOT / "README.md").read_text()
+    for name, entry in sorted(LISTED.items()):
+        if entry.get("category") == "department" and f"`{name}`" not in readme:
+            fail("README.md", f"never names `{name}`, which the marketplace offers as "
+                              "a department bundle")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     if failures:

@@ -15,8 +15,11 @@ jobs:
       - uses: actions/checkout@v4
 
       # check.py is stdlib-only on purpose: nothing to install, and a
-      # contributor can run the identical command locally before pushing.
-      - name: Manifests, skills, secrets, runtime invariants
+      # contributor can run the identical command locally before pushing. Two
+      # checks used to live in this file as inline Python, which meant nobody
+      # could run them locally at all and each one stopped at its first
+      # complaint. They are `onboarding` and `readme` in check.py now.
+      - name: Manifests, skills, secrets, runtime invariants, and what the docs promise
         run: python3 .github/scripts/check.py
 
       # The Rock runtime is the one place in this repo where a plausible
@@ -29,47 +32,3 @@ jobs:
       # because a green check does not prove the check still bites. See ADR 0022.
       - name: Every Rock request, and every check that guards one
         run: python3 -m unittest discover -s tests -v
-
-      - name: The onboarding settings block must be valid JSON
-        run: |
-          python3 - <<'PY'
-          import json, re, sys, pathlib
-          text = pathlib.Path("ONBOARDING.md").read_text()
-          blocks = re.findall(r"```json\n(.*?)```", text, re.S)
-          if not blocks:
-              sys.exit("ONBOARDING.md has no JSON block — autoUpdate is set by hand")
-          for i, b in enumerate(blocks, 1):
-              try:
-                  json.loads(b)
-              except json.JSONDecodeError as e:
-                  sys.exit(f"ONBOARDING.md block {i} is not valid JSON: {e}")
-          # Claude merges one key by hand, and it is autoUpdate. `claude plugin
-          # install` writes enabledPlugins itself for the bundle and every
-          # dependency; hand-writing it instead is the failure mode ADR 0012
-          # measured — the bundle installs, its dependencies do not, and no
-          # number of restarts repairs it. So the block must not carry that key.
-          d = json.loads(blocks[0])
-          if "extraKnownMarketplaces" not in d:
-              sys.exit("ONBOARDING.md settings block is missing extraKnownMarketplaces")
-          if "enabledPlugins" in d:
-              sys.exit("ONBOARDING.md settings block must not hand-write enabledPlugins — "
-                       "claude plugin install writes it, dependencies included (ADR 0012)")
-          mk = d["extraKnownMarketplaces"]["passion-tech"]
-          assert mk["autoUpdate"] is True, "autoUpdate must stay on — ADR 0001"
-          assert mk["source"]["repo"] == "passiondev/tech-skills", "wrong repo"
-          print("ONBOARDING.md settings block is valid")
-          PY
-
-      - name: Every department in the README is a real bundle
-        run: |
-          python3 - <<'PY'
-          import json, pathlib, re, sys
-          mk = json.loads(pathlib.Path(".claude-plugin/marketplace.json").read_text())
-          bundles = {p["name"] for p in mk["plugins"] if p.get("category") == "department"}
-          readme = pathlib.Path("README.md").read_text()
-          named = set(re.findall(r"`([a-z-]+-engineering|ops|analytics|service-and-support)`", readme))
-          missing = bundles - named
-          if missing:
-              sys.exit(f"README does not mention these departments: {sorted(missing)}")
-          print(f"README covers all {len(bundles)} departments")
-          PY
