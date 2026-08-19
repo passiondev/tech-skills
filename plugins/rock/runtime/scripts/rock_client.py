@@ -21,18 +21,13 @@ import json
 import sys
 import traceback
 from contextlib import contextmanager
-from pathlib import Path
 
 import requests
-import yaml
 
 import passion_env
 from rock_log import get_logger
 
 log = get_logger("rock.client")
-
-ROOT = Path(__file__).resolve().parent.parent
-CONFIG_PATH = ROOT / "config.yaml"
 
 BASE_URL_ENV = "ROCK_BASE_URL"
 USERNAME_ENV = "ROCK_USERNAME"
@@ -117,11 +112,6 @@ def api_errors_reported():
     except requests.RequestException as exc:
         print(f"Error: could not reach Rock. {exc}")
         sys.exit(1)
-
-
-def load_config():
-    with open(CONFIG_PATH) as f:
-        return yaml.safe_load(f)
 
 
 def get_credentials():

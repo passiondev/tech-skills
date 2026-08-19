@@ -281,5 +281,50 @@ class TestProvenanceReadsTheFileLists(CheckTestCase):
             checks.failures[:] = kept
 
 
+class TestWhichFilesTheChecksSee(CheckTestCase):
+    """repo_files — what git tracks, and only what is there to read."""
+
+    def files(self, tree, **kwargs):
+        with tempfile.TemporaryDirectory() as tmp:
+            for rel, source in tree.items():
+                path = Path(tmp) / rel
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(source)
+            for command in (["init", "-q"], ["add", "-A"]):
+                subprocess.run(["git", "-C", tmp, *command],
+                               check=True, capture_output=True)
+            real_root, checks.ROOT = checks.ROOT, Path(tmp)
+            try:
+                return [str(p.relative_to(tmp))
+                        for p in checks.repo_files(**kwargs)], Path(tmp)
+            finally:
+                checks.ROOT = real_root
+
+    def test_a_prefix_and_a_suffix_narrow_it(self):
+        found, _ = self.files(
+            {"plugins/a/x.py": "1\n", "plugins/a/x.sh": "1\n", "docs/y.py": "1\n"},
+            under="plugins/", suffixes={".py"})
+        self.assertEqual(found, ["plugins/a/x.py"])
+
+    def test_what_git_ignores_is_not_a_file_of_ours(self):
+        found, _ = self.files({".gitignore": "*.log\n", "keep.md": "1\n",
+                               "noise.log": "1\n"})
+        self.assertEqual(found, [".gitignore", "keep.md"])
+
+    def test_a_deletion_not_yet_staged_is_dropped_rather_than_returned(self):
+        """The index still names it. Every caller opens what it is handed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "gone.md").write_text("body\n")
+            for command in (["init", "-q"], ["add", "-A"]):
+                subprocess.run(["git", "-C", tmp, *command],
+                               check=True, capture_output=True)
+            (Path(tmp) / "gone.md").unlink()
+            real_root, checks.ROOT = checks.ROOT, Path(tmp)
+            try:
+                self.assertEqual(checks.repo_files(), [])
+            finally:
+                checks.ROOT = real_root
+
+
 if __name__ == "__main__":
     unittest.main()

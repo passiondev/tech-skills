@@ -67,6 +67,11 @@ def repo_files(under="", suffixes=None):
     What a public repository ships is what git tracks, and git already knows
     about the caches, because they carry their own ignore files. `under` is a
     literal prefix, so pass the trailing slash: "plugins/".
+
+    A path in the index that is not on disk is dropped rather than returned. A
+    file deleted but not yet staged is exactly that, and every caller here opens
+    what it is given -- so returning the path would turn an ordinary moment
+    mid-edit into a check that crashes instead of reporting.
     """
     listing = subprocess.run(["git", "-C", str(ROOT), "ls-files", "-z"],
                              capture_output=True, text=True, check=False)
@@ -75,7 +80,8 @@ def repo_files(under="", suffixes=None):
                            f"{listing.stderr.strip()[:200]}")
     return sorted(ROOT / rel for rel in listing.stdout.split("\0")
                   if rel and rel.startswith(under)
-                  and (suffixes is None or Path(rel).suffix in suffixes))
+                  and (suffixes is None or Path(rel).suffix in suffixes)
+                  and (ROOT / rel).is_file())
 
 
 # ─────────────────────────────────────────────────────────────────────────────

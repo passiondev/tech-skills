@@ -4,7 +4,7 @@ The Rock client code moves into this repo and this repo becomes its only home. `
 
 Once [0003](0003-rock-bundles-its-runtime.md) put the runtime inside the plugin, the choice was between one canonical copy and two copies with a promotion step between them. Two copies drift. Every mechanism for preventing that — a sync command, a CI equality check, a release checklist — is machinery that exists only to paper over having made a copy in the first place. And there was little left to keep separate: `rock-tools` tracks twenty files, of which nineteen are the Rock runtime, the rock skills, and scaffolding.
 
-Developing in public was the objection, and two facts answered it. The scripts contain no Passion hostnames, credentials, or references of any kind — `config.yaml` names environment *variables*, not their values. And everything the tooling produces when pointed at a live Rock instance is already gitignored: `catalog.json`, `.venv/`, `*.log`, `screenshots/`, `data/reports/`, `.env`. The dangerous output was never in version control.
+Developing in public was the objection, and two facts answered it. The scripts contain no Passion hostnames, credentials, or references of any kind — `config.yaml` names environment *variables*, not their values. *`config.yaml` has since been deleted: four of its five keys were read by nothing, and the fifth is now a constant beside the one function that reads it. The claim holds without it — the variable names are in `rock_client.py`.* And everything the tooling produces when pointed at a live Rock instance is already gitignored: `catalog.json`, `.venv/`, `*.log`, `screenshots/`, `data/reports/`, `.env`. The dangerous output was never in version control.
 
 ## Considered options
 

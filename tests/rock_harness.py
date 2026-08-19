@@ -31,8 +31,8 @@ def _stub(name, **attrs):
     """Register a stand-in module so an import of a third-party package works.
 
     check.py keeps CI stdlib-only and there is no virtualenv here, so `requests`
-    and `yaml` are not installed. Neither is reached: every test builds a client
-    with an explicit fake session or bypasses the client entirely.
+    is not installed. It is never reached either: every test builds a client with
+    an explicit fake session, or bypasses the client entirely.
     """
     if name in sys.modules:
         return sys.modules[name]
@@ -110,7 +110,6 @@ def _session_factory():
 
 
 _stub("requests", Session=_session_factory, RequestException=OSError)
-_stub("yaml", safe_load=lambda *a, **k: {})
 
 if str(ROCK_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(ROCK_SCRIPTS))

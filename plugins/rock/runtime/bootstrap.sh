@@ -56,7 +56,7 @@ fi
 echo "Installing the Rock runtime into $ROCK_HOME ..." >&2
 
 mkdir -p "$ROCK_HOME/scripts"
-cp "$SRC"/pyproject.toml "$SRC"/uv.lock "$SRC"/config.yaml "$ROCK_HOME/"
+cp "$SRC"/pyproject.toml "$SRC"/uv.lock "$ROCK_HOME/"
 cp "$SRC"/scripts/*.py "$ROCK_HOME/scripts/"
 
 SYNC_ARGS=(--frozen)
