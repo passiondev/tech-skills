@@ -13,6 +13,7 @@ Exit 0 if clean, 1 otherwise. Every failure names the file and what to do.
 """
 
 import ast
+import collections
 import json
 import re
 import subprocess
@@ -1062,21 +1063,142 @@ def _onboarding():
                               f"{entry.get('source', {}).get('repo')!r}, not {REPO}")
 
 
+ROSTER_LINE = re.compile(r"^\*\*([a-z-]+)\*\* —")
+BACKTICKED = re.compile(r"`([a-z][a-z-]*)`")
+
+
 @check("readme")
 def _readme():
-    """Every department bundle is named in the README.
+    """Everything the marketplace offers is findable in the README, by name.
 
-    A department nobody can find is a department nobody installs. The names come
-    from the marketplace rather than from a pattern over the prose: the check
-    this replaced matched `ops|analytics|service-and-support|...-engineering`,
-    so it knew the five names by heart and would have failed on the sixth for
-    the wrong reason.
+    A department nobody can find is a department nobody installs, and a skill
+    missing from the roster is a skill nobody browsing knows to ask for. The
+    names come from the marketplace and from disk rather than from a pattern over
+    the prose: the check this replaced matched departments with
+    `ops|analytics|service-and-support|...-engineering`, so it knew the five
+    names by heart and would have failed on the sixth for the wrong reason.
     """
-    readme = (ROOT / "README.md").read_text()
+    text = (ROOT / "README.md").read_text()
     for name, entry in sorted(LISTED.items()):
-        if entry.get("category") == "department" and f"`{name}`" not in readme:
+        if entry.get("category") == "department" and f"`{name}`" not in text:
             fail("README.md", f"never names `{name}`, which the marketplace offers as "
                               "a department bundle")
+
+    # Below the bundle table, one line per capability plugin lists what it holds.
+    # A line runs to the next `**plugin**` or to a blank line, because the prose
+    # wraps.
+    roster, entry = {}, None
+    for n, line in enumerate(text.splitlines(), 1):
+        opener = ROSTER_LINE.match(line)
+        if opener:
+            entry = opener.group(1)
+            roster[entry] = (n, line)
+        elif entry and line.strip():
+            roster[entry] = (roster[entry][0], roster[entry][1] + " " + line)
+        else:
+            entry = None
+
+    capabilities = {name for name, e in LISTED.items()
+                    if e.get("category") != "department"}
+    for name, (n, prose) in sorted(roster.items()):
+        where = f"README.md:{n}"
+        if name not in capabilities:
+            fail(where, f"lists skills under `{name}`, which the marketplace does not "
+                        "offer as a capability plugin")
+            continue
+        named = set(BACKTICKED.findall(prose))
+        held = {skill for plugin, skill in map(owner_of, SKILLS) if plugin == name}
+        for missing in sorted(held - named):
+            fail(where, f"does not name `{missing}`, which `{name}` ships")
+        for gone in sorted(named - held):
+            fail(where, f"names `{gone}` under `{name}`, which ships no such skill")
+    for silent in sorted(capabilities - set(roster)):
+        fail("README.md", f"never lists what `{silent}` holds — the roster is how "
+                          "a reader finds a skill")
+
+
+_ONES = ("zero one two three four five six seven eight nine ten eleven twelve "
+         "thirteen fourteen fifteen sixteen seventeen eighteen nineteen").split()
+_TENS = ("", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy",
+         "eighty", "ninety")
+
+
+def in_words(n):
+    """`n` spelled the way the README spells it: nineteen, twenty, twenty-three."""
+    if n < 20:
+        return _ONES[n]
+    return _TENS[n // 10] + ("" if n % 10 == 0 else f"-{_ONES[n % 10]}")
+
+
+BUNDLE_ROW = re.compile(r"^\| `([a-z-]+)` \| (\d+) \| ([a-z, -]+) \|$")
+ADR_COUNT = re.compile(r"([A-Za-z-]+) decisions and their reasoning")
+VENDORED_COUNT = re.compile(r"([a-z-]+) of the\s+([a-z-]+) skills are Matt Pocock's")
+
+
+@check("readme-counts")
+def _readme_counts():
+    """Every number the README states about this repository.
+
+    Eight of them, all maintained by hand, and each one wrong the moment a skill
+    is added: five bundle rows, the count of decisions, and the two in the
+    licence note. A number in a README is read as a fact and never as a claim, so
+    a stale one misinforms rather than confuses. `readme` keeps the departments
+    findable; this keeps what the README says about them true.
+    """
+    text = (ROOT / "README.md").read_text()
+    per_plugin = collections.Counter(plugin for plugin, _ in map(owner_of, SKILLS))
+    rows = 0
+
+    for n, line in enumerate(text.splitlines(), 1):
+        row = BUNDLE_ROW.match(line)
+        if not row:
+            continue
+        rows += 1
+        where = f"README.md:{n}"
+        name, said, listed = row.group(1), int(row.group(2)), row.group(3)
+        if name not in LISTED:
+            fail(where, f"`{name}` is not a plugin the marketplace lists")
+            continue
+        below = installs(name) - {name}
+        truth = sum(per_plugin[plugin] for plugin in below)
+        if said != truth:
+            fail(where, f"says `{name}` has {said} skills. It installs {truth}")
+        # Order in the column runs foundational to specific, which is a choice
+        # about reading and not a fact about the graph.
+        if set(listed.split(", ")) != below:
+            fail(where, f"lists {listed} for `{name}`, which installs "
+                        f"{', '.join(sorted(below))}")
+
+    bundles = sum(1 for e in LISTED.values() if e.get("category") == "department")
+    if rows != bundles:
+        fail("README.md", f"has {rows} rows in the bundle table for {bundles} "
+                          "department bundles — a row was added or lost")
+
+    # The two prose claims are searched over the whole document rather than line
+    # by line, because the README wraps and "eighteen of the twenty-four skills"
+    # straddles a line break. Newlines become spaces one for one, so an offset
+    # still says which line the sentence starts on.
+    flat = text.replace("\n", " ")
+
+    def at(match):
+        return f"README.md:{text.count(chr(10), 0, match.start()) + 1}"
+
+    adrs = ADR_COUNT.search(flat)
+    if adrs:
+        truth = len(list((ROOT / "docs" / "adr").glob("[0-9]*.md")))
+        if adrs.group(1).lower() != in_words(truth):
+            fail(at(adrs), f"says {adrs.group(1)} decisions. docs/adr holds "
+                           f"{truth} — {in_words(truth)}")
+
+    vendored = VENDORED_COUNT.search(flat)
+    if vendored:
+        entries = (json_at(ROOT / "docs" / "vendored.json") or {}).get("skills", {})
+        theirs = sum(1 for e in entries.values()
+                     if e.get("upstream") == "mattpocock/skills")
+        for said, truth, what in ((vendored.group(1), theirs, "skills are his"),
+                                  (vendored.group(2), len(SKILLS), "skills ship")):
+            if said.lower() != in_words(truth):
+                fail(at(vendored), f"says {said} where {truth} {what} — {in_words(truth)}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

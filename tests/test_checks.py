@@ -60,7 +60,7 @@ def first(client, endpoint, params):
 class CheckTestCase(unittest.TestCase):
     """Runs one real check over a repository of our own making."""
 
-    def run_check(self, fn, files, listed=None):
+    def run_check(self, fn, files, listed=None, skills=None):
         """Report what `fn` complains about, given `files` as the whole repo.
 
         The temp directory is made a real git repository with `files` added to
@@ -69,8 +69,10 @@ class CheckTestCase(unittest.TestCase):
         for a file git ignores: put it in `.gitignore` here and it is ignored
         here too, by the same code that ignores it upstairs.
 
-        `listed` stands in for the marketplace catalog, for the checks that walk
-        it. Pass plugin names mapped to their marketplace entry.
+        `listed` stands in for the marketplace catalog and `skills` for the
+        SKILL.md files on disk, for the checks that read them. Both are computed
+        once at import against the real repository, so a fixture has to say what
+        it holds instead.
         """
         with tempfile.TemporaryDirectory() as tmp:
             for rel, source in files.items():
@@ -81,12 +83,14 @@ class CheckTestCase(unittest.TestCase):
                 subprocess.run(["git", "-C", tmp, *command],
                                check=True, capture_output=True)
             kept, real_root = list(checks.failures), checks.ROOT
-            real_listed = checks.LISTED
+            real_listed, real_skills = checks.LISTED, checks.SKILLS
             checks.failures.clear()
             checks.ROOT = Path(tmp)
             checks.PLUGINS = checks.ROOT / "plugins"
             if listed is not None:
                 checks.LISTED = listed
+            if skills is not None:
+                checks.SKILLS = [checks.PLUGINS / rel for rel in skills]
             checks.reset_caches()
             try:
                 fn()
@@ -94,7 +98,7 @@ class CheckTestCase(unittest.TestCase):
             finally:
                 checks.ROOT = real_root
                 checks.PLUGINS = real_root / "plugins"
-                checks.LISTED = real_listed
+                checks.LISTED, checks.SKILLS = real_listed, real_skills
                 checks.failures[:] = kept
                 checks.reset_caches()
 
@@ -561,35 +565,70 @@ class TestTheOnboardingBlockPeoplePasteFrom(CheckTestCase):
             checks.failures[:] = kept
 
 
-class TestTheReadmeNamesEveryDepartment(CheckTestCase):
-    """readme — a bundle the README never names is a bundle nobody installs.
+class TestTheReadmeNamesEverythingOnOffer(CheckTestCase):
+    """readme — a bundle nobody can find is a bundle nobody installs.
 
-    The names come from the marketplace. The check this replaced knew the five
-    department names by heart, in a regex, and would have failed on a sixth for
-    the wrong reason.
+    Same for a skill left out of the roster. The names come from the marketplace
+    and from disk. The department half of this check ran as a regex holding the
+    five names it was checking, so a sixth would have failed it for the wrong
+    reason.
     """
 
     LISTED = {"ops": {"category": "department"},
               "finance": {"category": "department"},
-              "general": {"category": "general"}}
+              "general": {"category": "general"},
+              "jira": {"category": "general"}}
+    SKILLS = ["general/skills/teach/SKILL.md", "general/skills/research/SKILL.md",
+              "jira/skills/ticket/SKILL.md"]
+    ROSTER = ("**general** — thinking: `teach`, `research`\n"
+              "**jira** — `ticket`\n")
 
     def readme(self, body):
         return self.run_check(checks._readme, {"README.md": body},
-                              listed=self.LISTED)
+                              listed=self.LISTED, skills=self.SKILLS)
 
-    def test_both_bundles_named_passes(self):
-        """`general` goes unmentioned here on purpose. Only bundles are wanted."""
-        self.assertEqual(self.readme("Install `ops` or `finance`.\n"), [])
+    def roster(self, roster):
+        """A README saying everything right except what `roster` says."""
+        return self.readme(f"Install `ops` or `finance`.\n\n{roster}")
+
+    def test_both_bundles_and_the_whole_roster_passes(self):
+        self.assertEqual(self.readme(f"Install `ops` or `finance`.\n\n{self.ROSTER}"), [])
 
     def test_a_bundle_the_prose_never_names_is_reported(self):
-        found = self.readme("Install `ops`.\n")
+        found = self.readme(f"Install `ops`.\n\n{self.ROSTER}")
         self.assertEqual(len(found), 1)
         self.assertIn("`finance`", found[0])
 
     def test_a_name_in_prose_without_a_code_span_does_not_count(self):
         """The README names bundles as commands, and a bare word is not one."""
-        found = self.readme("Install ops or finance.\n")
+        found = self.readme(f"Install ops or finance.\n\n{self.ROSTER}")
         self.assertEqual(len(found), 2)
+
+    def test_a_roster_that_forgets_a_skill_hides_it(self):
+        found = self.roster(self.ROSTER.replace(", `research`", ""))
+        self.assertEqual(len(found), 1)
+        self.assertIn("does not name `research`, which `general` ships", found[0])
+
+    def test_a_roster_naming_a_skill_that_is_gone(self):
+        found = self.roster(self.ROSTER.replace("`ticket`", "`ticket`, `retired`"))
+        self.assertEqual(len(found), 1)
+        self.assertIn("names `retired` under `jira`", found[0])
+
+    def test_a_capability_plugin_with_no_roster_line_at_all(self):
+        found = self.roster(self.ROSTER.replace("**jira** — `ticket`\n", ""))
+        self.assertEqual(len(found), 1)
+        self.assertIn("never lists what `jira` holds", found[0])
+
+    def test_a_roster_line_for_a_plugin_the_marketplace_dropped(self):
+        found = self.roster(self.ROSTER.replace("**jira**", "**gone**"))
+        self.assertEqual(len(found), 2)
+        self.assertIn("does not offer as a capability plugin", found[0])
+        self.assertIn("never lists what `jira` holds", found[1])
+
+    def test_a_roster_entry_wrapped_over_two_lines_is_read_whole(self):
+        self.assertEqual(
+            self.roster(self.ROSTER.replace("`teach`, `research`", "`teach`,\n`research`")),
+            [])
 
     def test_the_readme_we_ship_passes(self):
         kept = list(checks.failures)
@@ -599,6 +638,106 @@ class TestTheReadmeNamesEveryDepartment(CheckTestCase):
             self.assertEqual(checks.failures, [])
         finally:
             checks.failures[:] = kept
+
+
+class TestEveryNumberTheReadmeStates(CheckTestCase):
+    """readme-counts — eight hand-maintained numbers, each stale on the next skill.
+
+    A number in a README reads as a fact rather than as a claim, so a wrong one
+    misinforms instead of confusing. Every one of these was right when somebody
+    typed it.
+    """
+
+    LISTED = {"ops": {"category": "department"},
+              "general": {"category": "general"},
+              "jira": {"category": "general"}}
+    SKILLS = ["general/skills/teach/SKILL.md", "general/skills/research/SKILL.md",
+              "jira/skills/ticket/SKILL.md"]
+    VENDORED = {"skills": {
+        "teach": {"plugin": "general", "upstream": "mattpocock/skills"},
+        "research": {"plugin": "general", "upstream": "mattpocock/skills"},
+        "ticket": {"plugin": "jira", "upstream": "passion-original"}}}
+
+    def readme(self, body, adrs=2):
+        files = {"README.md": body,
+                 "docs/vendored.json": json.dumps(self.VENDORED),
+                 "plugins/ops/.claude-plugin/plugin.json": json.dumps(
+                     {"name": "ops", "dependencies": ["general", "jira"]}),
+                 "plugins/general/.claude-plugin/plugin.json": json.dumps({"name": "general"}),
+                 "plugins/jira/.claude-plugin/plugin.json": json.dumps({"name": "jira"})}
+        for i in range(1, adrs + 1):
+            files[f"docs/adr/{i:04d}-a-decision.md"] = "# A decision\n"
+        for rel in self.SKILLS:
+            files[f"plugins/{rel}"] = "---\nname: x\n---\n"
+        return self.run_check(checks._readme_counts, files,
+                              listed=self.LISTED, skills=self.SKILLS)
+
+    TRUE = ("| `ops` | 3 | general, jira |\n"
+            "\nTwo decisions and their reasoning are in docs/adr/.\n"
+            "\ntwo of the three skills are Matt Pocock's work.\n")
+
+    def test_a_readme_telling_the_truth_passes(self):
+        self.assertEqual(self.readme(self.TRUE), [])
+
+    def test_a_bundle_row_counting_wrong_is_told_the_real_number(self):
+        found = self.readme(self.TRUE.replace("| 3 |", "| 7 |"))
+        self.assertEqual(len(found), 1)
+        self.assertIn("says `ops` has 7 skills. It installs 3", found[0])
+
+    def test_a_bundle_row_naming_the_wrong_plugins_is_told_which(self):
+        found = self.readme(self.TRUE.replace("general, jira", "general, dev"))
+        self.assertEqual(len(found), 1)
+        self.assertIn("lists general, dev for `ops`", found[0])
+
+    def test_a_row_for_a_plugin_the_marketplace_dropped(self):
+        found = self.readme(self.TRUE.replace("`ops`", "`gone`"))
+        self.assertEqual(len(found), 1)
+        self.assertIn("not a plugin the marketplace lists", found[0])
+
+    def test_a_missing_row_is_a_bundle_the_table_forgot(self):
+        found = self.readme(self.TRUE.replace("| `ops` | 3 | general, jira |\n", ""))
+        self.assertEqual(len(found), 1)
+        self.assertIn("a row was added or lost", found[0])
+
+    def test_the_count_of_decisions_is_read_as_a_word(self):
+        found = self.readme(self.TRUE, adrs=5)
+        self.assertEqual(len(found), 1)
+        self.assertIn("says Two decisions. docs/adr holds 5 — five", found[0])
+
+    def test_a_capitalised_number_at_the_start_of_a_sentence_still_counts(self):
+        """The README writes `Twenty-three decisions`, mid-paragraph or not."""
+        self.assertEqual(self.readme(self.TRUE.replace("Two decisions", "two decisions")), [])
+
+    def test_the_licence_note_carries_two_numbers_and_both_are_checked(self):
+        found = self.readme(self.TRUE.replace("two of the three skills",
+                                              "nine of the eleven skills"))
+        self.assertEqual(len(found), 2)
+        self.assertIn("says nine where 2 skills are his — two", found[0])
+        self.assertIn("says eleven where 3 skills ship — three", found[1])
+
+    def test_the_licence_note_is_found_across_a_line_break(self):
+        wrapped = self.TRUE.replace("two of the three skills are Matt Pocock's work.",
+                                    "two of the\nthree skills are Matt Pocock's work.")
+        self.assertEqual(self.readme(wrapped), [])
+
+    def test_the_readme_we_ship_passes(self):
+        kept = list(checks.failures)
+        checks.failures.clear()
+        try:
+            checks._readme_counts()
+            self.assertEqual(checks.failures, [])
+        finally:
+            checks.failures[:] = kept
+
+
+class TestSpellingANumberOut(unittest.TestCase):
+    """in_words — the README writes its numbers as words, so the check must too."""
+
+    def test_it_spells_the_way_the_readme_spells(self):
+        self.assertEqual(
+            [checks.in_words(n) for n in (0, 5, 11, 18, 19, 20, 23, 24, 30, 41)],
+            ["zero", "five", "eleven", "eighteen", "nineteen", "twenty",
+             "twenty-three", "twenty-four", "thirty", "forty-one"])
 
 
 if __name__ == "__main__":
