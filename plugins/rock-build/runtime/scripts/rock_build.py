@@ -6,9 +6,18 @@ Handles sequential creation with parent-child ID dependencies.
 Usage:
   echo '{"operation": "create_workflow", ...}' | uv run scripts/rock_build.py
   uv run scripts/rock_build.py /tmp/build-plan.json
+
+Reached only through rock-build's rock.sh, which sets ROCK_ALLOW_WRITES; every
+operation here refuses without it (ADR 0016).
+
+Partial updates use PATCH, never PUT. RockClient.put explains why at length —
+the short version is that Rock's PUT replaces the whole entity, so a partial
+body nulls the fields you left out, wipes the created-by audit, and gives the
+row a new Guid.
 """
 
 import json
+import os
 import sys
 import traceback
 from pathlib import Path
@@ -82,6 +91,58 @@ def resolve_layout(catalog, name, site_id=None):
     return None
 
 
+def resolve_group_type(client, name):
+    """Find a GroupType ID by name (substring match, as check-in areas rely on)."""
+    gts = client.get("GroupTypes", params={
+        "$filter": f"substringof('{odata_str(name)}', Name) eq true",
+        "$select": "Id",
+        "$top": 1,
+    })
+    return gts[0]["Id"] if gts else None
+
+
+def resolve_group_role(client, group_id, role_name):
+    """Find a GroupTypeRole ID by name, within the group's own type.
+
+    Role names are only unique inside a group type — "Member" and "Leader"
+    exist many times over — so the group's GroupTypeId has to come first.
+    """
+    group = client.get(f"Groups/{group_id}", params={"$select": "GroupTypeId"})
+    if not group or not group.get("GroupTypeId"):
+        return None
+    roles = client.get("GroupTypeRoles", params={
+        "$filter": f"GroupTypeId eq {group['GroupTypeId']} and "
+                   f"Name eq '{odata_str(role_name)}'",
+        "$select": "Id",
+        "$top": 1,
+    })
+    return roles[0]["Id"] if roles else None
+
+
+def resolve_data_view(client, name):
+    """Find a DataView ID by name."""
+    views = client.get("DataViews", params={
+        "$filter": f"Name eq '{odata_str(name)}'",
+        "$select": "Id",
+        "$top": 1,
+    })
+    return views[0]["Id"] if views else None
+
+
+# Rock.Model.GroupMemberStatus. Sending nothing means 0 — Inactive — so every
+# code path here sets it explicitly.
+MEMBER_STATUS = {"inactive": 0, "active": 1, "pending": 2}
+
+
+def member_status(value):
+    """Map a status name to its enum value. Returns None if it is not one."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value in MEMBER_STATUS.values() else None
+    return MEMBER_STATUS.get(str(value).strip().lower())
+
+
 def _next_order(client, endpoint, filter_str):
     """Get the next Order value for a child entity (max + 1, or 0 if none)."""
     existing = client.get(endpoint, params={
@@ -94,21 +155,42 @@ def _next_order(client, endpoint, filter_str):
 
 
 def set_attribute_values(client, endpoint, entity_id, settings):
-    """Set attribute values on an entity, trying both POST and PUT endpoints."""
+    """Set attribute values on an entity.
+
+    Rock routes this one by convention, not by OData, and binds both arguments
+    from the query string: POST /api/{Entity}/AttributeValue/{id} with
+    attributeKey and attributeValue. Neither is optional — omit attributeKey and
+    the request stops matching the route at all and 404s.
+
+    An unrecognised key is a 400 and nothing is written, so a failure here has
+    to propagate. The version this replaced sent a JSON body to two routes that
+    do not exist, caught both 404s, printed `Warning: could not set X`, and let
+    the entity count as created — which is how a workflow could be reported
+    built with not one of its actions configured.
+    """
     for attr_key, attr_value in settings.items():
-        try:
-            client.post(f"{endpoint}/{entity_id}/AttributeValues", {
-                "Key": attr_key,
-                "Value": str(attr_value),
-            })
-        except Exception:
-            try:
-                client.put(f"{endpoint}/AttributeValue/{entity_id}", {
-                    "Key": attr_key,
-                    "Value": str(attr_value),
-                })
-            except Exception as e2:
-                print(f"  Warning: could not set {attr_key}: {e2}")
+        client.post(f"{endpoint}/AttributeValue/{entity_id}", params={
+            "attributeKey": attr_key,
+            "attributeValue": "" if attr_value is None else str(attr_value),
+        })
+
+
+def apply_settings(result, client, endpoint, entity_id, label, settings):
+    """set_attribute_values, with any failure recorded on the build result.
+
+    Returns False when a setting did not land. The caller must stop there: the
+    entity exists but is not configured, and reporting success anyway is the
+    failure mode this whole function exists to prevent.
+    """
+    if not settings:
+        return True
+    try:
+        set_attribute_values(client, endpoint, entity_id, settings)
+        return True
+    except Exception as e:
+        result.fail("Settings", label, e)
+        result.report()
+        return False
 
 
 class BuildResult:
@@ -268,8 +350,9 @@ def create_workflow(plan, client, catalog):
                 result.report()
                 return result
 
-            set_attribute_values(client, "WorkflowActionTypes", action_id,
-                                action_def.get("settings", {}))
+            if not apply_settings(result, client, "WorkflowActionTypes", action_id,
+                                  action_def["name"], action_def.get("settings", {})):
+                return result
 
             # Create form if specified
             form_def = action_def.get("form")
@@ -404,8 +487,10 @@ def create_page(plan, client, catalog):
             result.report()
             return result
 
-        set_attribute_values(client, "Blocks", block_id,
-                            block_def.get("settings", {}))
+        if not apply_settings(result, client, "Blocks", block_id,
+                              block_def.get("name", f"block-{block_order}"),
+                              block_def.get("settings", {})):
+            return result
 
     result.report()
     return result
@@ -444,8 +529,9 @@ def add_workflow_action(plan, client, catalog):
         result.report()
         return result
 
-    set_attribute_values(client, "WorkflowActionTypes", action_id,
-                        action_def.get("settings", {}))
+    if not apply_settings(result, client, "WorkflowActionTypes", action_id,
+                          action_def["name"], action_def.get("settings", {})):
+        return result
 
     result.report()
     return result
@@ -487,8 +573,10 @@ def add_page_block(plan, client, catalog):
         result.report()
         return result
 
-    set_attribute_values(client, "Blocks", block_id,
-                        block_def.get("settings", {}))
+    if not apply_settings(result, client, "Blocks", block_id,
+                          block_def.get("name", "new block"),
+                          block_def.get("settings", {})):
+        return result
 
     result.report()
     return result
@@ -520,7 +608,7 @@ def update_workflow(plan, client, catalog):
             data[field_map.get(key, key)] = value
 
     try:
-        client.put(f"WorkflowTypes/{wf_id}", data)
+        client.patch(f"WorkflowTypes/{wf_id}", data)
         result.add("WorkflowType", f"updated {wf_id}", wf_id)
     except Exception as e:
         result.fail("WorkflowType", str(wf_id), e)
@@ -545,7 +633,7 @@ def update_activity(plan, client, catalog):
     data = {field_map.get(k, k): v for k, v in updates.items()}
 
     try:
-        client.put(f"WorkflowActivityTypes/{act_id}", data)
+        client.patch(f"WorkflowActivityTypes/{act_id}", data)
         result.add("ActivityType", f"updated {act_id}", act_id)
     except Exception as e:
         result.fail("ActivityType", str(act_id), e)
@@ -582,7 +670,7 @@ def update_action(plan, client, catalog):
                 data[field_map.get(key, key)] = value
 
         try:
-            client.put(f"WorkflowActionTypes/{action_id}", data)
+            client.patch(f"WorkflowActionTypes/{action_id}", data)
             result.add("ActionType", f"updated {action_id}", action_id)
         except Exception as e:
             result.fail("ActionType", str(action_id), e)
@@ -591,7 +679,9 @@ def update_action(plan, client, catalog):
 
     settings = mod.get("settings", {})
     if settings:
-        set_attribute_values(client, "WorkflowActionTypes", action_id, settings)
+        if not apply_settings(result, client, "WorkflowActionTypes", action_id,
+                              str(action_id), settings):
+            return result
         result.add("Settings", f"updated on {action_id}", action_id)
 
     result.report()
@@ -649,7 +739,7 @@ def reorder_actions(plan, client, catalog):
 
     for i, action_id in enumerate(mod["action_order"]):
         try:
-            client.put(f"WorkflowActionTypes/{action_id}", {"Order": i})
+            client.patch(f"WorkflowActionTypes/{action_id}", {"Order": i})
             result.add("ActionType", f"reordered {action_id} -> {i}", action_id)
         except Exception as e:
             result.fail("ActionType", str(action_id), e)
@@ -670,7 +760,7 @@ def move_action(plan, client, catalog):
     next_order = _next_order(client, "WorkflowActionTypes", f"ActivityTypeId eq {new_activity_id}")
 
     try:
-        client.put(f"WorkflowActionTypes/{action_id}", {
+        client.patch(f"WorkflowActionTypes/{action_id}", {
             "ActivityTypeId": new_activity_id,
             "Order": mod.get("order", next_order),
         })
@@ -705,13 +795,7 @@ def create_checkin_area(plan, client, catalog):
     # Resolve group type
     group_type_id = area.get("group_type_id")
     if not group_type_id and "group_type" in area:
-        gts = client.get("GroupTypes", params={
-            "$filter": f"substringof('{odata_str(area['group_type'])}', Name) eq true",
-            "$select": "Id",
-            "$top": 1,
-        })
-        if gts:
-            group_type_id = gts[0]["Id"]
+        group_type_id = resolve_group_type(client, area["group_type"])
 
     if not group_type_id:
         result.fail("Group", area["name"], "Could not resolve GroupType")
@@ -783,7 +867,7 @@ def create_checkin_area(plan, client, catalog):
                     sched_id = found[0]["Id"]
         if sched_id:
             try:
-                client.put(f"Groups/{group_id}", {"ScheduleId": sched_id})
+                client.patch(f"Groups/{group_id}", {"ScheduleId": sched_id})
                 result.add("Schedule", f"schedule {sched_id} on group", group_id)
             except Exception as e:
                 result.fail("Schedule", str(sched_id), e)
@@ -792,6 +876,463 @@ def create_checkin_area(plan, client, catalog):
 
     result.report()
     return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Groups
+#
+# Group work was the gap that sent people back to older tooling: rock-build
+# could create a check-in area, which is a Group, and then had no way to touch
+# a group, its members, or its sync. These are the operations that were
+# missing, not a new abstraction over them.
+# ─────────────────────────────────────────────────────────────────────────────
+
+GROUP_FIELDS = {
+    "name": "Name", "description": "Description", "is_active": "IsActive",
+    "is_public": "IsPublic", "is_security_role": "IsSecurityRole",
+    "campus_id": "CampusId", "parent_group_id": "ParentGroupId",
+    "schedule_id": "ScheduleId", "group_capacity": "GroupCapacity",
+    "order": "Order",
+}
+
+
+def create_group(plan, client, catalog):
+    """Create a group.
+
+    Plan format:
+    {
+        "operation": "create_group",
+        "group": {
+            "name": "Guest Services",
+            "group_type": "Serving Team",   // or "group_type_id": 25
+            "parent_group_id": 8,           // optional
+            "campus_id": 1,                 // optional
+            "description": "...",           // optional
+            "settings": {"AllowGuests": "True"}   // optional attribute values
+        }
+    }
+    """
+    result = BuildResult()
+    grp = plan["group"]
+
+    group_type_id = grp.get("group_type_id")
+    if not group_type_id and grp.get("group_type"):
+        group_type_id = resolve_group_type(client, grp["group_type"])
+    if not group_type_id:
+        result.fail("Group", grp["name"],
+                    f"Could not resolve GroupType: {grp.get('group_type')}")
+        result.report()
+        return result
+
+    data = {
+        "Name": grp["name"],
+        "GroupTypeId": group_type_id,
+        "IsActive": grp.get("is_active", True),
+        "IsPublic": grp.get("is_public", True),
+        "IsSecurityRole": grp.get("is_security_role", False),
+        "Order": grp.get("order", 0),
+    }
+    for key in ("parent_group_id", "campus_id", "description", "schedule_id",
+                "group_capacity"):
+        if grp.get(key) is not None:
+            data[GROUP_FIELDS[key]] = grp[key]
+
+    try:
+        group_id = client.post("Groups", data)
+        result.add("Group", grp["name"], group_id)
+    except Exception as e:
+        result.fail("Group", grp["name"], e)
+        result.report()
+        return result
+
+    if not apply_settings(result, client, "Groups", group_id, grp["name"],
+                          grp.get("settings", {})):
+        return result
+
+    result.report()
+    return result
+
+
+def update_group(plan, client, catalog):
+    """Update properties on an existing group.
+
+    Plan format:
+    {
+        "operation": "update_group",
+        "modification": {"group_id": 31, "updates": {"name": "...", "is_active": false}}
+    }
+    """
+    result = BuildResult()
+    mod = plan["modification"]
+    group_id = mod["group_id"]
+
+    data = {GROUP_FIELDS.get(k, k): v for k, v in mod["updates"].items()}
+    if not data:
+        result.fail("Group", str(group_id), "No fields to update")
+        result.report()
+        return result
+
+    try:
+        client.patch(f"Groups/{group_id}", data)
+        result.add("Group", f"updated {group_id}", group_id)
+    except Exception as e:
+        result.fail("Group", str(group_id), e)
+        result.report()
+        return result
+
+    if not apply_settings(result, client, "Groups", group_id, str(group_id),
+                          mod.get("settings", {})):
+        return result
+
+    result.report()
+    return result
+
+
+def add_group_member(plan, client, catalog):
+    """Add a person to a group.
+
+    Plan format:
+    {
+        "operation": "add_group_member",
+        "modification": {
+            "group_id": 31,
+            "person_id": 42,
+            "role": "Leader",        // or "group_role_id": 3
+            "status": "active",      // active | inactive | pending
+            "note": "..."            // optional
+        }
+    }
+
+    Rock validates this on save — a duplicate member, or one who fails the
+    group's requirements, comes back as a validation error rather than a
+    silent success.
+    """
+    result = BuildResult()
+    mod = plan["modification"]
+    group_id = mod["group_id"]
+    person_id = mod["person_id"]
+    label = f"person {person_id} in group {group_id}"
+
+    role_id = mod.get("group_role_id")
+    if not role_id and mod.get("role"):
+        role_id = resolve_group_role(client, group_id, mod["role"])
+    if not role_id:
+        result.fail("GroupMember", label,
+                    f"Could not resolve role {mod.get('role')!r} in group {group_id}")
+        result.report()
+        return result
+
+    status = member_status(mod.get("status", "active"))
+    if status is None:
+        result.fail("GroupMember", label,
+                    f"Unknown status {mod.get('status')!r} — "
+                    f"expected one of {', '.join(MEMBER_STATUS)}")
+        result.report()
+        return result
+
+    data = {
+        "GroupId": group_id,
+        "PersonId": person_id,
+        "GroupRoleId": role_id,
+        "GroupMemberStatus": status,
+        "IsNotified": mod.get("is_notified", False),
+        "IsArchived": False,
+    }
+    if mod.get("note"):
+        data["Note"] = mod["note"]
+    if mod.get("order") is not None:
+        data["GroupOrder"] = mod["order"]
+
+    try:
+        member_id = client.post("GroupMembers", data)
+        result.add("GroupMember", label, member_id)
+    except Exception as e:
+        result.fail("GroupMember", label, e)
+
+    result.report()
+    return result
+
+
+GROUP_MEMBER_FIELDS = {
+    "role": "GroupRoleId", "group_role_id": "GroupRoleId", "note": "Note",
+    "is_notified": "IsNotified", "is_archived": "IsArchived",
+    "order": "GroupOrder", "guest_count": "GuestCount",
+}
+
+
+def update_group_member(plan, client, catalog):
+    """Update a group membership — its role, status, or note.
+
+    Plan format:
+    {
+        "operation": "update_group_member",
+        "modification": {"group_member_id": 88, "updates": {"status": "inactive"}}
+    }
+    """
+    result = BuildResult()
+    mod = plan["modification"]
+    member_id = mod["group_member_id"]
+
+    data = {}
+    for key, value in mod["updates"].items():
+        if key == "status":
+            status = member_status(value)
+            if status is None:
+                result.fail("GroupMember", str(member_id),
+                            f"Unknown status {value!r} — "
+                            f"expected one of {', '.join(MEMBER_STATUS)}")
+                result.report()
+                return result
+            data["GroupMemberStatus"] = status
+        else:
+            data[GROUP_MEMBER_FIELDS.get(key, key)] = value
+
+    if not data:
+        result.fail("GroupMember", str(member_id), "No fields to update")
+        result.report()
+        return result
+
+    try:
+        client.patch(f"GroupMembers/{member_id}", data)
+        result.add("GroupMember", f"updated {member_id}", member_id)
+    except Exception as e:
+        result.fail("GroupMember", str(member_id), e)
+
+    result.report()
+    return result
+
+
+def remove_group_member(plan, client, catalog):
+    """Delete a group membership.
+
+    Plan format:
+    {
+        "operation": "remove_group_member",
+        "modification": {"group_member_id": 88}
+    }
+
+    This deletes the row. Groups whose type keeps history expect an archive
+    instead, which is `update_group_member` with `{"is_archived": true}` —
+    the history and the attendance stay attached that way.
+    """
+    result = BuildResult()
+    member_id = plan["modification"]["group_member_id"]
+
+    try:
+        client.delete(f"GroupMembers/{member_id}")
+        result.add("GroupMember", f"removed {member_id}", member_id)
+    except Exception as e:
+        result.fail("GroupMember", str(member_id), e)
+
+    result.report()
+    return result
+
+
+def create_group_sync(plan, client, catalog):
+    """Point a group's role at a data view, so Rock keeps the roster in step.
+
+    Plan format:
+    {
+        "operation": "create_group_sync",
+        "modification": {
+            "group_id": 31,
+            "role": "Member",                  // or "group_type_role_id": 3
+            "data_view": "Active Adults",      // or "sync_data_view_id": 71
+            "add_user_accounts": false,        // optional
+            "schedule_interval_minutes": 720,  // optional
+            "welcome_email_id": 4,             // optional SystemCommunication
+            "exit_email_id": 5                 // optional SystemCommunication
+        }
+    }
+    """
+    result = BuildResult()
+    mod = plan["modification"]
+    group_id = mod["group_id"]
+    label = f"sync on group {group_id}"
+
+    role_id = mod.get("group_type_role_id")
+    if not role_id and mod.get("role"):
+        role_id = resolve_group_role(client, group_id, mod["role"])
+    if not role_id:
+        result.fail("GroupSync", label,
+                    f"Could not resolve role {mod.get('role')!r} in group {group_id}")
+        result.report()
+        return result
+
+    data_view_id = mod.get("sync_data_view_id")
+    if not data_view_id and mod.get("data_view"):
+        data_view_id = resolve_data_view(client, mod["data_view"])
+    if not data_view_id:
+        result.fail("GroupSync", label,
+                    f"Could not resolve data view {mod.get('data_view')!r}")
+        result.report()
+        return result
+
+    data = {
+        "GroupId": group_id,
+        "GroupTypeRoleId": role_id,
+        "SyncDataViewId": data_view_id,
+    }
+    for key, field in (("add_user_accounts", "AddUserAccountsDuringSync"),
+                       ("schedule_interval_minutes", "ScheduleIntervalMinutes"),
+                       ("welcome_email_id", "WelcomeSystemCommunicationId"),
+                       ("exit_email_id", "ExitSystemCommunicationId")):
+        if mod.get(key) is not None:
+            data[field] = mod[key]
+
+    try:
+        sync_id = client.post("GroupSyncs", data)
+        result.add("GroupSync", label, sync_id)
+    except Exception as e:
+        result.fail("GroupSync", label, e)
+
+    result.report()
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The escape hatch
+# ─────────────────────────────────────────────────────────────────────────────
+
+API_METHODS = ("GET", "POST", "PATCH", "PUT", "DELETE")
+
+
+def api_request(plan, client, catalog):
+    """Send one arbitrary request to the Rock API.
+
+    Every named operation above encodes what Rock wants for one kind of change.
+    Rock has hundreds of entities and this plugin covers a dozen, so without a
+    way out, anything uncovered means no answer at all — which is what drove
+    people back to tooling most of the department does not have. This is that
+    way out. It is deliberately thin: no field maps, no name resolution, no
+    conveniences. What you write is what Rock receives.
+
+    Plan format:
+    {
+        "operation": "api_request",
+        "request": {
+            "method": "PATCH",
+            "endpoint": "GroupRequirements/12",
+            "params": {"attributeKey": "..."},   // optional query string
+            "body": {"...": "..."},              // optional JSON body
+            "full_replace": true                 // required for PUT only
+        }
+    }
+
+    PUT needs `full_replace: true` and a body holding the entity's every field,
+    Id and Guid and CreatedDateTime included. That is not ceremony: Rock's PUT
+    replaces the row, so a partial body is the bug this operation was written
+    alongside. GET is here because reading the entity is the only way to build
+    that body honestly.
+    """
+    result = BuildResult()
+    req = plan.get("request") or {}
+    method = str(req.get("method", "")).strip().upper()
+    endpoint = str(req.get("endpoint", "")).strip()
+    label = f"{method} {endpoint}".strip() or "api_request"
+
+    if method not in API_METHODS:
+        result.fail("Request", label,
+                    f"method must be one of {', '.join(API_METHODS)}, got {method!r}")
+        result.report()
+        return result
+
+    if not endpoint:
+        result.fail("Request", label, "endpoint is required, e.g. \"GroupSyncs/12\"")
+        result.report()
+        return result
+
+    # An endpoint is a path under /api/, and nothing else. Anything that could
+    # aim the authenticated session somewhere else, or climb out of /api/, is
+    # refused rather than normalised.
+    if "://" in endpoint or endpoint.startswith("/") or ".." in endpoint.split("/"):
+        result.fail("Request", label,
+                    "endpoint must be a path under /api/ — no scheme, no leading "
+                    "slash, no '..'")
+        result.report()
+        return result
+
+    if method == "PUT" and req.get("full_replace") is not True:
+        result.fail("Request", label,
+                    "PUT replaces the whole entity in Rock: every field absent from "
+                    "the body is set to null, the created-by audit is lost, and the "
+                    "row gets a new Guid. Use PATCH to change some fields. If you "
+                    "really mean to replace the entity, read it first and send it "
+                    "back whole with \"full_replace\": true.")
+        result.report()
+        return result
+
+    params = req.get("params")
+    body = req.get("body")
+
+    print(f"  {method} /api/{endpoint}" + (f"  params={params}" if params else ""))
+
+    try:
+        if method == "GET":
+            print(json.dumps(client.get(endpoint, params=params), indent=2, default=str))
+            result.add("Response", label, endpoint)
+        elif method == "POST":
+            result.add("Response", label, client.post(endpoint, body, params=params))
+        elif method == "PATCH":
+            client.patch(endpoint, body)
+            result.add("Response", label, endpoint)
+        elif method == "PUT":
+            client.put(endpoint, body)
+            result.add("Response", label, endpoint)
+        else:
+            client.delete(endpoint)
+            result.add("Response", label, endpoint)
+    except Exception as e:
+        result.fail("Request", label, e)
+
+    result.report()
+    return result
+
+
+def require_writes_enabled(operation):
+    """Refuse to run unless ROCK_ALLOW_WRITES is set.
+
+    rock-build's rock.sh sets it and is the only documented way in. Nothing
+    else sets it — see ADR 0016. The check matters because both plugins install
+    into the same runtime directory, so this script sits on disk beside the
+    read-only ones and could otherwise be run by hand.
+    """
+    if os.environ.get("ROCK_ALLOW_WRITES") == "1":
+        return
+    print(
+        f"Refusing to run '{operation}': everything in this script changes Rock, "
+        f"and ROCK_ALLOW_WRITES is not set.\n"
+        f"Run it through the rock-build plugin's rock.sh, which sets it.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+
+OPERATIONS = {
+    "create_workflow": create_workflow,
+    "create_page": create_page,
+    "add_action": add_workflow_action,
+    "add_block": add_page_block,
+    "update_workflow": update_workflow,
+    "update_activity": update_activity,
+    "update_action": update_action,
+    "delete_action": delete_action,
+    "delete_activity": delete_activity,
+    "reorder_actions": reorder_actions,
+    "move_action": move_action,
+    "create_checkin_area": create_checkin_area,
+    "create_group": create_group,
+    "update_group": update_group,
+    "add_group_member": add_group_member,
+    "update_group_member": update_group_member,
+    "remove_group_member": remove_group_member,
+    "create_group_sync": create_group_sync,
+    "api_request": api_request,
+}
+
+# Operations that resolve a name through the catalog cache.
+NEEDS_CATALOG = {"create_workflow", "create_page", "add_action", "add_block",
+                 "update_action"}
 
 
 def main():
@@ -811,35 +1352,28 @@ def main():
     else:
         plan = json.load(sys.stdin)
 
-    catalog = load_catalog()
-    if not catalog:
-        print("Error: no catalog found. Refresh it: rock_catalog.py refresh")
-        sys.exit(1)
-    client = RockClient()
-
-    operations = {
-        "create_workflow": create_workflow,
-        "create_page": create_page,
-        "add_action": add_workflow_action,
-        "add_block": add_page_block,
-        "update_workflow": update_workflow,
-        "update_activity": update_activity,
-        "update_action": update_action,
-        "delete_action": delete_action,
-        "delete_activity": delete_activity,
-        "reorder_actions": reorder_actions,
-        "move_action": move_action,
-        "create_checkin_area": create_checkin_area,
-    }
-
     operation = plan.get("operation")
-    log.info("build operation=%s", operation)
-    handler = operations.get(operation)
+    handler = OPERATIONS.get(operation)
     if not handler:
         print(f"Error: unknown operation: {operation}")
-        print(f"Supported: {', '.join(operations)}")
+        print(f"Supported: {', '.join(OPERATIONS)}")
         sys.exit(1)
-    result = handler(plan, client, catalog)
+
+    require_writes_enabled(operation)
+
+    # The catalog resolves names to IDs for the things Rock does not let you
+    # look up by name — action components, field types, block types, layouts.
+    # Operations that resolve nothing should not be blocked by a stale or
+    # missing cache.
+    catalog = load_catalog()
+    if catalog is None and operation in NEEDS_CATALOG:
+        print("Error: no catalog found. Refresh it: rock_catalog.py refresh")
+        sys.exit(1)
+
+    client = RockClient()
+
+    log.info("build operation=%s", operation)
+    result = handler(plan, client, catalog or {})
 
     if not result.success:
         sys.exit(1)

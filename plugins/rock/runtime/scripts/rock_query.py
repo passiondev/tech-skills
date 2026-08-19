@@ -1517,25 +1517,25 @@ def cmd_block_set(args, client):
         return
 
     print(f"Setting {args.key}={args.value[:80]}{'...' if len(args.value) > 80 else ''} on block {block_id}")
+
+    # Rock routes this by convention rather than through OData, and binds both
+    # arguments from the query string. The two shapes this replaced — a JSON
+    # body to Blocks/{id}/AttributeValues, then to Blocks/AttributeValue/{id} —
+    # are not routes at all: both answer "The OData path is invalid." So
+    # block-set had never once changed a block setting, and said "Done." only
+    # when the second 404 was also swallowed.
     try:
-        client.post(f"Blocks/{block_id}/AttributeValues", {
-            "Key": args.key,
-            "Value": args.value,
+        client.post(f"Blocks/AttributeValue/{block_id}", params={
+            "attributeKey": args.key,
+            "attributeValue": args.value,
         })
         log.info("block-set ok block=%d key=%s", block_id, args.key)
         print("Done.")
-    except Exception as e1:
-        log.debug("block-set POST failed, trying PUT: %s", e1)
-        try:
-            client.put(f"Blocks/AttributeValue/{block_id}", {
-                "Key": args.key,
-                "Value": args.value,
-            })
-            log.info("block-set ok (PUT) block=%d key=%s", block_id, args.key)
-            print("Done.")
-        except Exception as e2:
-            log.error("block-set failed block=%d key=%s\n%s", block_id, args.key, traceback.format_exc())
-            print(f"Error setting attribute: {e2}")
+    except Exception as e:
+        log.error("block-set failed block=%d key=%s\n%s", block_id, args.key, traceback.format_exc())
+        print(f"Error setting attribute: {e}")
+        print(f"  Rock rejects a key it does not know. Check it against: "
+              f"rock.sh query block {block_id}")
 
 
 def cmd_person_create(args, client):
@@ -1589,8 +1589,11 @@ def cmd_person_update(args, client):
         print("No fields to update.")
         return
 
+    # PATCH, not PUT. Rock's PUT replaces the whole person record, so a
+    # three-field update used to null everything else on the row, wipe who
+    # created it, and hand it a new Guid. See RockClient.put.
     try:
-        client.put(f"People/{pid}", data)
+        client.patch(f"People/{pid}", data)
         pname = f"{person.get('FirstName', '')} {person.get('LastName', '')}"
         print(f"Updated {pname} (ID: {pid}): {', '.join(f'{k}={v}' for k, v in data.items())}")
     except Exception as e:

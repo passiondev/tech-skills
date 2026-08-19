@@ -527,6 +527,45 @@ def _write_guard():
         fail("rock_query.py", f"WRITE_COMMANDS lists subcommands that no longer exist: {sorted(stale)}")
 
 
+@check("rock-write-shapes")
+def _rock_write_shapes():
+    """The two request shapes Rock will not forgive (ADR 0022).
+
+    Rock's PUT is a full-entity replace: `ApiController<T>.Put` hands the posted
+    object to `CurrentValues.SetValues`, so every column absent from the body is
+    set to null. A partial PUT therefore 400s where a nulled column is required,
+    and silently corrupts the row where it is not — losing the created-by audit
+    and replacing the Guid. Partial updates use PATCH. The single PUT the
+    runtime keeps is inside `api_request`, which refuses to send one without an
+    explicit `full_replace` acknowledgement.
+
+    Attribute values are the other one. There is no `{Entity}/{id}/AttributeValues`
+    route; both shapes that look plausible answer "The OData path is invalid."
+    The real route binds from the query string.
+    """
+    put_is_deliberate = {("rock_build.py", "api_request")}
+
+    for path in sorted(PLUGINS.rglob("*.py")):
+        rel = path.relative_to(ROOT)
+        src = path.read_text()
+
+        for fn in re.finditer(r"^def (\w+)\(.*?(?=^def |\Z)", src, re.S | re.M):
+            if "client.put(" not in fn.group(0):
+                continue
+            if (path.name, fn.group(1)) in put_is_deliberate:
+                continue
+            fail(f"{rel}", f"{fn.group(1)}() sends a PUT. Rock's PUT replaces the whole "
+                           f"entity — use client.patch for a partial update")
+
+        for n, line in enumerate(src.splitlines(), 1):
+            if line.lstrip().startswith("#"):
+                continue  # a comment naming the dead route is documentation
+            if "/AttributeValues" in line:
+                fail(f"{rel}:{n}", "there is no {Entity}/{id}/AttributeValues route — "
+                                   "attribute values go to POST {Entity}/AttributeValue/{id} "
+                                   "with attributeKey and attributeValue as query parameters")
+
+
 @check("no-repo-writes")
 def _no_repo_writes():
     """Nothing may write into a repository — attachments, screenshots, plans (ADR 0001)."""

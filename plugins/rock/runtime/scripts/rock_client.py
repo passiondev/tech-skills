@@ -86,10 +86,18 @@ class RockClient:
         log.info("GET %s ok %dB", endpoint, len(resp.content))
         return resp.json() if resp.content else None
 
-    def post(self, endpoint, data, timeout=30):
+    def post(self, endpoint, data=None, params=None, timeout=30):
+        """POST, with or without a JSON body.
+
+        Some Rock routes are convention-based rather than OData, and bind their
+        arguments from the query string with no body at all — SetAttributeValue
+        is the one this runtime uses. Passing `json=None` sends no body, which
+        is what those routes need: a body makes the request match the OData
+        route instead, and that 404s.
+        """
         url = f"{self.base_url}/api/{endpoint.lstrip('/')}"
-        resp = self.session.post(url, json=data, timeout=timeout)
-        self._handle_error(resp, "POST", endpoint, data=data)
+        resp = self.session.post(url, json=data, params=params, timeout=timeout)
+        self._handle_error(resp, "POST", endpoint, params=params, data=data)
         result = None
         if resp.status_code == 201:
             try:
@@ -101,7 +109,37 @@ class RockClient:
         log.info("POST %s ok id=%s", endpoint, result)
         return result
 
+    def patch(self, endpoint, data, timeout=30):
+        """Change only the fields in `data`, leaving every other column alone.
+
+        This is the verb for any partial update. See `put` for why.
+        """
+        url = f"{self.base_url}/api/{endpoint.lstrip('/')}"
+        resp = self.session.patch(url, json=data, timeout=timeout)
+        self._handle_error(resp, "PATCH", endpoint, data=data)
+        log.info("PATCH %s ok", endpoint)
+        return True
+
     def put(self, endpoint, data, timeout=30):
+        """Replace the whole entity. Almost never what you want — use `patch`.
+
+        Rock's PUT is not a merge. `ApiController<T>.Put` calls
+        `Service.SetValues(value, target)`, which is
+        `Entry(target).CurrentValues.SetValues(source)` — Entity Framework
+        copies every mapped column from the object you posted, including the
+        ones you left out. So a partial body:
+
+          * nulls every field you omitted, and 400s instead where one of them
+            is `[Required]`;
+          * wipes CreatedDateTime and CreatedByPersonAliasId, because
+            RockPreSave only fills those on insert and never restores them;
+          * replaces the row's Guid with a fresh random one, because
+            `Entity<T>` initialises its backing field with `Guid.NewGuid()`
+            and an absent Guid is indistinguishable from a new entity's.
+
+        A caller that means it must send the entity back whole — every field it
+        read, including Id, Guid, and the Created* pair.
+        """
         url = f"{self.base_url}/api/{endpoint.lstrip('/')}"
         resp = self.session.put(url, json=data, timeout=timeout)
         self._handle_error(resp, "PUT", endpoint, data=data)

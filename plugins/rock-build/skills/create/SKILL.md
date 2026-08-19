@@ -74,6 +74,10 @@ PLAN
 | `add_action` | an action on an existing activity |
 | `add_block` | a block on an existing page |
 
+A group, its members, or its sync is `/rock-build:group`. A check-in area is a
+group too, but `create_checkin_area` stays here: it builds a check-in structure
+with its locations and schedule, not a roster.
+
 Plan files live under `/tmp`; the build script rejects any other path, so a plan
 cannot land in a repository.
 
@@ -93,8 +97,12 @@ A partial create leaves a half-built workflow in Rock under a real name. Name it
 and say what it is missing, so someone finishes or deletes it rather than finding
 it later and assuming it works.
 
-A settings key Rock does not recognise prints a `Warning:` line and the entity
-still counts as created, so read the warnings as failures too.
+A settings key Rock does not recognise fails the operation on the spot, so a
+create can stop with the workflow and its activities in place and an action left
+unconfigured. That is what the per-entity report is for. `Warning:` lines are a
+separate thing — an unresolved category, a form field naming an attribute that
+does not exist — and the entity really is created despite them, so read them and
+say what is missing.
 
 Then run `/rock-build:audit` and report its output. Newly created workflows
 commonly audit dirty on the first pass — an activity nothing activates, an email

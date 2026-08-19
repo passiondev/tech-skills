@@ -363,6 +363,18 @@
       ],
       "authored_here": true,
       "note": "Role-first introduction to the marketplace. Names skills across every plugin by design, so check.py exempts it from the reachability rule via CATALOGUE_FILES. Its recommendation table must be updated when skills are added or removed. See ADR 0018."
+    },
+    "group": {
+      "plugin": "rock-build",
+      "upstream": null,
+      "via": null,
+      "vendored_as": "group",
+      "files": [
+        "SKILL.md"
+      ],
+      "derived_from": null,
+      "authored_here": true,
+      "notes": "Authored here, not vendored. Group, member, and sync operations were absent from rock-tools and from this marketplace, which is what sent people back to rock-tools and left anyone without it unable to change a roster at all. See ADR 0022."
     }
   },
   "runtime": {

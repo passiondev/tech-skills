@@ -77,8 +77,9 @@ PLAN
 
 The audit supplies the IDs. An `action_type` name resolves through
 `"$R" catalog show`, but `settings` keys go to Rock verbatim — take each key
-exactly as `"$R" query actions <activity_id>` reports it, because an unknown key
-only prints a `Warning:` and the operation still reports success. Adding an
+exactly as `"$R" query actions <activity_id>` reports it. Rock rejects a key it
+does not recognise, and the operation fails on it rather than skipping that one
+setting, so a wrong key costs you the whole apply and not a line of it. Adding an
 action or block that is missing entirely is `/rock-build:create`.
 
 `reorder_actions` takes every action in the activity, not just the moved ones — a
@@ -90,6 +91,56 @@ A block attribute is a different, smaller thing:
 "$R" query block 4821                      # see current values first
 "$R" query block-set 4821 EnableDebug false
 ```
+
+A group, its roster, or its sync is `/rock-build:group` — different entities,
+different confirmation, different ways to get it wrong.
+
+### When no operation fits
+
+The table above covers what this skill was built for. Rock has hundreds of
+entities and this plugin names a couple of dozen, so a request eventually lands
+outside them — a group requirement, a page context, a scheduled job. Guessing at
+an operation that does not exist is one wrong answer and giving up is the other.
+`api_request` sends exactly one request, which you write:
+
+```bash
+cat > /tmp/rock-plan.json <<'PLAN'
+{
+  "operation": "api_request",
+  "request": {
+    "method": "PATCH",
+    "endpoint": "GroupRequirements/12",
+    "body": {"MustMeetRequirementToAddMember": true}
+  }
+}
+PLAN
+"$R" build /tmp/rock-plan.json
+```
+
+Read the entity before you change it. `GET` is available here for that reason,
+and it is how you learn the field names Rock actually uses:
+
+```json
+{"operation": "api_request",
+ "request": {"method": "GET", "endpoint": "GroupRequirements/12"}}
+```
+
+Then:
+
+- **`PATCH` changes some fields.** It sets what you send and leaves everything
+  else alone. This is the verb for almost every edit.
+- **`PUT` replaces the entity.** Rock copies every column out of your body, so a
+  field you omitted becomes null, the created-by audit is gone, and the row gets
+  a new Guid. `api_request` refuses a `PUT` without `"full_replace": true`, and
+  that acknowledgement is only honest when the body is the entity you just read
+  back whole — `Id`, `Guid`, `CreatedDateTime` and all. If you are reaching for
+  it to change two fields, reach for `PATCH` instead.
+- **Show the request in the plan** — method, URL, body — before sending it. The
+  named operations have shapes a reader can check against the table. This one has
+  none, so the requester is the only check there is.
+
+Nothing here skips a step: `api_request` goes through the same `rock.sh`, the same
+write guard, and the same yes as everything above.
 
 ## 4. Verify
 
