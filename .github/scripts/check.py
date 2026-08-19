@@ -15,11 +15,13 @@ Exit 0 if clean, 1 otherwise. Every failure names the file and what to do.
 import ast
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 PLUGINS = ROOT / "plugins"
+SELF = Path(__file__).resolve().relative_to(ROOT)
 
 failures = []
 checks_run = 0
@@ -50,6 +52,30 @@ def load_json(path):
     except json.JSONDecodeError as exc:
         fail(path.relative_to(ROOT), f"is not valid JSON — {exc}")
         return None
+
+
+def repo_files(under="", suffixes=None):
+    """Every file this repository ships, under a prefix, as absolute paths.
+
+    Asked of git rather than of the filesystem. A walk finds whatever the last
+    command left lying about — `__pycache__` from a test run, a binary ruff
+    cache whose files have no extension at all, a virtualenv full of somebody
+    else's Python — and then every check that walks has to name each of those to
+    skip it. None of them did. `secrets` was reading nine cache blobs looking
+    for hostnames, and excluding itself by comparing a hardcoded path.
+
+    What a public repository ships is what git tracks, and git already knows
+    about the caches, because they carry their own ignore files. `under` is a
+    literal prefix, so pass the trailing slash: "plugins/".
+    """
+    listing = subprocess.run(["git", "-C", str(ROOT), "ls-files", "-z"],
+                             capture_output=True, text=True, check=False)
+    if listing.returncode != 0:
+        raise RuntimeError(f"git ls-files failed in {ROOT}: "
+                           f"{listing.stderr.strip()[:200]}")
+    return sorted(ROOT / rel for rel in listing.stdout.split("\0")
+                  if rel and rel.startswith(under)
+                  and (suffixes is None or Path(rel).suffix in suffixes))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -362,15 +388,46 @@ def _contamination():
             fail(hit.relative_to(ROOT), "is an excluded file — see docs/vendored.json")
 
 
+def _files_recorded(list_name, listed, shipped, base):
+    """Compare one hand-written file list against what is on disk beside it.
+
+    Both directions are worth a failure, for different reasons. A shipped file
+    the list does not name is a file with no recorded provenance, which is the
+    single thing this manifest exists to prevent. A name with no file behind it
+    is a stale entry, and stale entries are how a manifest stops being read:
+    `config.yaml` was listed as "unchanged" for the life of the plugin, and
+    nothing would have noticed the day it stopped existing.
+    """
+    have = {str(path.relative_to(base)) for path in shipped}
+    for name in sorted(have - set(listed)):
+        fail((base / name).relative_to(ROOT),
+             f"is shipped but absent from `{list_name}` in docs/vendored.json — "
+             "every file records where it came from")
+    for name in sorted(set(listed) - have):
+        fail("docs/vendored.json",
+             f"`{list_name}` lists {name}, which this repository no longer ships")
+
+
 @check("provenance")
 def _provenance():
     vend = load_json(ROOT / "docs" / "vendored.json") or {}
+    shipped = repo_files("plugins/")
     recorded = {(v["plugin"], k) for k, v in vend.get("skills", {}).items()}
-    on_disk = {(p.parts[-4], p.parts[-2]) for p in SKILLS}
+    on_disk = {(p.parts[-4], p.parts[-2]) for p in shipped if p.name == "SKILL.md"}
     for plugin, skill in sorted(on_disk - recorded):
         fail(f"{plugin}/{skill}", "is not in docs/vendored.json — every skill records where it came from")
     for plugin, skill in sorted(recorded - on_disk):
         fail(f"{plugin}/{skill}", "is in docs/vendored.json but not on disk")
+
+    # The skill entries and the runtime entry both list filenames. Nothing read
+    # either list until now, so 54 of them were a comment that happened to be
+    # valid JSON.
+    for skill, entry in sorted(vend.get("skills", {}).items()):
+        directory = ROOT / "plugins" / entry["plugin"] / "skills" / skill
+        _files_recorded(f'skills["{skill}"].files', entry.get("files", []),
+                        [p for p in shipped if directory in p.parents], directory)
+    _files_recorded("runtime.files", vend.get("runtime", {}).get("files", {}),
+                    repo_files("plugins/rock/runtime/"), ROOT)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -444,13 +501,9 @@ PLACEHOLDER = re.compile(
 
 @check("secrets")
 def _secrets():
-    for path in sorted(ROOT.rglob("*")):
-        if not path.is_file() or ".git/" in str(path):
-            continue
-        if path.suffix not in TEXT_SUFFIXES:
-            continue
+    for path in repo_files(suffixes=TEXT_SUFFIXES):
         rel = path.relative_to(ROOT)
-        if str(rel) == ".github/scripts/check.py":
+        if rel == SELF:
             continue  # this file necessarily contains the patterns
         try:
             lines = path.read_text(encoding="utf-8").splitlines()
@@ -483,7 +536,7 @@ def _secrets():
 
 @check("passion_env")
 def _passion_env():
-    copies = sorted(PLUGINS.rglob("passion_env.py"))
+    copies = [p for p in repo_files("plugins/") if p.name == "passion_env.py"]
     if len(copies) < 2:
         fail("passion_env", f"expected several copies, found {len(copies)}")
         return
@@ -766,7 +819,7 @@ def _rock_listing_rows():
 @check("no-repo-writes")
 def _no_repo_writes():
     """Nothing may write into a repository — attachments, screenshots, plans (ADR 0001)."""
-    for path in PLUGINS.rglob("*.py"):
+    for path in repo_files("plugins/", {".py"}):
         for n, line in enumerate(path.read_text().splitlines(), 1):
             if re.search(r"REPO_ROOT|Path\(__file__\)\.parent\.parent\s*/\s*[\"'](?!\.)", line):
                 if "rock_paths" in line or "sys.path" in line:
@@ -780,7 +833,7 @@ def _no_repo_writes():
 def _executables():
     """Entry points must be runnable. `.template.sh` files are copied, not run."""
     import os
-    for path in PLUGINS.rglob("*.sh"):
+    for path in repo_files("plugins/", {".sh"}):
         if path.name.endswith(".template.sh"):
             continue
         if not os.access(path, os.X_OK):

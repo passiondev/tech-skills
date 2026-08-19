@@ -14,6 +14,8 @@ Run:  python3 -m unittest discover -s tests
 """
 
 import importlib.util
+import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -59,12 +61,22 @@ class CheckTestCase(unittest.TestCase):
     """Runs one real check over a repository of our own making."""
 
     def run_check(self, fn, files):
-        """Report what `fn` complains about, given `files` as the whole repo."""
+        """Report what `fn` complains about, given `files` as the whole repo.
+
+        The temp directory is made a real git repository with `files` added to
+        its index, because the checks ask git what the repository ships rather
+        than walking the filesystem. That is also the only way to write a test
+        for a file git ignores: put it in `.gitignore` here and it is ignored
+        here too, by the same code that ignores it upstairs.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             for rel, source in files.items():
                 path = Path(tmp) / rel
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(source)
+            for command in (["init", "-q"], ["add", "-A"]):
+                subprocess.run(["git", "-C", tmp, *command],
+                               check=True, capture_output=True)
             kept, real_root = list(checks.failures), checks.ROOT
             checks.failures.clear()
             checks.ROOT = Path(tmp)
@@ -207,6 +219,66 @@ def cmd_summary(counts):
             checks._rock_listing_rows,
             {str(QUERY_PATH): (ROOT / QUERY_PATH).read_text()})
         self.assertEqual(found, [])
+
+
+class TestProvenanceReadsTheFileLists(CheckTestCase):
+    """provenance — every shipped file is named in docs/vendored.json."""
+
+    def vendored(self, files):
+        return json.dumps({
+            "skills": {"rock": {"plugin": "rock", "upstream": "somewhere",
+                                "files": files}},
+            "runtime": {"files": {}},
+        })
+
+    def repo(self, listed, on_disk, extra=None):
+        """A one-skill repository, and what its entry claims to cover."""
+        files = {"docs/vendored.json": self.vendored(listed)}
+        for name in on_disk:
+            files[f"plugins/rock/skills/rock/{name}"] = "body\n"
+        files.update(extra or {})
+        return self.run_check(checks._provenance, files)
+
+    def test_a_list_that_matches_disk_is_clean(self):
+        self.assertEqual(self.repo(["SKILL.md", "references/lava.md"],
+                                   ["SKILL.md", "references/lava.md"]), [])
+
+    def test_a_shipped_file_nobody_recorded_is_caught(self):
+        found = self.repo(["SKILL.md"], ["SKILL.md", "references/lava.md"])
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("references/lava.md", found[0])
+        self.assertIn("where it came from", found[0])
+
+    def test_a_recorded_file_that_is_gone_is_caught(self):
+        found = self.repo(["SKILL.md", "references/gone.md"], ["SKILL.md"])
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("no longer ships", found[0])
+
+    def test_a_file_git_ignores_is_not_a_missing_entry(self):
+        self.assertEqual(self.repo(
+            ["SKILL.md"], ["SKILL.md"],
+            extra={".gitignore": "__pycache__/\n",
+                   "plugins/rock/skills/rock/__pycache__/x.pyc": "junk\n"}), [])
+
+    def test_the_runtime_list_is_read_too(self):
+        found = self.run_check(checks._provenance, {
+            "docs/vendored.json": json.dumps({"skills": {}, "runtime": {
+                "files": {"plugins/rock/runtime/scripts/gone.py": "patched"}}}),
+            "plugins/rock/runtime/scripts/rock_client.py": "x = 1\n",
+        })
+        self.assertEqual(len(found), 2, found)
+        self.assertTrue(any("gone.py" in f and "no longer ships" in f for f in found), found)
+        self.assertTrue(any("rock_client.py" in f for f in found), found)
+
+    def test_the_repository_itself_passes(self):
+        """Not a repository of our making — this one, and its 54 filenames."""
+        kept = list(checks.failures)
+        checks.failures.clear()
+        try:
+            checks._provenance()
+            self.assertEqual(list(checks.failures), [])
+        finally:
+            checks.failures[:] = kept
 
 
 if __name__ == "__main__":
